@@ -6,72 +6,201 @@
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_rust::ClientBuilder;
+//! use std::time::Duration;
+//! use fastmcp_rust::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
 //!
-//! let client = ClientBuilder::new()
-//!     .client_info("my-client", "1.0.0")
-//!     .timeout_ms(60_000)
-//!     .max_retries(3)
-//!     .retry_delay_ms(1000)
-//!     .working_dir("/tmp")
-//!     .env("DEBUG", "1")
-//!     .connect_stdio("uvx", &["my-server"])?;
+//! async fn connect(cx: &Cx) -> McpResult<Client> {
+//!     ClientBuilder::new()
+//!         .client_info("my-client", "1.0.0")
+//!         .request_timeout_policy(RequestTimeoutPolicy::new(
+//!             Duration::from_secs(30),
+//!             Duration::from_secs(60),
+//!         )?)
+//!         .max_retries(3)
+//!         .retry_delay_ms(1000)
+//!         .working_dir("/tmp")
+//!         .env("DEBUG", "1")
+//!         .connect_stdio_with_cx(cx, "uvx", &["my-server"])
+//!         .await
+//! }
 //! ```
 
 use std::collections::HashMap;
+#[cfg(feature = "websocket-experimental")]
+use std::future::Future;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
-
-/// Guard that kills and waits for a child process when dropped.
-/// Call `disarm()` to prevent cleanup (e.g., when ownership transfers to Client).
-struct ChildGuard(Option<Child>);
-
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self(Some(child))
-    }
-
-    /// Takes ownership of the child, preventing cleanup on drop.
-    fn disarm(mut self) -> Child {
-        self.0.take().expect("ChildGuard already disarmed")
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            // Best effort cleanup - ignore errors
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
-use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, JsonRpcMessage,
-    JsonRpcRequest, PROTOCOL_VERSION,
+#[cfg(feature = "websocket-experimental")]
+use asupersync::io::{AsyncRead, AsyncWrite};
+use fastmcp_core::{
+    McpContext, McpError, McpResult, SamplingRequest, SamplingRequestMessage, SamplingRole,
 };
-use fastmcp_transport::{StdioTransport, Transport};
+use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
+    McpAppsClientSettings,
+};
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::{
+    ClientCapabilities, ClientInfo, CreateMessageParams, CreateMessageResult, ListRootsResult,
+    Root, RootsCapability, SamplingContent,
+};
+use fastmcp_transport::StdioTransport;
+#[cfg(feature = "websocket-experimental")]
+use fastmcp_transport::websocket::AsyncWsClientTransport;
 
-use crate::{Client, ClientSession};
+#[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
+use crate::ReverseRequestCancellation;
+#[cfg(feature = "websocket-experimental")]
+use crate::WebSocketClient;
+use crate::http_executor::{HttpConnectionSettings, ModernHttpExecutorError};
+use crate::{
+    AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+    ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
+    ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
+    SubscriptionTimeoutPolicy, combine_operation_and_cleanup, combine_operation_with_cleanup,
+    combine_operation_with_cleanup_async, is_cleanup_unverified, resolve_stdio_command,
+    validate_protocol_plan_feature,
+};
+
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::ModernOnly;
+
+/// The maximum number of connection attempts admitted by the client retry policy.
+const MAX_CONNECTION_ATTEMPTS: u32 = 8;
+/// The maximum delay before one connection retry.
+const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// The maximum elapsed time for the entire connection retry operation.
+const MAX_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
+/// The elapsed cap used by the legacy retry-count and millisecond-delay setters.
+const DEFAULT_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
+/// Bounded timer slice used to observe a caller-owned context while waiting.
+const CONNECTION_RETRY_CANCEL_SLICE: Duration = Duration::from_millis(25);
+
+/// One initialized stdio child attempt. `Fallback` is possible only for the
+/// disposable modern Auto probe, after its child has been fully cleaned up.
+enum StdioConnectionAttempt {
+    Connected(Box<Client>),
+    Fallback(AutoStdioFallbackSignal),
+}
+
+fn legacy_capabilities_for_handlers(
+    capabilities: &ClientCapabilities,
+    handlers: &ReverseRequestHandlers,
+) -> ClientCapabilities {
+    let mut legacy_capabilities = capabilities.clone();
+    handlers.derive_legacy_capabilities(&mut legacy_capabilities);
+    legacy_capabilities
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConnectionRetryPolicy {
+    max_attempts: u64,
+    retry_delay: Duration,
+    total_elapsed: Option<Duration>,
+}
+
+impl ConnectionRetryPolicy {
+    fn new(max_attempts: u32, retry_delay: Duration, total_elapsed: Duration) -> McpResult<Self> {
+        if max_attempts == 0 {
+            return Err(McpError::invalid_params(
+                "Connection retry policy requires at least one attempt",
+            ));
+        }
+        if max_attempts > MAX_CONNECTION_ATTEMPTS {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry attempts must not exceed {MAX_CONNECTION_ATTEMPTS}",
+            )));
+        }
+        if retry_delay > MAX_CONNECTION_RETRY_DELAY {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry delay must not exceed {} seconds",
+                MAX_CONNECTION_RETRY_DELAY.as_secs(),
+            )));
+        }
+        if total_elapsed.is_zero() || total_elapsed > MAX_CONNECTION_RETRY_ELAPSED {
+            return Err(McpError::invalid_params(format!(
+                "Connection retry elapsed limit must be between 1ns and {} seconds",
+                MAX_CONNECTION_RETRY_ELAPSED.as_secs(),
+            )));
+        }
+
+        let retry_count = max_attempts.checked_sub(1).ok_or_else(|| {
+            McpError::invalid_params("Connection retry attempt count underflowed")
+        })?;
+        let scheduled_delay = retry_delay.checked_mul(retry_count).ok_or_else(|| {
+            McpError::invalid_params("Connection retry delays overflow the duration range")
+        })?;
+        if scheduled_delay > total_elapsed {
+            return Err(McpError::invalid_params(
+                "Connection retry delays exceed the total elapsed limit",
+            ));
+        }
+
+        Ok(Self {
+            max_attempts: u64::from(max_attempts),
+            retry_delay,
+            total_elapsed: Some(total_elapsed),
+        })
+    }
+
+    fn from_legacy(max_retries: u32, retry_delay_ms: u64) -> McpResult<Self> {
+        let max_attempts = max_retries.checked_add(1).ok_or_else(|| {
+            McpError::invalid_params("Connection retry count exceeds the attempt range")
+        })?;
+        Self::new(
+            max_attempts,
+            Duration::from_millis(retry_delay_ms),
+            DEFAULT_CONNECTION_RETRY_ELAPSED,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionRetryDeadline(Option<Instant>);
+
+impl ConnectionRetryDeadline {
+    fn expired(self) -> bool {
+        self.0.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn remaining(self, now: Instant) -> Option<Duration> {
+        self.0
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+}
 
 /// Builder for configuring an MCP client.
 ///
 /// Use this to configure timeout, retry, and spawn options before
 /// connecting to an MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBuilder {
     /// Client identification info.
     client_info: ClientInfo,
-    /// Request timeout in milliseconds.
-    timeout_ms: u64,
+    /// Modern-only Implementation extras. Exact-2024 initialize stays name/version.
+    client_title: Option<String>,
+    client_description: Option<String>,
+    client_website_url: Option<String>,
+    client_icons: Vec<fastmcp_protocol::common_types::RawIcon>,
+    /// Validated ordinary-request idle/absolute timeout policy.
+    timeout_policy: RequestTimeoutPolicy,
+    /// Validated modern HTTP subscription idle/absolute timeout policy.
+    subscription_timeout_policy: SubscriptionTimeoutPolicy,
     /// Maximum number of connection retries.
     max_retries: u32,
     /// Delay between retries in milliseconds.
     retry_delay_ms: u64,
+    /// Explicit validated retry policy, if one supersedes legacy retry settings.
+    retry_policy: Option<ConnectionRetryPolicy>,
     /// Working directory for subprocess.
     working_dir: Option<PathBuf>,
     /// Environment variables to set for subprocess.
@@ -80,8 +209,63 @@ pub struct ClientBuilder {
     inherit_env: bool,
     /// Client capabilities to advertise.
     capabilities: ClientCapabilities,
+    /// Exact-2024 server-to-client callbacks installed before initialization.
+    reverse_request_handlers: ReverseRequestHandlers,
+    /// Shared inbound request slot for as_proxy reverse sampling/roots.
+    inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
+    /// Optional official MCP Apps client settings for final discovery.
+    mcp_apps_settings: Option<McpAppsClientSettings>,
+    /// Frozen generic final extension descriptors, local settings, and resolver.
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    /// Caller-supplied credential bound to the exact modern HTTPS resource.
+    http_bearer_credential: Option<crate::http_auth::BoundBearerCredential>,
+    /// Explicit private CA trust bound to the modern HTTPS POST endpoint.
+    http_resource_tls: Option<crate::http_executor::ResourceTlsTrust>,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
+    /// Whether the subprocess must be isolated in an owned Unix process group.
+    owned_process_group: bool,
+    protocol_plan: ClientProtocolPlan,
+}
+
+impl std::fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("client_info", &self.client_info)
+            .field("timeout_policy", &self.timeout_policy)
+            .field(
+                "subscription_timeout_policy",
+                &self.subscription_timeout_policy,
+            )
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay_ms", &self.retry_delay_ms)
+            .field("retry_policy", &self.retry_policy)
+            .field("working_dir_set", &self.working_dir.is_some())
+            .field("env_var_count", &self.env_vars.len())
+            .field("inherit_env", &self.inherit_env)
+            .field("sampling_capability", &self.capabilities.sampling.is_some())
+            .field(
+                "elicitation_capability",
+                &self.capabilities.elicitation.is_some(),
+            )
+            .field("roots_capability", &self.capabilities.roots.is_some())
+            .field(
+                "reverse_request_handlers_configured",
+                &!self.reverse_request_handlers.is_empty(),
+            )
+            .field("mcp_apps_configured", &self.mcp_apps_settings.is_some())
+            .field(
+                "client_extension_registry_configured",
+                &self.client_extension_runtime.is_some(),
+            )
+            .field("auto_initialize", &self.auto_initialize)
+            .field(
+                "http_bearer_configured",
+                &self.http_bearer_credential.is_some(),
+            )
+            .field("owned_process_group", &self.owned_process_group)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -89,11 +273,16 @@ impl ClientBuilder {
     ///
     /// Default configuration:
     /// - Client name: "fastmcp-client"
-    /// - Timeout: 30 seconds
+    /// - Request idle timeout: 30 seconds
+    /// - Request absolute timeout: 120 seconds
+    /// - Matching strictly increasing progress resets idle: enabled
+    /// - Modern HTTP subscription idle timeout: 5 minutes
+    /// - Modern HTTP subscription absolute timeout: 1 hour
     /// - Max retries: 0 (no retries)
     /// - Retry delay: 1 second
     /// - Inherit environment: true
     /// - Auto-initialize: false (initialize immediately on connect)
+    /// - Protocol policy: Auto when exact-2024 support is compiled, otherwise ModernOnly
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -101,14 +290,28 @@ impl ClientBuilder {
                 name: "fastmcp-client".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
-            timeout_ms: 30_000,
+            client_title: None,
+            client_description: None,
+            client_website_url: None,
+            client_icons: Vec::new(),
+            timeout_policy: RequestTimeoutPolicy::default(),
+            subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             max_retries: 0,
             retry_delay_ms: 1_000,
+            retry_policy: None,
             working_dir: None,
             env_vars: HashMap::new(),
             inherit_env: true,
             capabilities: ClientCapabilities::default(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
+            mcp_apps_settings: None,
+            client_extension_runtime: None,
+            http_bearer_credential: None,
+            http_resource_tls: None,
             auto_initialize: false,
+            owned_process_group: false,
+            protocol_plan: ClientProtocolPlan::stdio(DEFAULT_PROTOCOL_POLICY),
         }
     }
 
@@ -124,13 +327,87 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the request timeout in milliseconds.
-    ///
-    /// This affects how long the client waits for responses from the server.
-    /// Default is 30,000ms (30 seconds).
+    /// Sets the modern discovery/request title. Exact-2024 initialize stays name/version.
     #[must_use]
-    pub fn timeout_ms(mut self, timeout: u64) -> Self {
-        self.timeout_ms = timeout;
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.client_title = Some(title.into());
+        self
+    }
+
+    /// Sets the modern discovery/request description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.client_description = Some(description.into());
+        self
+    }
+
+    /// Sets the modern discovery/request website URL.
+    #[must_use]
+    pub fn website_url(mut self, website_url: impl Into<String>) -> Self {
+        self.client_website_url = Some(website_url.into());
+        self
+    }
+
+    /// Sets the modern discovery/request icon set.
+    #[must_use]
+    pub fn icons(mut self, icons: Vec<fastmcp_protocol::common_types::RawIcon>) -> Self {
+        self.client_icons = icons;
+        self
+    }
+
+    fn modern_client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+        let mut implementation = self.client_info.to_implementation();
+        implementation.title = self.client_title.clone();
+        implementation.description = self.client_description.clone();
+        if let Some(website_url) = self.client_website_url.as_deref()
+            && let Ok(uri) = fastmcp_protocol::common_types::AbsoluteUri::parse(website_url)
+        {
+            implementation.website_url = Some(uri);
+        }
+        implementation.icons = self.client_icons.clone();
+        implementation
+    }
+
+    fn client_implementation_for_session(
+        &self,
+    ) -> Option<fastmcp_protocol::common_types::Implementation> {
+        let implementation = self.modern_client_implementation();
+        if implementation.title.is_some()
+            || implementation.description.is_some()
+            || implementation.website_url.is_some()
+            || !implementation.icons.is_empty()
+        {
+            Some(implementation)
+        } else {
+            None
+        }
+    }
+
+    /// Sets the validated idle/absolute policy for ordinary requests.
+    ///
+    /// Initialization uses the same idle and absolute bounds, but has no
+    /// request-owned progress that could reset idle. On Unix, bounded
+    /// child-pipe readiness polling enforces both response timers even while a
+    /// server is silent or holds a partial frame. On non-Unix targets,
+    /// the standard child pipe has no portable safe readiness primitive, so
+    /// reads remain frame-boundary-only and synchronous child-stdin response
+    /// writes cannot be preempted by these timers. It also has no equivalent
+    /// bounded atomic cancellation-control write, so a required cancellation
+    /// or timeout control explicitly fails that connection.
+    #[must_use]
+    pub fn request_timeout_policy(mut self, policy: RequestTimeoutPolicy) -> Self {
+        self.timeout_policy = policy;
+        self
+    }
+
+    /// Sets the modern HTTP `subscriptions/listen` idle and absolute policy.
+    ///
+    /// The policy is validated before an HTTP connection opens. It applies
+    /// only to modern HTTP subscription response streams; ordinary requests
+    /// retain [`RequestTimeoutPolicy`].
+    #[must_use]
+    pub fn subscription_timeout_policy(mut self, policy: SubscriptionTimeoutPolicy) -> Self {
+        self.subscription_timeout_policy = policy;
         self
     }
 
@@ -141,6 +418,7 @@ impl ClientBuilder {
     #[must_use]
     pub fn max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
+        self.retry_policy = None;
         self
     }
 
@@ -150,7 +428,57 @@ impl ClientBuilder {
     #[must_use]
     pub fn retry_delay_ms(mut self, delay: u64) -> Self {
         self.retry_delay_ms = delay;
+        self.retry_policy = None;
         self
+    }
+
+    /// Sets a validated bounded policy for connection retries.
+    ///
+    /// `max_attempts` includes the initial attempt, so one attempt preserves
+    /// the default zero-retry behavior. The policy rejects values above the
+    /// connection safety caps and delay schedules that exceed `total_elapsed`.
+    pub fn connection_retry_policy(
+        mut self,
+        max_attempts: u32,
+        retry_delay: Duration,
+        total_elapsed: Duration,
+    ) -> McpResult<Self> {
+        self.retry_policy = Some(ConnectionRetryPolicy::new(
+            max_attempts,
+            retry_delay,
+            total_elapsed,
+        )?);
+        Ok(self)
+    }
+
+    /// Preserves a trusted application's retry count and millisecond delay.
+    ///
+    /// The initial attempt is followed by at most `max_retries` retries. This
+    /// explicit local configuration path has no aggregate elapsed-time cap;
+    /// each initialization still obeys the request timeout policy, and every
+    /// retry wait observes caller cancellation in bounded timer slices. Do not
+    /// derive these values from peer-controlled protocol fields.
+    ///
+    /// The ordinary retry setters and [`Self::connection_retry_policy`] retain
+    /// their bounded admission rules. Calling either ordinary retry setter
+    /// after this method selects those bounded rules again.
+    #[must_use]
+    pub fn application_retry_config(mut self, max_retries: u32, retry_delay_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.retry_delay_ms = retry_delay_ms;
+        self.retry_policy = Some(ConnectionRetryPolicy {
+            max_attempts: u64::from(max_retries) + 1,
+            retry_delay: Duration::from_millis(retry_delay_ms),
+            total_elapsed: None,
+        });
+        self
+    }
+
+    fn effective_connection_retry_policy(&self) -> McpResult<ConnectionRetryPolicy> {
+        match self.retry_policy {
+            Some(policy) => Ok(policy),
+            None => ConnectionRetryPolicy::from_legacy(self.max_retries, self.retry_delay_ms),
+        }
     }
 
     /// Sets the working directory for the subprocess.
@@ -197,11 +525,146 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the client capabilities to advertise to the server.
+    /// Sets the client capabilities advertised during initialization.
+    ///
+    /// The complete value replaces the default empty capability set.
     #[must_use]
     pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Configures exact MCP 2024-11-05 server-to-client request handlers.
+    ///
+    /// The builder derives the matching legacy `sampling` and `roots`
+    /// capabilities only if negotiation selects the exact legacy initialize
+    /// handshake. Auto discovery remains a modern request without these
+    /// legacy-only capability claims; a legacy fallback advertises them.
+    #[must_use]
+    pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
+        self.reverse_request_handlers = handlers;
+        self
+    }
+
+    /// Advertises exact-2024 sampling+roots and forwards reverse RPCs onto the
+    /// inbound request context bound by as_proxy.
+    ///
+    /// Handlers are installed before initialize so advertised capabilities
+    /// match the callable surface. `ProxyClient` binds the inbound ctx for
+    /// the duration of each forwarded tools/call.
+    #[must_use]
+    pub fn forward_inbound_legacy_reverse(mut self) -> Self {
+        let inbound = Arc::clone(&self.inbound_legacy_reverse);
+        self.capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
+        self.capabilities.roots = Some(RootsCapability {
+            list_changed: false,
+        });
+        self.reverse_request_handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message({
+                let inbound = Arc::clone(&inbound);
+                move |_cx, _cancel, params| {
+                    let inbound = Arc::clone(&inbound);
+                    Box::pin(async move {
+                        let inbound = inbound
+                            .lock()
+                            .map_err(|_| {
+                                McpError::internal_error("Stdio inbound reverse lock poisoned")
+                            })?
+                            .clone()
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "Stdio proxy legacy sampling callback is unavailable",
+                                )
+                            })?;
+                        if !inbound.can_sample() {
+                            return Err(McpError::invalid_request(
+                                "Sampling not available: client does not support sampling capability",
+                            ));
+                        }
+                        let response = inbound
+                            .sample_with_request(stdio_sampling_request_from_params(params)?)
+                            .await?;
+                        Ok(CreateMessageResult::text(response.text, response.model))
+                    })
+                }
+            })
+            .with_roots_list({
+                let inbound = Arc::clone(&inbound);
+                move |_cx, _cancel, _params| {
+                    let inbound = Arc::clone(&inbound);
+                    Box::pin(async move {
+                        let inbound = inbound
+                            .lock()
+                            .map_err(|_| {
+                                McpError::internal_error("Stdio inbound reverse lock poisoned")
+                            })?
+                            .clone()
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "Stdio proxy legacy roots callback is unavailable",
+                                )
+                            })?;
+                        let roots = inbound.list_roots().await?;
+                        Ok(ListRootsResult::new(
+                            roots
+                                .into_iter()
+                                .map(|root| match root.name {
+                                    Some(name) => Root::with_name(root.uri, name),
+                                    None => Root::new(root.uri),
+                                })
+                                .collect(),
+                        ))
+                    })
+                }
+            });
+        self
+    }
+
+    /// Configures the official MCP Apps MIME types advertised during final discovery.
+    ///
+    /// Apps can activate only on a final MCP connection when the server also
+    /// advertises its exact empty Apps marker. Exact legacy routes neither
+    /// advertise nor activate these settings.
+    #[cfg(feature = "apps")]
+    #[must_use]
+    pub fn mcp_apps(mut self, settings: McpAppsClientSettings) -> Self {
+        self.mcp_apps_settings = Some(settings);
+        self
+    }
+
+    /// Installs a final-only client extension registry and its local discovery settings.
+    ///
+    /// The builder validates every local settings owner and freezes the
+    /// descriptor registry before any connection exists. The resolver factory
+    /// is invoked once for every discovery connection or retry, and must
+    /// return an independent resolver instance rather than a shared mutable
+    /// handle. A resolver itself is intentionally not accepted: `Clone` does
+    /// not prove that `Arc<Mutex<_>>`-backed state is isolated. A successful modern
+    /// `server/discover` then produces one retained bilateral extension set;
+    /// [`Client::request_final_extension`](crate::Client::request_final_extension)
+    /// and its HTTP counterpart admit only client-to-server methods from that
+    /// set. Exact MCP 2024-11-05 never negotiates or exposes this surface.
+    pub fn extension_registry<F, R>(
+        mut self,
+        descriptors: ExtensionDescriptorRegistry,
+        client_discovery: ClientExtensionDiscovery,
+        resolver_factory: F,
+    ) -> McpResult<Self>
+    where
+        F: Fn() -> R + Send + Sync + 'static,
+        R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+    {
+        if self.client_extension_runtime.is_some() {
+            return Err(McpError::invalid_params(
+                "Client extension registry is already configured",
+            ));
+        }
+        self.client_extension_runtime = Some(Arc::new(ClientExtensionRuntime::new(
+            descriptors,
+            client_discovery,
+            resolver_factory,
+        )?));
+        Ok(self)
     }
 
     /// Enables auto-initialization mode.
@@ -210,18 +673,33 @@ impl ClientBuilder {
     /// the first method call (e.g., `list_tools`, `call_tool`). This allows
     /// the subprocess to start immediately without blocking on initialization.
     ///
+    /// `ProtocolPolicy::Auto` is the exception: it completes its disposable
+    /// modern probe during connection so a recognized refusal can be followed
+    /// only by a fresh exact-legacy subprocess. Fixed modern and legacy plans
+    /// retain deferred initialization.
+    /// On Unix, async request methods and `Client::ensure_initialized_with_cx`
+    /// yield during this first handshake. Dropping the first-use future retains
+    /// its request and deadline for the next call; synchronous methods resume
+    /// the same handshake with their usual blocking behavior.
+    ///
     /// Default is `false` (initialize immediately on connect).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let client = ClientBuilder::new()
+    /// # use fastmcp_rust::{ClientBuilder, Cx, McpResult};
+    /// # async fn connect(cx: &Cx) -> McpResult<()> {
+    /// let mut client = ClientBuilder::new()
     ///     .auto_initialize(true)
-    ///     .connect_stdio("uvx", &["my-server"])?;
+    ///     .connect_stdio_with_cx(cx, "uvx", &["my-server"])
+    ///     .await?;
     ///
     /// // Subprocess is running but not yet initialized
     /// // Initialization happens on first use:
     /// let tools = client.list_tools()?; // Initializes here
+    /// # let _ = tools;
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn auto_initialize(mut self, enabled: bool) -> Self {
@@ -229,74 +707,786 @@ impl ClientBuilder {
         self
     }
 
-    /// Connects to a server via stdio subprocess.
+    /// Requires ownership of the subprocess's inherited Unix process group.
     ///
-    /// Spawns the specified command as a subprocess and communicates via
-    /// stdin/stdout using JSON-RPC over NDJSON framing.
+    /// When enabled, a `/bin/sh` anchor becomes a dedicated process-group
+    /// leader. The requested executable is still spawned directly, as the
+    /// anchor's sibling in that group, so its executable, argument vector,
+    /// environment, working directory, and protocol descriptors retain normal
+    /// [`Command`] semantics. A private close-on-exec control pipe keeps the
+    /// anchor alive and asks it to kill its own group on explicit close, drop,
+    /// or owner-process death.
     ///
-    /// # Arguments
+    /// The caller must retain exclusive ownership of the spawned child: a
+    /// process-wide `waitpid(-1)` reaper or external signalling can interfere
+    /// with bounded reap verification. Descendants that deliberately enter
+    /// another process group or session are outside this ownership boundary.
+    /// A host-side `fork` that retains the private control descriptor can also
+    /// delay owner-death cleanup until that copy closes. This includes a
+    /// concurrent setup-time raw fork on Unix targets whose standard library
+    /// cannot create the internal socket pair with atomic close-on-exec.
     ///
-    /// * `command` - The command to run (e.g., "uvx", "npx")
-    /// * `args` - Arguments to pass to the command
+    /// The mode fails closed during connection on platforms where this crate
+    /// has no safe process-group or Job Object equivalent.
+    #[must_use]
+    pub fn owned_process_group(mut self, enabled: bool) -> Self {
+        self.owned_process_group = enabled;
+        self
+    }
+
+    /// Selects an immutable protocol and endpoint plan before process creation.
+    #[must_use]
+    pub fn protocol_plan(mut self, protocol_plan: ClientProtocolPlan) -> Self {
+        self.protocol_plan = protocol_plan;
+        self
+    }
+
+    /// Supplies a caller-acquired bearer credential for modern HTTP.
+    ///
+    /// Before any connection, the credential must bind the plan's exact HTTPS
+    /// POST endpoint. Discovery, requests, subscriptions and reverse-response
+    /// POSTs use that binding. Authentication never follows a redirect or
+    /// falls back to a legacy endpoint; this setter does not acquire or refresh
+    /// credentials. The token is never included in builder diagnostics.
+    /// An expired or revoked credential refuses each new POST before contact;
+    /// loss during connection setup also refuses the POST before writing it.
+    /// Authenticated intent never falls back to an anonymous request.
+    #[must_use]
+    pub fn http_bearer_credential(
+        mut self,
+        credential: crate::http_auth::BoundBearerCredential,
+    ) -> Self {
+        self.http_bearer_credential = Some(credential);
+        self
+    }
+
+    /// Adds a private CA for the exact modern HTTPS endpoint in the protocol
+    /// plan. Discovery and subsequent MCP POSTs retain this trust; legacy
+    /// fallback and a mismatching endpoint are refused before contact. Up to
+    /// eight distinct roots of at most 16 KiB each may be configured.
+    pub fn http_resource_root_certificate(
+        mut self,
+        resource: fastmcp_core::CanonicalHttpUrl,
+        certificate: asupersync::tls::Certificate,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        crate::http_executor::ResourceTlsTrust::add_root(
+            &mut self.http_resource_tls,
+            resource,
+            certificate,
+        )?;
+        Ok(self)
+    }
+
+    /// Returns the immutable protocol plan that will be validated before connect.
+    #[must_use]
+    pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
+        &self.protocol_plan
+    }
+
+    /// Starts a modern-first HTTP negotiation from this immutable builder plan.
+    ///
+    /// This is a side-effect-free admission boundary. The returned attempt
+    /// permits at most one modern probe and binds its cache to the complete
+    /// configured endpoint bundle rather than to an HTTP origin.
+    pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
+        self.validate_feature_configuration().map_err(|_| {
+            ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                policy: self.protocol_plan.policy(),
+            }
+        })?;
+        ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
+    }
+
+    /// Connects the configured HTTP plan with an explicit cancellation context.
+    ///
+    /// The connection consumes at most one disposable modern probe before
+    /// `Auto` may open its exact legacy SSE fallback. It never leaves protocol
+    /// classification to the caller.
+    ///
+    /// HTTP connection is deliberately available only through this
+    /// caller-owned context. In particular, the client library never creates
+    /// or re-enters a runtime to make this asynchronous boundary look
+    /// synchronous.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::ClientBuilder;
+    ///
+    /// // Omitting the caller-owned context is not a supported HTTP API.
+    /// let _ = ClientBuilder::new().connect_http();
+    /// ```
+    pub async fn connect_http_with_cx(
+        self,
+        cx: &Cx,
+    ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
+        let builder = self.selected_legacy_builder_with_reverse_handlers();
+        builder
+            .validate_feature_configuration()
+            .map_err(|_| builder.http_feature_configuration_admission_error())?;
+        builder
+            .validate_reverse_callback_configuration(&builder.protocol_plan)
+            .map_err(|_| Self::http_policy_admission_error())?;
+        builder
+            .timeout_policy
+            .validate()
+            .map_err(|_| Self::http_timeout_policy_error())?;
+        builder
+            .subscription_timeout_policy
+            .validate()
+            .map_err(|_| Self::http_timeout_policy_error())?;
+        let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        let mut client_capabilities = builder.capabilities.clone();
+        if reverse_request_handlers.has_modern_handlers() {
+            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+        }
+        let legacy_capabilities =
+            legacy_capabilities_for_handlers(&client_capabilities, &reverse_request_handlers);
+        let client_implementation = builder.client_implementation_for_session();
+        let mut connection = ClientHttpConnection::connect_with_settings(
+            cx,
+            builder.protocol_plan,
+            builder.client_info.clone(),
+            client_capabilities,
+            HttpConnectionSettings {
+                mcp_apps: builder.mcp_apps_settings,
+                extensions: builder.client_extension_runtime,
+                bearer: builder.http_bearer_credential,
+                resource_tls: builder.http_resource_tls,
+                request_timeout_policy: builder.timeout_policy,
+                subscription_timeout_policy: builder.subscription_timeout_policy,
+            },
+        )
+        .await?;
+        if let Some(implementation) = client_implementation {
+            connection.set_client_implementation(implementation);
+        }
+        match connection.selected_protocol_era() {
+            fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+                if reverse_request_handlers.has_modern_handlers() =>
+            {
+                connection
+                    .set_modern_reverse_request_handlers(reverse_request_handlers)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+                let _ = legacy_capabilities;
+            }
+            #[cfg(feature = "legacy-2024-11-05")]
+            fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024 => {
+                // This must run even for an empty handler set. A caller may not
+                // advertise exact-2024 sampling or roots authority without the
+                // matching callable handler merely because Auto selected legacy
+                // after its disposable modern probe.
+                reverse_request_handlers
+                    .validate_legacy_capabilities(&legacy_capabilities)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+                connection.set_legacy_client_capabilities(legacy_capabilities);
+                connection
+                    .set_legacy_reverse_request_handlers(reverse_request_handlers)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+            }
+            _ => {
+                let _ = (reverse_request_handlers, legacy_capabilities);
+            }
+        }
+
+        if cx.checkpoint().is_err() {
+            #[cfg(feature = "legacy-2024-11-05")]
+            if connection.selected_protocol_era()
+                == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+            {
+                return Err(ClientHttpConnectionError::Legacy(
+                    crate::LegacySseHttpClientError::Cancelled,
+                ));
+            }
+            return Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
+            ));
+        }
+
+        Ok(connection)
+    }
+
+    /// Connects a ready high-level HTTP client with an explicit cancellation context.
+    ///
+    /// Modern clients are ready after `server/discover`; exact legacy clients
+    /// are ready only after `initialize` and `notifications/initialized` have
+    /// both completed on the admitted legacy routes.
+    pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
+        let builder = self.selected_legacy_builder_with_reverse_handlers();
+        builder
+            .validate_feature_configuration()
+            .map_err(HttpClientError::CoreResult)?;
+        builder
+            .validate_reverse_callback_configuration(&builder.protocol_plan)
+            .map_err(HttpClientError::CoreResult)?;
+        builder
+            .timeout_policy
+            .validate()
+            .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
+        builder
+            .subscription_timeout_policy
+            .validate()
+            .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
+        let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        let mut client_capabilities = builder.capabilities.clone();
+        if reverse_request_handlers.has_modern_handlers() {
+            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+        }
+        let client_implementation = builder.client_implementation_for_session();
+        // Heap the connect step rather than awaiting it inline. It is the whole
+        // discovery-or-initialize flow and dominated this future's 16 KB, which
+        // every caller of this public method paid at its own `.await`
+        // (bd-y2xoc). Boxing the inner step keeps the public signature intact.
+        let mut client = Box::pin(HttpClient::connect_with_settings(
+            cx,
+            builder.protocol_plan,
+            builder.client_info,
+            client_capabilities,
+            HttpConnectionSettings {
+                mcp_apps: builder.mcp_apps_settings,
+                extensions: builder.client_extension_runtime,
+                bearer: builder.http_bearer_credential,
+                resource_tls: builder.http_resource_tls,
+                request_timeout_policy: builder.timeout_policy,
+                subscription_timeout_policy: builder.subscription_timeout_policy,
+            },
+            reverse_request_handlers,
+        ))
+        .await?;
+        if let Some(implementation) = client_implementation {
+            client.set_client_implementation(implementation);
+        }
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        Ok(client)
+    }
+
+    /// Connects to a server via a stdio subprocess under the caller's context.
+    ///
+    /// The caller-owned context is mandatory; the client library never creates
+    /// or re-enters a runtime merely to make stdio construction look
+    /// context-free.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::ClientBuilder;
+    ///
+    /// let _client = ClientBuilder::new().connect_stdio("server", &[]);
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The subprocess fails to spawn
-    /// - The initialization handshake fails
-    /// - All retry attempts are exhausted
-    pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-        self.connect_stdio_with_cx(command, args, &Cx::for_request())
+    /// Returns an error if the timeout or retry policy is invalid, the caller
+    /// is cancelled, the subprocess fails to spawn, initialization fails, or
+    /// all bounded retry attempts are exhausted.
+    pub async fn connect_stdio_with_cx(
+        self,
+        cx: &Cx,
+        command: &str,
+        args: &[&str],
+    ) -> McpResult<Client> {
+        // Keep the retry and failed-client cleanup state out of callers' futures.
+        Box::pin(async move {
+            // Reject unusable configuration once, before cancellation checks,
+            // retries, command resolution, or subprocess creation. In particular,
+            // auto-initialize must never return a live client that cannot issue its
+            // first protocol request.
+            let (retry_policy, retry_deadline) = self.validated_connection_retry_plan()?;
+            let mut last_error = None;
+
+            for attempt in 0..retry_policy.max_attempts {
+                // Honor cancellation/budget before each attempt.
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                if retry_deadline.expired() {
+                    return Err(Self::connection_retry_elapsed_error());
+                }
+
+                if attempt > 0 {
+                    Self::wait_for_connection_retry(cx, retry_policy.retry_delay, retry_deadline)
+                        .await?;
+                }
+
+                #[cfg(unix)]
+                let attempt_result = self
+                    .try_connect_yielding(command, args, cx, retry_deadline)
+                    .await;
+                #[cfg(not(unix))]
+                let attempt_result = self.try_connect(command, args, cx, retry_deadline);
+                match attempt_result {
+                    Ok(mut client) => {
+                        let operation_error = if cx.checkpoint().is_err() {
+                            Some(McpError::request_cancelled())
+                        } else if retry_deadline.expired() {
+                            Some(Self::connection_retry_elapsed_error())
+                        } else {
+                            client.set_request_timeout_policy(self.timeout_policy).err()
+                        };
+                        if let Some(error) = operation_error {
+                            return combine_operation_with_cleanup_async(
+                                Err(error),
+                                client.close_with_cx(cx),
+                            )
+                            .await;
+                        }
+                        return Ok(client);
+                    }
+                    Err(error) if is_cleanup_unverified(&error) => return Err(error),
+                    Err(e) => {
+                        last_error = Some(e);
+                        if retry_deadline.expired() {
+                            return Err(Self::connection_retry_elapsed_error());
+                        }
+                    }
+                }
+            }
+
+            // All attempts failed
+            Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
+        })
+        .await
     }
 
-    /// Connects to a server via stdio subprocess with a provided Cx.
+    /// Performs the one bounded stdio attempt used by fixed-plan constructors.
     ///
-    /// Same as [`connect_stdio`](Self::connect_stdio) but allows providing
-    /// a custom capability context for cancellation support.
-    pub fn connect_stdio_with_cx(self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
-        let mut last_error = None;
-        // Compute attempts in u64 to avoid overflow when max_retries == u32::MAX.
-        let attempts = u64::from(self.max_retries) + 1;
+    /// This deliberately does not implement retry waiting. Public configurable
+    /// retry users go through [`Self::connect_stdio_with_cx`] so every delay is
+    /// awaited under the caller's capability context.
+    pub(crate) fn connect_stdio_once_with_cx(
+        self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+    ) -> McpResult<Client> {
+        let (_retry_policy, retry_deadline) = self.validated_connection_retry_plan()?;
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if retry_deadline.expired() {
+            return Err(Self::connection_retry_elapsed_error());
+        }
 
-        for attempt in 0..attempts {
-            // Honor cancellation/budget before each attempt.
+        match self.try_connect(command, args, cx, retry_deadline) {
+            Ok(mut client) => {
+                if cx.checkpoint().is_err() {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(
+                        Err(McpError::request_cancelled()),
+                        || cleanup,
+                    );
+                }
+                if retry_deadline.expired() {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(
+                        Err(Self::connection_retry_elapsed_error()),
+                        || cleanup,
+                    );
+                }
+                if let Err(error) = client.set_request_timeout_policy(self.timeout_policy) {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(Err(error), || cleanup);
+                }
+                Ok(client)
+            }
+            Err(error) if is_cleanup_unverified(&error) => Err(error),
+            Err(_error) if retry_deadline.expired() => Err(Self::connection_retry_elapsed_error()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Negotiates one native caller-context async WebSocket connection.
+    ///
+    /// The caller establishes the real `ws://` or `wss://` transport with
+    /// [`AsyncWsClientTransport`] and passes its owned value here. This method
+    /// never blocks, creates a runtime, or accepts synthetic transport halves.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn connect_websocket_with_cx<IO>(
+        self,
+        cx: &Cx,
+        transport: AsyncWsClientTransport<IO>,
+    ) -> McpResult<WebSocketClient<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.validate_feature_configuration()?;
+        self.validate_websocket_configuration()?;
+        let client_implementation = self.client_implementation_for_session();
+        // Negotiation owns several protocol states. Pin it separately so
+        // wrapping this connection in a caller deadline keeps a small future.
+        Box::pin(WebSocketClient::connect_with_builder_configuration_with_cx(
+            cx,
+            self.protocol_plan,
+            self.client_info,
+            client_implementation,
+            self.capabilities,
+            self.reverse_request_handlers,
+            self.mcp_apps_settings,
+            self.client_extension_runtime,
+            transport,
+        ))
+        .await
+    }
+
+    /// Negotiates Auto with a caller-owned factory that creates a fresh
+    /// upgraded transport for the sole permitted exact-legacy retry.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn connect_websocket_auto_with_cx<IO, F, Fut>(
+        self,
+        cx: &Cx,
+        fresh_transport: F,
+    ) -> McpResult<WebSocketClient<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut(&Cx) -> Fut,
+        Fut: Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
+    {
+        self.validate_feature_configuration()?;
+        self.validate_websocket_configuration()?;
+        if !matches!(self.protocol_plan.policy(), ProtocolPolicy::Auto) {
+            return Err(McpError::invalid_params(
+                "connect_websocket_auto_with_cx requires the Auto protocol policy",
+            ));
+        }
+        WebSocketClient::connect_auto_with_builder_configuration_with_cx(
+            cx,
+            self.client_info,
+            self.capabilities,
+            self.reverse_request_handlers,
+            self.mcp_apps_settings,
+            self.client_extension_runtime,
+            fresh_transport,
+        )
+        .await
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn validate_websocket_configuration(&self) -> McpResult<()> {
+        if matches!(self.protocol_plan.policy(), ProtocolPolicy::ModernOnly)
+            && !self.reverse_request_handlers.is_empty()
+        {
+            return Err(McpError::invalid_params(
+                "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connection_retry_elapsed_error() -> McpError {
+        McpError::internal_error("Connection retry elapsed limit exceeded")
+    }
+
+    fn validated_connection_retry_plan(
+        &self,
+    ) -> McpResult<(ConnectionRetryPolicy, ConnectionRetryDeadline)> {
+        self.validate_feature_configuration()?;
+        self.timeout_policy.validate()?;
+        let retry_policy = self.effective_connection_retry_policy()?;
+        let retry_deadline = retry_policy
+            .total_elapsed
+            .map(|total_elapsed| {
+                Instant::now().checked_add(total_elapsed).ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Connection retry elapsed limit exceeds the monotonic clock range",
+                    )
+                })
+            })
+            .transpose()?;
+        Ok((retry_policy, ConnectionRetryDeadline(retry_deadline)))
+    }
+
+    async fn wait_for_connection_retry(
+        cx: &Cx,
+        retry_delay: Duration,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+
+        // Elapsed subtraction admits large application-configured delays
+        // without requiring one far-future Instant to be representable.
+        let delay_started = Instant::now();
+        loop {
             if cx.checkpoint().is_err() {
                 return Err(McpError::request_cancelled());
             }
 
-            if attempt > 0 {
-                // Delay before retry while still observing cancellation.
-                // Slice sleeps so cancellation is detected promptly even for long delays.
-                let mut remaining_ms = self.retry_delay_ms;
-                while remaining_ms > 0 {
-                    if cx.checkpoint().is_err() {
-                        return Err(McpError::request_cancelled());
-                    }
-
-                    let sleep_ms = remaining_ms.min(25);
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
-                    remaining_ms = remaining_ms.saturating_sub(sleep_ms);
-                }
+            let now = Instant::now();
+            if retry_deadline.expired() {
+                return Err(Self::connection_retry_elapsed_error());
+            }
+            let remaining_delay = retry_delay.saturating_sub(now.duration_since(delay_started));
+            if remaining_delay.is_zero() {
+                return Ok(());
             }
 
-            match self.try_connect(command, args, cx) {
-                Ok(client) => return Ok(client),
-                Err(e) => {
-                    last_error = Some(e);
+            let mut sleep_for = remaining_delay.min(CONNECTION_RETRY_CANCEL_SLICE);
+            if let Some(remaining_retry) = retry_deadline.remaining(now) {
+                sleep_for = sleep_for.min(remaining_retry);
+            }
+            if let Some(remaining_budget) = cx.budget().remaining_time(cx.now()) {
+                sleep_for = sleep_for.min(remaining_budget);
+            }
+            if sleep_for.is_zero() {
+                if cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                return Err(Self::connection_retry_elapsed_error());
+            }
+
+            // This caller-owned timer is deliberately sliced so cancellation
+            // and deadline checkpoints remain observable during a retry wait.
+            asupersync::time::sleep(cx.now(), sleep_for).await;
+        }
+    }
+
+    /// Runs startup reads and post-startup cleanup on the caller's runtime.
+    /// The existing spawn/admission path returns an owned provisional Client;
+    /// no transport lock or unowned child crosses an await here.
+    #[cfg(unix)]
+    async fn try_connect_yielding(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<Client> {
+        let auto_probe = self.protocol_plan.policy() == ProtocolPolicy::Auto;
+        let mut builder = match self.protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self.legacy_builder_with_reverse_handlers(),
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => self.clone(),
+        };
+        let mut plan = self.protocol_plan.clone();
+        if auto_probe {
+            builder.reverse_request_handlers = ReverseRequestHandlers::new();
+            plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+        }
+        let mut probing = auto_probe;
+        loop {
+            let mut client = match builder.try_connect_with_protocol_plan(
+                command,
+                args,
+                cx,
+                plan.clone(),
+                true,
+                false,
+                retry_deadline,
+            )? {
+                StdioConnectionAttempt::Connected(client) => client,
+                StdioConnectionAttempt::Fallback(_) => {
+                    unreachable!("spawning without initialization cannot select fallback")
+                }
+            };
+            if !auto_probe && self.auto_initialize {
+                return Ok(*client);
+            }
+            let operation =
+                match builder.initialize_timeout_policy_for_retry_deadline(retry_deadline) {
+                    Ok(policy) => {
+                        client.timeout_policy = policy;
+                        client.initialize_yielding(cx, probing, None).await
+                    }
+                    Err(error) => Err(error),
+                };
+            match operation {
+                Ok(Some(_signal)) => {
+                    // Cleanup must finish before fallback admission. It is
+                    // awaited even after cancellation and can veto the spawn.
+                    client.close_with_cx(cx).await?;
+                    crate::admit_auto_legacy_fallback(cx)?;
+                    if retry_deadline.expired() {
+                        return Err(Self::connection_retry_elapsed_error());
+                    }
+                    builder = self.legacy_builder_with_reverse_handlers();
+                    plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+                    probing = false;
+                }
+                Ok(None) => {
+                    if retry_deadline.expired() {
+                        return combine_operation_with_cleanup_async(
+                            Err(Self::connection_retry_elapsed_error()),
+                            client.close_with_cx(cx),
+                        )
+                        .await;
+                    }
+                    if auto_probe {
+                        client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                    }
+                    return Ok(*client);
+                }
+                Err(error) => {
+                    return combine_operation_with_cleanup_async(
+                        Err(error),
+                        client.close_with_cx(cx),
+                    )
+                    .await;
                 }
             }
         }
-
-        // All attempts failed
-        Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
     }
 
-    /// Attempts a single connection.
-    fn try_connect(&self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
+    /// Attempts a single connection for synchronous constructors.
+    fn try_connect(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<Client> {
+        match self.protocol_plan.policy() {
+            ProtocolPolicy::ModernOnly => match self.try_connect_with_protocol_plan(
+                command,
+                args,
+                cx,
+                self.protocol_plan.clone(),
+                self.auto_initialize,
+                false,
+                retry_deadline,
+            )? {
+                StdioConnectionAttempt::Connected(client) => Ok(*client),
+                StdioConnectionAttempt::Fallback(_) => {
+                    unreachable!("only an Auto modern probe can return a fallback signal")
+                }
+            },
+            ProtocolPolicy::LegacyOnly => {
+                let legacy_builder = self.legacy_builder_with_reverse_handlers();
+                match legacy_builder.try_connect_with_protocol_plan(
+                    command,
+                    args,
+                    cx,
+                    self.protocol_plan.clone(),
+                    self.auto_initialize,
+                    false,
+                    retry_deadline,
+                )? {
+                    StdioConnectionAttempt::Connected(client) => Ok(*client),
+                    StdioConnectionAttempt::Fallback(_) => {
+                        unreachable!("only an Auto modern probe can return a fallback signal")
+                    }
+                }
+            }
+            ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx, retry_deadline),
+        }
+    }
+
+    /// Returns the builder state for an already-selected exact-2024 connection.
+    ///
+    /// Reverse request handlers are an exact-2024 surface. Their derived
+    /// capabilities and handlers must therefore stay out of the disposable
+    /// final discovery probe and enter only after Auto has authorized its
+    /// fresh legacy connection.
+    fn legacy_builder_with_reverse_handlers(&self) -> Self {
+        let mut builder = self.clone();
+        builder.capabilities = legacy_capabilities_for_handlers(
+            &builder.capabilities,
+            &builder.reverse_request_handlers,
+        );
+        builder
+    }
+
+    /// Applies callback-derived capabilities only when the immutable plan has
+    /// already selected exact MCP 2024-11-05.
+    ///
+    /// This is intentionally distinct from Auto: a modern discovery probe
+    /// must remain free of legacy reverse-request capability claims.
+    fn selected_legacy_builder_with_reverse_handlers(&self) -> Self {
+        match self.protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self.legacy_builder_with_reverse_handlers(),
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => self.clone(),
+        }
+    }
+
+    /// Selects an era with a disposable modern child before exposing a client.
+    ///
+    /// A stdio peer has one opening-frame classification, so the modern probe
+    /// can never be reused for exact legacy initialization. Only a correlated
+    /// JSON-RPC discovery refusal or Unix-observable clean first-probe timeout
+    /// authorizes a second spawn.
+    fn try_connect_auto(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<Client> {
+        let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+        // Exact-2024 reverse handlers neither advertise nor execute during a
+        // modern probe. Keep that disposable child handler-free so Auto stays
+        // modern-first regardless of local legacy callback configuration.
+        let mut modern_builder = self.clone();
+        modern_builder.reverse_request_handlers = ReverseRequestHandlers::new();
+        match modern_builder.try_connect_with_protocol_plan(
+            command,
+            args,
+            cx,
+            modern_plan,
+            false,
+            true,
+            retry_deadline,
+        ) {
+            Ok(StdioConnectionAttempt::Connected(client)) => {
+                let mut client = *client;
+                client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                Ok(client)
+            }
+            Ok(StdioConnectionAttempt::Fallback(_signal)) => {
+                // The disposable modern child has been cleaned up before its
+                // structured signal reaches this branch. Observe cancellation
+                // again before creating a fresh legacy child.
+                crate::admit_auto_legacy_fallback(cx)?;
+                if retry_deadline.expired() {
+                    return Err(Self::connection_retry_elapsed_error());
+                }
+                let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
+                let legacy_builder = self.legacy_builder_with_reverse_handlers();
+                let mut client = match legacy_builder.try_connect_with_protocol_plan(
+                    command,
+                    args,
+                    cx,
+                    legacy_plan,
+                    false,
+                    false,
+                    retry_deadline,
+                )? {
+                    StdioConnectionAttempt::Connected(client) => *client,
+                    StdioConnectionAttempt::Fallback(_) => {
+                        unreachable!("an exact-2024 connection cannot emit an Auto fallback signal")
+                    }
+                };
+                client.set_protocol_plan_after_selection(self.protocol_plan.clone());
+                Ok(client)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Spawns one configured subprocess and applies one fixed protocol era.
+    fn try_connect_with_protocol_plan(
+        &self,
+        command: &str,
+        args: &[&str],
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        defer_initialization: bool,
+        auto_modern_probe: bool,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<StdioConnectionAttempt> {
+        self.validate_feature_configuration()?;
+        self.validate_reverse_callback_configuration(&protocol_plan)?;
+
+        // Keep command resolution and optional process-group setup on the
+        // admitted side of the caller's cancellation and retry bounds.
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if retry_deadline.expired() {
+            return Err(Self::connection_retry_elapsed_error());
+        }
+
         // Build the command
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
+        let (mut cmd, child_ownership, mut group_anchor) =
+            self.prepare_stdio_command(executable, args)?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
@@ -312,31 +1502,239 @@ impl ClientBuilder {
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
-
+        // Command setup, including an optional Unix process-group anchor, may
+        // consume the caller's cancellation or retry budget. Re-admit the MCP
+        // subprocess immediately before creation and report anchor cleanup if
+        // the attempt has expired in the meantime.
+        let admission_error = if cx.checkpoint().is_err() {
+            Some(McpError::request_cancelled())
+        } else if retry_deadline.expired() {
+            Some(Self::connection_retry_elapsed_error())
+        } else {
+            None
+        };
+        if let Some(error) = admission_error {
+            return combine_operation_with_cleanup(Err(error), || {
+                group_anchor
+                    .as_mut()
+                    .map_or(Ok(()), ProcessGroupAnchor::cleanup)
+            });
+        }
         // Spawn the subprocess
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| McpError::internal_error(format!("Failed to spawn subprocess: {e}")))?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let operation = Err(McpError::internal_error(format!(
+                    "Failed to spawn subprocess: {error}"
+                )));
+                return combine_operation_with_cleanup(operation, || {
+                    group_anchor
+                        .as_mut()
+                        .map_or(Ok(()), ProcessGroupAnchor::cleanup)
+                });
+            }
+        };
+        let mut child_guard = match group_anchor.take() {
+            Some(anchor) => ChildGuard::with_process_group(child, anchor),
+            None => ChildGuard::with_ownership(child, child_ownership),
+        };
+        if let Err(error) = child_guard.verify_group_anchor() {
+            return combine_operation_with_cleanup(Err(error), || child_guard.cleanup());
+        }
+        let initialization_policy = if defer_initialization {
+            None
+        } else {
+            match self.initialize_timeout_policy_for_retry_deadline(retry_deadline) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    return combine_operation_with_cleanup(Err(error), || child_guard.cleanup());
+                }
+            }
+        };
 
         // Get stdin/stdout handles
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::internal_error("Failed to get subprocess stdout"))?;
+        let stdin = match child_guard.child_mut().stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return combine_operation_with_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdin")),
+                    || child_guard.cleanup(),
+                );
+            }
+        };
+        let stdout = match child_guard.child_mut().stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return combine_operation_with_cleanup(
+                    Err(McpError::internal_error("Failed to get subprocess stdout")),
+                    || child_guard.cleanup(),
+                );
+            }
+        };
 
         // Create transport
         let transport = StdioTransport::new(stdout, stdin);
+        let (child, group_anchor) = child_guard.disarm_all();
 
-        if self.auto_initialize {
+        if defer_initialization {
             // Create uninitialized client - initialization will happen on first use
-            Ok(self.create_uninitialized_client(child, transport, cx))
+            Ok(StdioConnectionAttempt::Connected(Box::new(
+                self.create_uninitialized_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    self.timeout_policy,
+                ),
+            )))
         } else {
-            // Perform initialization immediately
-            self.initialize_client(child, transport, cx)
+            let timeout_policy =
+                initialization_policy.expect("initialized connection has a retry timeout policy");
+            if auto_modern_probe {
+                self.initialize_auto_modern_probe_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    timeout_policy,
+                    retry_deadline,
+                )
+            } else {
+                self.initialize_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    timeout_policy,
+                    retry_deadline,
+                )
+                .map(|client| StdioConnectionAttempt::Connected(Box::new(client)))
+            }
+        }
+    }
+
+    fn validate_reverse_callback_configuration(
+        &self,
+        protocol_plan: &ClientProtocolPlan,
+    ) -> McpResult<()> {
+        match protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self
+                .reverse_request_handlers
+                .validate_legacy_capabilities(&self.capabilities),
+            ProtocolPolicy::ModernOnly if !self.reverse_request_handlers.is_empty() => {
+                Err(McpError::invalid_params(
+                    "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+                ))
+            }
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Ok(()),
+        }
+    }
+
+    /// Refuses a policy or extension that this crate build did not include,
+    /// before it can resolve a command, spawn a process, or contact HTTP.
+    fn validate_feature_configuration(&self) -> McpResult<()> {
+        validate_protocol_plan_feature(&self.protocol_plan)?;
+
+        #[cfg(not(feature = "apps"))]
+        if self.mcp_apps_settings.is_some()
+            || self
+                .client_extension_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.configures_mcp_apps())
+        {
+            return Err(McpError::invalid_params(
+                "FeatureUnavailable: apps is compiled out; MCP Apps configuration requires --features apps",
+            ));
+        }
+
+        #[cfg(not(feature = "tasks"))]
+        if self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_extension("io.modelcontextprotocol/tasks"))
+        {
+            return Err(McpError::invalid_params(
+                "FeatureUnavailable: tasks is compiled out; Tasks configuration requires --features tasks",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn http_feature_configuration_admission_error(&self) -> ClientHttpConnectionError {
+        // The existing public HTTP connection error vocabulary has no
+        // feature-configuration admission variant. This is fail-closed: no
+        // modern probe is sent and no legacy route is opened.
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+            ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                policy: self.protocol_plan.policy(),
+            },
+        ))
+    }
+
+    fn http_policy_admission_error() -> ClientHttpConnectionError {
+        // Reverse callback admission has its own validation path. Retain the
+        // existing refusal shape here; feature configuration uses the typed
+        // `FeatureConfigurationUnavailable` outcome above.
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+            ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly,
+        ))
+    }
+
+    fn http_timeout_policy_error() -> ClientHttpConnectionError {
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+            ModernHttpExecutorError::InvalidTimeoutPolicy,
+        ))
+    }
+
+    fn initialize_timeout_policy_for_retry_deadline(
+        &self,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<RequestTimeoutPolicy> {
+        let mut policy = self.timeout_policy;
+        if let Some(remaining) = retry_deadline.remaining(Instant::now()) {
+            if remaining < Duration::from_millis(1) {
+                return Err(Self::connection_retry_elapsed_error());
+            }
+            // Keep the application's provenance when applying a separate
+            // aggregate retry limit to this initialization attempt.
+            policy.idle_timeout = policy.idle_timeout.min(remaining);
+            policy.absolute_timeout = policy.absolute_timeout.min(remaining);
+        }
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn prepare_stdio_command(
+        &self,
+        executable: PathBuf,
+        args: &[&str],
+    ) -> McpResult<(Command, ChildOwnership, Option<ProcessGroupAnchor>)> {
+        let mut command = Command::new(executable);
+        command.args(args);
+        if !self.owned_process_group {
+            return Ok((command, ChildOwnership::DirectChild, None));
+        }
+
+        #[cfg(unix)]
+        {
+            let anchor = ProcessGroupAnchor::spawn()?;
+            command.process_group(anchor.raw_process_group());
+            Ok((command, ChildOwnership::OwnedProcessGroup, Some(anchor)))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            Err(McpError::internal_error(
+                "Owned subprocess groups are unavailable on this platform",
+            ))
         }
     }
 
@@ -344,11 +1742,15 @@ impl ClientBuilder {
     fn create_uninitialized_client(
         &self,
         child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
         transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
     ) -> Client {
         // Create a placeholder session - will be updated on first use
-        let session = ClientSession::new(
+        let mut session = ClientSession::new_placeholder(
             self.client_info.clone(),
             self.capabilities.clone(),
             fastmcp_protocol::ServerInfo {
@@ -356,103 +1758,153 @@ impl ClientBuilder {
                 version: String::new(),
             },
             fastmcp_protocol::ServerCapabilities::default(),
-            String::new(),
-        );
+        )
+        .with_mcp_apps_settings(self.mcp_apps_settings.clone())
+        .with_client_extension_runtime(self.client_extension_runtime.clone())
+        .with_protocol_plan(protocol_plan);
+        if let Some(implementation) = self.client_implementation_for_session() {
+            session = session.with_client_implementation(implementation);
+        }
 
-        Client::from_parts_uninitialized(child, transport, cx.clone(), session, self.timeout_ms)
+        let mut client = Client::from_parts_uninitialized_with_ownership(
+            child,
+            child_ownership,
+            group_anchor,
+            transport,
+            cx.clone(),
+            session,
+            timeout_policy,
+        );
+        client.install_reverse_request_handlers_before_initialization(
+            self.reverse_request_handlers.clone(),
+        );
+        client.attach_inbound_legacy_reverse_slot(Arc::clone(&self.inbound_legacy_reverse));
+        client
     }
 
     /// Performs the initialization handshake and creates the client.
     fn initialize_client(
         &self,
         child: Child,
-        mut transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
+        transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
         cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
+        retry_deadline: ConnectionRetryDeadline,
     ) -> McpResult<Client> {
-        // Guard ensures child process is killed if initialization fails.
-        // Disarmed when client is successfully created.
-        let child_guard = ChildGuard::new(child);
-
-        // Send initialize request
-        let init_params = InitializeParams {
-            protocol_version: PROTOCOL_VERSION.to_string(),
-            capabilities: self.capabilities.clone(),
-            client_info: self.client_info.clone(),
-        };
-
-        let init_request = JsonRpcRequest::new(
-            "initialize",
-            Some(serde_json::to_value(&init_params).map_err(|e| {
-                McpError::internal_error(format!("Failed to serialize params: {e}"))
-            })?),
-            1i64,
-        );
-
-        transport
-            .send(cx, &JsonRpcMessage::Request(init_request))
-            .map_err(|e| McpError::internal_error(format!("Failed to send initialize: {e}")))?;
-
-        // Receive initialize response
-        let response = loop {
-            let msg = transport.recv(cx).map_err(|e| {
-                McpError::internal_error(format!("Failed to receive response: {e}"))
-            })?;
-
-            match msg {
-                JsonRpcMessage::Response(resp) => break resp,
-                JsonRpcMessage::Request(_) => {
-                    // Ignore server requests during initialization
-                }
-            }
-        };
-
-        // Check for error
-        if let Some(error) = response.error {
-            return Err(McpError::new(
-                fastmcp_core::McpErrorCode::Custom(error.code),
-                error.message,
-            ));
-        }
-
-        // Parse result
-        let result_value = response
-            .result
-            .ok_or_else(|| McpError::internal_error("No result in initialize response"))?;
-
-        let init_result: InitializeResult = serde_json::from_value(result_value).map_err(|e| {
-            McpError::internal_error(format!("Failed to parse initialize result: {e}"))
-        })?;
-
-        // Send initialized notification
-        let initialized_request = JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: "initialized".to_string(),
-            params: Some(serde_json::json!({})),
-            id: None,
-        };
-
-        transport
-            .send(cx, &JsonRpcMessage::Request(initialized_request))
-            .map_err(|e| McpError::internal_error(format!("Failed to send initialized: {e}")))?;
-
-        // Create session
-        let session = ClientSession::new(
-            self.client_info.clone(),
-            self.capabilities.clone(),
-            init_result.server_info,
-            init_result.capabilities,
-            init_result.protocol_version,
-        );
-
-        // Create client - disarm guard since Client now owns the subprocess
-        Ok(Client::from_parts(
-            child_guard.disarm(),
+        let mut client = self.create_uninitialized_client(
+            child,
+            child_ownership,
+            group_anchor,
             transport,
-            cx.clone(),
-            session,
-            self.timeout_ms,
-        ))
+            cx,
+            protocol_plan,
+            timeout_policy,
+        );
+        if let Err(error) = client.ensure_initialized() {
+            let cleanup = client.close();
+            return combine_operation_with_cleanup(Err(error), || cleanup);
+        }
+        if retry_deadline.expired() {
+            let cleanup = client.close();
+            return combine_operation_with_cleanup(
+                Err(Self::connection_retry_elapsed_error()),
+                || cleanup,
+            );
+        }
+        Ok(client)
     }
+
+    /// Initializes Auto's disposable modern child and closes it before
+    /// surfacing its one authorized fallback signal.
+    fn initialize_auto_modern_probe_client(
+        &self,
+        child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
+        transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
+        retry_deadline: ConnectionRetryDeadline,
+    ) -> McpResult<StdioConnectionAttempt> {
+        let mut client = self.create_uninitialized_client(
+            child,
+            child_ownership,
+            group_anchor,
+            transport,
+            cx,
+            protocol_plan,
+            timeout_policy,
+        );
+        match client.ensure_initialized_for_auto_modern_probe() {
+            Ok(Some(signal)) => {
+                // A fallback is valid only once its disposable child is gone.
+                // A cleanup failure is terminal and cannot be converted into a
+                // second subprocess attempt.
+                let cleanup = client.close();
+                combine_operation_and_cleanup(Ok(StdioConnectionAttempt::Fallback(signal)), cleanup)
+            }
+            Ok(None) => {
+                if retry_deadline.expired() {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(
+                        Err(Self::connection_retry_elapsed_error()),
+                        || cleanup,
+                    );
+                }
+                Ok(StdioConnectionAttempt::Connected(Box::new(client)))
+            }
+            Err(error) => {
+                let cleanup = client.close();
+                combine_operation_with_cleanup(Err(error), || cleanup)
+            }
+        }
+    }
+}
+
+fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<SamplingRequest> {
+    let max_tokens = params
+        .max_tokens
+        .as_i32()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            McpError::invalid_params("Stdio inbound sampling maxTokens must fit a u32 token budget")
+        })?;
+    let messages = params
+        .messages
+        .into_iter()
+        .map(|message| {
+            let text = match message.content {
+                SamplingContent::Text { text } => text,
+                SamplingContent::Image { .. } => {
+                    return Err(McpError::invalid_params(
+                        "Stdio inbound sampling cannot forward an image sampling message",
+                    ));
+                }
+            };
+            Ok(SamplingRequestMessage {
+                role: match message.role {
+                    fastmcp_protocol::Role::User => SamplingRole::User,
+                    fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
+                },
+                text,
+            })
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+    let mut request = SamplingRequest::new(messages, max_tokens);
+    if let Some(system_prompt) = params.system_prompt {
+        request = request.with_system_prompt(system_prompt);
+    }
+    if let Some(temperature) = params.temperature {
+        request = request.with_temperature(temperature);
+    }
+    if !params.stop_sequences.is_empty() {
+        request = request.with_stop_sequences(params.stop_sequences);
+    }
+    Ok(request)
 }
 
 impl Default for ClientBuilder {
@@ -464,42 +1916,1724 @@ impl Default for ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_core::McpErrorCode;
+    use fastmcp_core::{McpErrorCode, block_on};
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn reverse_callback_test_runtime() -> asupersync::runtime::Runtime {
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("reverse callback test runtime must build")
+    }
+
+    #[cfg(all(unix, feature = "apps", feature = "legacy-2024-11-05"))]
+    fn auto_legacy_lifecycle_script(discovery_error_code: i32) -> String {
+        format!(
+            "IFS= read -r first || exit 1; \\
+             case \"$first\" in \\
+             *server/discover*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":{discovery_error_code},\"message\":\"final discovery unavailable\"}}}}' ;; \\
+             *initialize*2024-11-05*) \\
+             case \"$first\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"builder-auto-legacy\",\"version\":\"1.0.0\"}}}}}}'; \\
+             IFS= read -r lifecycle || exit 1; \\
+             case \"$lifecycle\" in *notifications/initialized*) case \"$lifecycle\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac ;; *) exit 1 ;; esac; \\
+             IFS= read -r request || exit 1; \\
+             case \"$request\" in *ping*) case \"$request\" in *io.modelcontextprotocol/ui*|*_meta*) exit 1 ;; esac; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac ;; \\
+             *) exit 1 ;; esac; \\
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    fn modern_apps_lifecycle_script(server_advertises_apps: bool) -> String {
+        let discovery_result = if server_advertises_apps {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"builder-modern-apps","version":"1.0.0"}}}}"#
+        };
+        // The modern liveness probe is `server/discover` (MCP 2026-07-28
+        // removed `ping`); it carries the same per-request `_meta`.
+        let ping_case = if server_advertises_apps {
+            "*server/discover*io.modelcontextprotocol/ui*)"
+        } else {
+            "*server/discover*io.modelcontextprotocol/ui*) exit 1 ;; *server/discover*)"
+        };
+        format!(
+            "IFS= read -r discover || exit 1; \\
+             case \"$discover\" in *server/discover*io.modelcontextprotocol/ui*) printf '%s\\n' '{discovery_result}' ;; *) exit 1 ;; esac; \\
+             IFS= read -r ping || exit 1; \\
+             case \"$ping\" in {ping_case} printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \\
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    struct StdioRetryAttemptLog {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl StdioRetryAttemptLog {
+        fn new(label: &str) -> Self {
+            static NEXT_LOG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+            let log_id = NEXT_LOG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "fastmcp-client-stdio-retry-{label}-{}-{log_id}.log",
+                std::process::id()
+            ));
+            std::fs::write(&path, []).expect("retry attempt log must be created empty");
+            Self { path }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.path)
+                .expect("retry attempt log must remain readable")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StdioRetryAttemptLog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn yielding_connect_probe(policy: ProtocolPolicy, mode: &'static str, owned_group: bool) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let events = StdioRetryAttemptLog::new(mode);
+                // Completion requires progress on the caller's sole worker;
+                // a fixed peer sleep cannot establish that ordering.
+                let release = StdioRetryAttemptLog::new("yielding-peer-release");
+                let script = r#"
+wait_for_sibling() {
+    while [ ! -s "$1" ]; do sleep 0.001; done
+}
+printf 'spawn:%s\n' "$$" >> "$1"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+case "$first" in
+    *server/discover*) era=modern;;
+    *initialize*2024-11-05*) era=legacy;;
+    *) exit 92;;
+esac
+printf '%s\n' "$era" >> "$1"
+case "$2" in cancel|drop) exec sleep 5;; esac
+if [ "$era" = modern ]; then
+    case "$2" in
+        auto-silent) exec sleep 5;;
+        auto-refusal) wait_for_sibling "$3"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+        wrong-id) wait_for_sibling "$3"; printf '%s\n' '{"jsonrpc":"2.0","id":9,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5;;
+    esac
+fi
+printf '%s' '{"jsonrpc":"2.0",'
+if [ "$2" = partial ]; then exec sleep 5; fi
+wait_for_sibling "$3"
+if [ "$era" = modern ]; then
+    printf '%s\n' '"id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"yielding-startup-peer","version":"1"}}}}'
+else
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"yielding-startup-peer","version":"1"}}}'
+    IFS= read -r initialized || exit 93
+    case "$initialized" in *notifications/initialized*) ;; *) exit 94;; esac
+fi
+IFS= read -r ping || exit 95
+case "$ping" in *'"id":2'*) ;; *) exit 96;; esac
+# MCP 2026-07-28 removed `ping`; a modern session probes with server/discover.
+if [ "$era" = modern ]; then liveness='"method":"server/discover"'; else liveness='"method":"ping"'; fi
+case "$ping" in *"$liveness"*) ;; *) exit 97;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+exec sleep 5
+"#;
+                let builder = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .owned_process_group(owned_group)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(
+                        Duration::from_millis(400), Duration::from_millis(400),
+                    ).unwrap())
+                    .max_retries(0);
+                let args = ["-c", script, "yielding-startup-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()];
+                let worker = std::thread::current().id();
+                let started = Instant::now();
+                let mut connecting = Box::pin(builder.connect_stdio_with_cx(&cx, "sh", &args));
+                let first = std::future::poll_fn(|task_cx| Poll::Ready(connecting.as_mut().poll(task_cx))).await;
+                assert!(first.is_pending(), "eager initialization must yield before the peer completes");
+                // (c) KNOWN LOAD-DEPENDENT SITE, kept deliberately. The
+                // property is real and nothing else covers it: is_pending()
+                // proves the poll did not complete, not that it did not
+                // block. The peer ends in `exec sleep 5`, so a blocking poll
+                // measures ~5s against this 250ms bound -- a 20x margin.
+                // Virtual time cannot replace it: the peer is a real `sh`
+                // child and no test clock controls its sleep.
+                assert!(started.elapsed() < Duration::from_millis(250), "one startup poll occupied the caller worker; elapsed: {:?}", started.elapsed());
+                let path = events.path.clone();
+                let release_path = release.path.clone();
+                let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        sibling_cx.checkpoint().unwrap();
+                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 {
+                            std::fs::write(&release_path, b"continue\n").unwrap();
+                            return 1_u8;
+                        }
+                        assert!(Instant::now() < deadline, "the actual child never received initialization");
+                        asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
+                    }
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                if mode == "drop" {
+                    drop(connecting);
+                } else {
+                    if mode == "cancel" {
+                        cx.set_cancel_requested(true);
+                    }
+                    let result = connecting.await;
+                    cx.set_cancel_requested(false);
+                    if matches!(mode, "partial" | "wrong-id" | "cancel") {
+                        let error = match result {
+                            Err(error) => error,
+                            Ok(_) => panic!("invalid startup must not expose a client"),
+                        };
+                        if mode == "cancel" {
+                            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        } else {
+                            assert_eq!(error.data, Some(serde_json::json!({"timeoutSource":"absolute"})));
+                        }
+                    } else {
+                        let mut client = result.unwrap_or_else(|error| {
+                            panic!("startup {policy:?}/{mode} failed after {:?}: {error}; child events: {:?}", started.elapsed(), events.lines())
+                        });
+                        assert!(client.is_initialized());
+                        assert_eq!(client.session.server_info().map(|peer| peer.name.as_str()), Some("yielding-startup-peer"));
+                        assert_eq!(client.protocol_policy(), policy);
+                        let legacy = policy == ProtocolPolicy::LegacyOnly || mode.starts_with("auto-");
+                        assert_eq!(client.selected_protocol_era(), Some(if legacy {
+                            fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+                        } else {
+                            fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+                        }));
+                        client.ping_with_cx(&cx, &crate::McpRequestCancellation::new()).await.unwrap();
+                        client.close_with_cx(&cx).await.unwrap();
+                        assert!(client.child.is_none());
+                    }
+                }
+                // (b) REMOVED: an upper bound on real wall time here was
+                // redundant by construction. Each loop iteration already
+                // takes exactly one of two typed paths, and both entail the
+                // timing this bound was asserting:
+                //   - the error path asserts the exact typed timeout
+                //     (RequestCancelled, or data timeoutSource="absolute"),
+                //     which can only be produced by the 400ms
+                //     RequestTimeoutPolicy firing, not by waiting out the
+                //     peer's `exec sleep 5`;
+                //   - the success path asserts is_initialized(), the exact
+                //     server_info name, the selected era, a completed ping
+                //     and a completed close, none of which the peer can
+                //     satisfy while still sleeping.
+                // So no iteration can reach here having blocked on the
+                // child, and the 3s bound added no property the branch
+                // assertions do not already entail. It was also unsound:
+                // an upper bound on Instant::now() asserts the host was
+                // fast enough, which is not a property of the code, and it
+                // covered a whole multi-iteration loop spawning real `sh`
+                // children.
+                // Do not reinstate an upper bound on wall time here.
+                let lines = events.lines();
+                let pids = lines.iter().filter_map(|line| line.strip_prefix("spawn:")).collect::<Vec<_>>();
+                let fallback = mode.starts_with("auto-");
+                assert_eq!(pids.len(), if fallback { 2 } else { 1 });
+                if fallback {
+                    assert_ne!(pids[0], pids[1]);
+                    assert_eq!(lines[1], "modern");
+                    assert_eq!(lines[3], "legacy");
+                }
+                #[cfg(target_os = "linux")]
+                for pid in pids {
+                    assert!(!PathBuf::from(format!("/proc/{pid}")).exists(), "startup retained unreaped child {pid}");
+                }
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_legacy_positive() {
+        yielding_connect_probe(ProtocolPolicy::LegacyOnly, "positive", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_modern_positive() {
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "positive", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "positive", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_auto_fallback_positive() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "auto-refusal", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "auto-silent", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_partial_deadline() {
+        yielding_connect_probe(ProtocolPolicy::LegacyOnly, "partial", false);
+        yielding_connect_probe(ProtocolPolicy::Auto, "partial", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_cancel_no_fallback() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "cancel", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_drop_reaps_child() {
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "drop", false);
+        yielding_connect_probe(ProtocolPolicy::ModernOnly, "drop", true);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_connect_yielding_auto_rejects_wrong_id() {
+        yielding_connect_probe(ProtocolPolicy::Auto, "wrong-id", false);
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn legacy_initialize_reply(id: &str, name: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":"2024-11-05","capabilities":{{}},"serverInfo":{{"name":"{name}","version":"1.0.0"}}}}}}"#
+        )
+    }
+
+    /// A legacy peer that answers `initialize` (sent as ID 1) with `foreign`
+    /// first, when present, and then, when `exact_follows`, with ID 1.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn legacy_exact_id_script(foreign: Option<&str>, exact_follows: bool) -> String {
+        let foreign =
+            foreign.map_or_else(String::new, |reply| format!("printf '%s\\n' '{reply}'; "));
+        let exact = if exact_follows {
+            format!(
+                "printf '%s\\n' '{}'; IFS= read -r lifecycle || exit 1; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; ",
+                legacy_initialize_reply("1", "exact-id-server")
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "IFS= read -r first || exit 1; case \"$first\" in *initialize*2024-11-05*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *'\"id\":1'*) ;; *) exit 1 ;; esac; {foreign}{exact}exec sleep 5"
+        )
+    }
+
+    /// Connects `builder` through its yielding initializer, which polls the
+    /// handshake under this bounded absolute deadline.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn connect_yielding(builder: ClientBuilder, script: &str) -> McpResult<Client> {
+        block_on(
+            builder
+                .max_retries(0)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
+                        .expect("bounded handshake timeout is valid"),
+                )
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+        )
+    }
+
+    /// Connects under `policy` through both shipped initializers: the
+    /// builder's yielding poll and the synchronous public constructor.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn connect_on_both_initializers(
+        policy: ProtocolPolicy,
+        script: &str,
+    ) -> [(&'static str, McpResult<Client>); 2] {
+        let direct = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
+            "sh",
+            &["-c", script],
+            ClientProtocolPlan::stdio(policy),
+        );
+        let builder = ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(policy));
+        [
+            ("builder", connect_yielding(builder, script)),
+            ("constructor", direct),
+        ]
+    }
+
+    /// Both shipped legacy initializers correlate `initialize` by its exact
+    /// request ID. A reply under another number, under the same digits as a
+    /// string, or under a peer-chosen string never completes the handshake;
+    /// the client keeps waiting and takes the exact reply behind it.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_initialize_waits_past_foreign_ids_for_its_exact_request_id() {
+        for foreign in [
+            None,
+            Some("2"),
+            Some("\"1\""),
+            Some("\"PEER-ID-SECRET-CANARY\""),
+        ] {
+            let foreign_reply = foreign.map(|id| legacy_initialize_reply(id, "foreign-id-server"));
+            let script = legacy_exact_id_script(foreign_reply.as_deref(), true);
+            for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script)
+            {
+                let mut client =
+                    result.unwrap_or_else(|error| panic!("{path} with {foreign:?}: {error}"));
+                assert_eq!(
+                    client
+                        .session
+                        .server_info()
+                        .expect("the fixture peer advertises identity")
+                        .name,
+                    "exact-id-server",
+                    "{path} with {foreign:?}"
+                );
+                assert_eq!(
+                    client.selected_protocol_era(),
+                    Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+                );
+                client.close().expect("legacy exact-id client cleanup");
+            }
+        }
+    }
+
+    /// With nothing behind a peer-chosen ID, `initialize` stays unanswered
+    /// until its own absolute deadline, and the error does not repeat the ID.
+    /// A reply with no ID at all is terminal even when the exact reply
+    /// follows it.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_initialize_fails_closed_on_foreign_or_missing_ids_without_echoing_them() {
+        let canary = "PEER-ID-SECRET-CANARY";
+        let foreign = legacy_initialize_reply(&format!("\"{canary}\""), "foreign-id-server");
+        for exact_follows in [false, true] {
+            let script = legacy_exact_id_script(Some(&foreign), exact_follows);
+            let legacy = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly));
+            let yielding = connect_yielding(legacy, &script);
+            if exact_follows {
+                let mut client =
+                    yielding.expect("the exact reply behind the canary ID initializes");
+                assert_eq!(
+                    client
+                        .session
+                        .server_info()
+                        .expect("the fixture peer advertises identity")
+                        .name,
+                    "exact-id-server"
+                );
+                client.close().expect("legacy canary control cleanup");
+                continue;
+            }
+            let Err(error) = yielding else {
+                panic!("an initialize reply under a foreign ID must not expose a client");
+            };
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource":"absolute"}))
+            );
+            assert!(!error.message.contains(canary), "{error:?}");
+            assert!(!format!("{error:?}").contains(canary), "{error:?}");
+        }
+
+        let missing =
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"no correlation"}}"#;
+        let script = legacy_exact_id_script(Some(missing), true);
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script) {
+            assert!(
+                result.is_err(),
+                "{path}: a missing-ID reply must fail initialize closed"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const INITIALIZING_PING: &str = r#"{"jsonrpc":"2.0","id":"init-request","method":"ping"}"#;
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const PING_ANSWERED: &str = r#""result":{}"#;
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    const METHOD_NOT_FOUND: &str = r#""code":-32601"#;
+
+    /// A peer that sends `request` (ID `init-request`) while the client's
+    /// handshake is in flight, exits unless the client answers it under that
+    /// ID with `expected`, and only then completes the handshake. `discover`
+    /// is the shell branch taken when the first line is `server/discover`.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn initializing_server_request_script(discover: &str, request: &str, expected: &str) -> String {
+        let legacy = legacy_initialize_reply("1", "initializing-request-server");
+        let modern = r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"initializing-request-server","version":"1"}}}}"#;
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*) {discover} ;; *initialize*2024-11-05*) era=legacy ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{request}'; \
+             IFS= read -r early || exit 2; \
+             case \"$early\" in *'\"id\":\"init-request\"'*) ;; *) exit 3 ;; esac; \
+             case \"$early\" in *'{expected}'*) ;; *) exit 4 ;; esac; \
+             if [ \"$era\" = legacy ]; then \
+             printf '%s\\n' '{legacy}'; \
+             IFS= read -r lifecycle || exit 5; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 6 ;; esac; \
+             else printf '%s\\n' '{modern}'; fi; \
+             exec sleep 5"
+        )
+    }
+
+    /// MCP 2024-11-05 lets a server ping before `initialized`, so a ping sent
+    /// while a legacy `initialize` is in flight gets `{}` under its exact ID
+    /// on both shipped initializers, and under Auto after it falls back to
+    /// the legacy handshake. The peer exits on any other answer.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn legacy_server_ping_is_answered_while_initialize_is_in_flight() {
+        let script = initializing_server_request_script("exit 1", INITIALIZING_PING, PING_ANSWERED);
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::LegacyOnly, &script) {
+            let mut client = result.unwrap_or_else(|error| {
+                panic!("{path}: a ping during legacy initialize must get {{}}: {error}")
+            });
+            assert_eq!(
+                client
+                    .session
+                    .server_info()
+                    .expect("the fixture peer advertises identity")
+                    .name,
+                "initializing-request-server"
+            );
+            client
+                .close()
+                .expect("legacy initializing-ping client cleanup");
+        }
+
+        let refuse_discovery = r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no discovery"}}'; exec sleep 5"#;
+        let script =
+            initializing_server_request_script(refuse_discovery, INITIALIZING_PING, PING_ANSWERED);
+        let auto =
+            ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+        let mut client = connect_yielding(auto, &script)
+            .unwrap_or_else(|error| panic!("Auto's legacy fallback must answer the ping: {error}"));
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .close()
+            .expect("Auto fallback initializing-ping client cleanup");
+    }
+
+    /// The same ping while a modern `server/discover` is in flight gets
+    /// method-not-found, and so do `roots/list` and `sampling/createMessage`
+    /// during a legacy `initialize`, each with its handler configured: the
+    /// spec allows only pings and logging before `initialized`.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn server_requests_during_the_handshake_other_than_legacy_ping_are_refused() {
+        let script =
+            initializing_server_request_script("era=modern", INITIALIZING_PING, METHOD_NOT_FOUND);
+        for (path, result) in connect_on_both_initializers(ProtocolPolicy::ModernOnly, &script) {
+            let mut client = result.unwrap_or_else(|error| {
+                panic!("{path}: a ping during server/discover must be refused: {error}")
+            });
+            assert_eq!(
+                client
+                    .session
+                    .server_info()
+                    .expect("the fixture peer advertises identity")
+                    .name,
+                "initializing-request-server"
+            );
+            client
+                .close()
+                .expect("modern initializing-ping client cleanup");
+        }
+
+        let roots = r#"{"jsonrpc":"2.0","id":"init-request","method":"roots/list"}"#;
+        let script = initializing_server_request_script("exit 1", roots, METHOD_NOT_FOUND);
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = Some(fastmcp_protocol::RootsCapability { list_changed: true });
+        let legacy = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+                },
+            ));
+        let mut client = connect_yielding(legacy, &script).unwrap_or_else(|error| {
+            panic!("roots/list during initialize must be refused: {error}")
+        });
+        assert_eq!(
+            client
+                .session
+                .server_info()
+                .expect("the fixture peer advertises identity")
+                .name,
+            "initializing-request-server"
+        );
+        client
+            .close()
+            .expect("legacy initializing-roots client cleanup");
+
+        let sampling = r#"{"jsonrpc":"2.0","id":"init-request","method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}"#;
+        let script = initializing_server_request_script("exit 1", sampling, METHOD_NOT_FOUND);
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
+        let legacy = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_sampling_create_message(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async {
+                        Ok(fastmcp_protocol::CreateMessageResult::text(
+                            "must not be produced before initialized",
+                            "test-model",
+                        ))
+                    })
+                },
+            ));
+        let mut client = connect_yielding(legacy, &script).unwrap_or_else(|error| {
+            panic!("sampling/createMessage during initialize must be refused: {error}")
+        });
+        assert_eq!(
+            client
+                .session
+                .server_info()
+                .expect("the fixture peer advertises identity")
+                .name,
+            "initializing-request-server"
+        );
+        client
+            .close()
+            .expect("legacy initializing-sampling client cleanup");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    async fn deferred_probe_request(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &crate::McpRequestCancellation,
+        api: &str,
+    ) -> McpResult<()> {
+        match api {
+            "raw" => {
+                let response = client.request_with_cx(cx, "ping", None).await?;
+                assert_eq!(response.result, Some(serde_json::json!({})));
+                assert!(response.error.is_none());
+            }
+            "core" => {
+                let result = client
+                    .request_core_with_cx(cx, cancellation, "tools/list", serde_json::json!({}))
+                    .await?;
+                match result {
+                    crate::CoreResult::Legacy(crate::LegacyCoreResult::ToolsList(result)) => {
+                        assert!(result.tools.is_empty());
+                    }
+                    crate::CoreResult::Final(crate::FinalCoreResult::ToolsList {
+                        result, ..
+                    }) => {
+                        assert!(result.payload.tools.is_empty());
+                    }
+                    other => panic!("unexpected deferred catalog result: {other:?}"),
+                }
+            }
+            "legacy" => {
+                let result = client
+                    .request_legacy_core_with_cx(cx, crate::LegacyCoreRequest::Ping)
+                    .await?;
+                assert!(matches!(result, crate::LegacyCoreResult::Ping(_)));
+            }
+            "initialize" => {
+                client.ensure_initialized_with_cx(cx).await?;
+                client.ping_with_cx(cx, cancellation).await?;
+            }
+            #[cfg(feature = "tasks")]
+            "tasks" => {
+                let task = client
+                    .get_task_final_with_cx(
+                        cx,
+                        cancellation,
+                        crate::FinalTaskId::parse("task-1").unwrap(),
+                    )
+                    .await?;
+                assert_eq!(task.task.base().task_id.as_str(), "task-1");
+                assert!(matches!(task.task, crate::FinalTask::Working { .. }));
+            }
+            _ => client.ping_with_cx(cx, cancellation).await?,
+        }
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn deferred_initialization_probe(
+        policy: ProtocolPolicy,
+        mode: &'static str,
+        api: &'static str,
+    ) {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let root = Cx::current().unwrap();
+            let sibling_root = root.clone();
+            let mut work = root.spawn(move |cx| async move {
+                let events = StdioRetryAttemptLog::new(mode);
+                // Keep first use pending until the same-worker sibling has
+                // observed the handshake and explicitly releases its peer.
+                let release = StdioRetryAttemptLog::new("deferred-peer-release");
+                let script = r#"
+printf 'spawn:%s\n' "$$" >> "$1"
+IFS= read -r first || exit 90
+case "$first" in *'"id":1'*) ;; *) exit 91;; esac
+case "$first" in *server/discover*) era=modern;; *initialize*2024-11-05*) era=legacy;; *) exit 92;; esac
+printf 'handshake:%s\n' "$era" >> "$1"
+case "$2" in silent|close) exec sleep 5;; esac
+printf '%s' '{"jsonrpc":"2.0",'
+if [ "$2" = partial ]; then exec sleep 5; fi
+while [ ! -s "$3" ]; do sleep 0.001; done
+if [ "$2" = invalid ]; then
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{},"serverInfo":{"name":"invalid-peer","version":"1"}}}'
+    exec sleep 5
+fi
+if [ "$era" = modern ]; then
+    printf '%s\n' '"id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"deferred-peer","version":"1"}}}}'
+else
+    printf '%s\n' '"id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"deferred-peer","version":"1"}}}'
+    IFS= read -r initialized || exit 93
+    case "$initialized" in *notifications/initialized*) ;; *) exit 94;; esac
+fi
+IFS= read -r request || exit 95
+printf 'request:%s\n' "$request" >> "$1"
+case "$request" in *'"id":2'*) ;; *) exit 96;; esac
+case "$request" in
+    *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}';;
+    *'"method":"server/discover"'*)
+        # A modern client's liveness probe is server/discover (MCP 2026-07-28
+        # removed ping); only a modern session may send it.
+        [ "$era" = modern ] || exit 97
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"deferred-peer","version":"1"}}}}';;
+    *'"method":"tasks/get"'*)
+        case "$request" in *'"taskId":"task-1"'*'"id":2'*) ;; *) exit 98;; esac
+        case "$request" in *'"extensions":{"io.modelcontextprotocol/tasks":{}}'*) ;; *) exit 99;; esac
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"working","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null}}';;
+    *'"method":"tools/list"'*)
+        if [ "$era" = modern ]; then
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
+        else
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+        fi;;
+    *) exit 97;;
+esac
+exec sleep 5
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .auto_initialize(true)
+                    .request_timeout_policy(RequestTimeoutPolicy::new(
+                        Duration::from_millis(900), Duration::from_millis(900),
+                    ).unwrap())
+                    .max_retries(0)
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script, "deferred-peer", events.path.to_str().unwrap(), mode, release.path.to_str().unwrap()])
+                    .await.unwrap();
+                assert!(!client.is_initialized());
+                let mut cancellation = crate::McpRequestCancellation::new();
+                if mode.starts_with("pre-") {
+                    if mode == "pre-token" { cancellation.cancel(); } else { cx.set_cancel_requested(true); }
+                    let error = deferred_probe_request(&mut client, &cx, &cancellation, api).await.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert!(client.pending_initialization.is_none());
+                    assert!(!client.is_initialized());
+                    assert!(!events.lines().iter().any(|line| line.starts_with("handshake:")));
+                    cx.set_cancel_requested(false);
+                    cancellation = crate::McpRequestCancellation::new();
+                }
+                let worker = std::thread::current().id();
+                let started = Instant::now();
+                let mut first_use = Box::pin(deferred_probe_request(&mut client, &cx, &cancellation, api));
+                let first = std::future::poll_fn(|task_cx| Poll::Ready(first_use.as_mut().poll(task_cx))).await;
+                assert!(first.is_pending(), "deferred first use must yield before initialization completes");
+                // (c) KNOWN LOAD-DEPENDENT SITE, kept deliberately. Same
+                // shape as the eager-startup case above: is_pending() proves
+                // the poll did not complete, this proves it did not block.
+                // 250ms against a real `sh` peer sleeping 5s, a 20x margin,
+                // and virtual time cannot control that child.
+                assert!(started.elapsed() < Duration::from_millis(250), "deferred initialization occupied the caller worker; elapsed: {:?}", started.elapsed());
+                let path = events.path.clone();
+                let release_path = release.path.clone();
+                let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if std::fs::read_to_string(&path).unwrap().lines().count() >= 2 {
+                            std::fs::write(&release_path, b"continue\n").unwrap();
+                            return 1_u8;
+                        }
+                        assert!(Instant::now() < deadline, "child never received initialization");
+                        asupersync::time::sleep(sibling_cx.now(), Duration::from_millis(1)).await;
+                    }
+                }).unwrap();
+                assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
+                let result = if matches!(mode, "drop-async" | "drop-sync" | "partial" | "silent" | "close") {
+                    drop(first_use);
+                    assert!(!client.is_initialized());
+                    assert!(client.pending_initialization.is_some());
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    if mode == "close" {
+                        client.close_with_cx(&cx).await.unwrap();
+                        Err(client.ensure_initialized_with_cx(&cx).await.unwrap_err())
+                    } else {
+                        if matches!(mode, "partial" | "silent") {
+                            asupersync::time::sleep(cx.now(), Duration::from_millis(1000)).await;
+                        }
+                        let resumed = Instant::now();
+                        if mode == "drop-sync" { client.ensure_initialized().unwrap(); }
+                        let result = deferred_probe_request(&mut client, &cx, &cancellation, api).await;
+                        if matches!(mode, "partial" | "silent") {
+                            // (c) KNOWN LOAD-DEPENDENT SITE, and the most
+                            // fragile of this file's: 250ms against a 400ms
+                            // handshake restart is only a 1.6x margin, where
+                            // the sibling sites have 20x. The property is
+                            // real -- resumption must reuse the in-flight
+                            // handshake rather than restart its deadline --
+                            // and next_id is a partial structural proxy
+                            // (asserted == 2 above), but it does not
+                            // distinguish reuse from a restart that mints no
+                            // new id. Narrow this margin only with a
+                            // structural assertion, never by raising the
+                            // bound.
+                            assert!(resumed.elapsed() < Duration::from_millis(250), "resumption restarted the handshake deadline");
+                        }
+                        result
+                    }
+                } else {
+                    if mode == "cancel-token" { cancellation.cancel(); }
+                    if mode == "cancel-cx" { cx.set_cancel_requested(true); }
+                    let result = first_use.await;
+                    cx.set_cancel_requested(false);
+                    result
+                };
+                if matches!(mode, "partial" | "silent" | "invalid" | "close" | "cancel-token" | "cancel-cx") {
+                    let error = result.expect_err("interrupted or invalid initialization cannot expose a selected client");
+                    if mode.starts_with("cancel-") { assert_eq!(error.code, McpErrorCode::RequestCancelled); }
+                    if matches!(mode, "partial" | "silent") {
+                        assert_eq!(error.data, Some(serde_json::json!({"timeoutSource":"absolute"})));
+                    }
+                    assert!(!client.is_initialized());
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 2);
+                    assert!(client.ensure_initialized_with_cx(&cx).await.is_err());
+                    assert!(client.ensure_initialized().is_err());
+                    assert!(!events.lines().iter().any(|line| line.starts_with("request:")));
+                } else {
+                    result.unwrap();
+                    assert!(client.is_initialized());
+                    assert!(client.pending_initialization.is_none());
+                    assert_eq!(client.session.server_info().map(|peer| peer.name.as_str()), Some("deferred-peer"));
+                    assert_eq!(client.next_id.load(std::sync::atomic::Ordering::SeqCst), 3);
+                    assert_eq!(events.lines().iter().filter(|line| line.starts_with("request:")).count(), 1);
+                }
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(client.child.is_none());
+                let lines = events.lines();
+                assert_eq!(lines.iter().filter(|line| line.starts_with("handshake:")).count(), 1);
+                let pids = lines.iter().filter_map(|line| line.strip_prefix("spawn:")).collect::<Vec<_>>();
+                assert_eq!(pids.len(), 1);
+                #[cfg(target_os = "linux")]
+                assert!(!PathBuf::from(format!("/proc/{}", pids[0])).exists());
+            }).unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_yielding_legacy_positive() {
+        for api in ["ping", "raw", "core", "legacy", "initialize"] {
+            deferred_initialization_probe(ProtocolPolicy::LegacyOnly, "positive", api);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_yielding_modern_positive() {
+        for api in ["ping", "raw", "core", "initialize"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, "positive", api);
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_drop_resume_async() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "drop-async", "core");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_drop_resume_sync() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "drop-sync", "core");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_deadline_not_restarted() {
+        for mode in ["partial", "silent"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_cancel_stays_terminal() {
+        for mode in ["cancel-token", "cancel-cx"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_pre_cancel_leaves_handshake_unsent() {
+        for mode in ["pre-token", "pre-cx"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_rejects_invalid_initialization() {
+        for policy in [ProtocolPolicy::LegacyOnly, ProtocolPolicy::ModernOnly] {
+            deferred_initialization_probe(policy, "invalid", "ping");
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn client_deferred_close_pending_handshake() {
+        deferred_initialization_probe(ProtocolPolicy::ModernOnly, "close", "ping");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05", feature = "tasks"))]
+    #[test]
+    fn client_deferred_tasks_yielding_positive() {
+        for mode in ["positive", "drop-async", "cancel-token", "pre-token"] {
+            deferred_initialization_probe(ProtocolPolicy::ModernOnly, mode, "tasks");
+        }
+    }
+
+    #[cfg(unix)]
+    struct PublicStdioRetryProbe {
+        error: McpError,
+        attempt_events: Vec<String>,
+        elapsed: Duration,
+    }
+
+    #[cfg(unix)]
+    fn run_public_stdio_retry_probe(cancel_during_delay: bool) -> PublicStdioRetryProbe {
+        const RETRY_DELAY_MS: u64 = 2_000;
+        const FIRST_RESPONSE: [&str; 2] = ["spawn", "response"];
+
+        let attempt_log = StdioRetryAttemptLog::new(if cancel_during_delay {
+            "cancelled"
+        } else {
+            "active"
+        });
+        let attempt_log_arg = attempt_log
+            .path
+            .to_str()
+            .expect("temporary retry attempt path must be valid UTF-8");
+        // Cleanup may kill the peer as soon as its error is parsed. Keep the
+        // outer closing brace unpublished until the response log is committed;
+        // even EOF cannot turn the incomplete prefix into a valid response.
+        let script = r#"printf '%s\n' spawn >> "$1" || exit 90;
+            IFS= read -r request || exit 91;
+            case "$request" in *server/discover*) ;; *) exit 92 ;; esac;
+            printf '%s' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"planned retry probe failure"}' || exit 93;
+            printf '%s\n' response >> "$1" || exit 94;
+            printf '}\n' || exit 95;
+            exit 73"#;
+        let cx = Cx::for_request();
+        let canceller = cancel_during_delay.then(|| {
+            let cancellation_cx = cx.clone();
+            let cancellation_log = attempt_log.path.clone();
+            std::thread::spawn(move || {
+                let observation_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let events = std::fs::read_to_string(&cancellation_log).unwrap_or_default();
+                    if events.lines().eq(FIRST_RESPONSE) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < observation_deadline,
+                        "the first real child must emit its correlated failure before cancellation"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+
+                // The child has emitted its terminal response. Give the public
+                // connection path time to enter its much longer retry delay,
+                // then cancel that caller-owned wait.
+                std::thread::sleep(Duration::from_millis(50));
+                cancellation_cx.set_cancel_requested(true);
+            })
+        });
+
+        let started = Instant::now();
+        let result = block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .auto_initialize(false)
+                // One retry after the fixed delay, with no aggregate elapsed
+                // cap. The probe proves delay gating and the second real child;
+                // a wall-clock cap would instead measure how fast the host
+                // spawns `sh`, and loaded hosts exceeded 5s. The cap has its
+                // own test.
+                .application_retry_config(1, RETRY_DELAY_MS)
+                .connect_stdio_with_cx(
+                    &cx,
+                    "sh",
+                    &["-c", script, "fastmcp-stdio-retry-probe", attempt_log_arg],
+                ),
+        );
+        let elapsed = started.elapsed();
+        if let Some(canceller) = canceller {
+            canceller
+                .join()
+                .expect("retry-delay cancellation helper must complete");
+        }
+        let error = match result {
+            Ok(mut client) => {
+                client
+                    .close()
+                    .expect("unexpected retry probe client must still be cleaned up");
+                panic!("both retry probe children return a correlated protocol failure")
+            }
+            Err(error) => error,
+        };
+
+        // A wrongly admitted second child may append shortly after the public
+        // future resolves. Wait one cancellation slice before freezing the
+        // observable so the negative assertion detects that race as well.
+        std::thread::sleep(CONNECTION_RETRY_CANCEL_SLICE);
+        PublicStdioRetryProbe {
+            error,
+            attempt_events: attempt_log.lines(),
+            elapsed,
+        }
+    }
 
     #[test]
     fn test_builder_defaults() {
         let builder = ClientBuilder::new();
         assert_eq!(builder.client_info.name, "fastmcp-client");
-        assert_eq!(builder.timeout_ms, 30_000);
+        assert_eq!(builder.timeout_policy, RequestTimeoutPolicy::default());
         assert_eq!(builder.max_retries, 0);
         assert_eq!(builder.retry_delay_ms, 1_000);
+        assert!(builder.retry_policy.is_none());
         assert!(builder.inherit_env);
         assert!(builder.working_dir.is_none());
         assert!(builder.env_vars.is_empty());
         assert!(!builder.auto_initialize);
+        assert!(!builder.owned_process_group);
+    }
+
+    #[test]
+    fn reverse_handlers_derive_exact_legacy_capabilities_before_connect() {
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "ok",
+                        "test-model",
+                    ))
+                })
+            })
+            .with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+            });
+        let builder = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .reverse_request_handlers(handlers);
+        let builder = builder.selected_legacy_builder_with_reverse_handlers();
+
+        assert!(builder.capabilities.sampling.is_some());
+        assert_eq!(
+            builder
+                .capabilities
+                .roots
+                .as_ref()
+                .map(|roots| roots.list_changed),
+            Some(false)
+        );
+        builder
+            .validate_reverse_callback_configuration(builder.selected_protocol_plan())
+            .expect("derived callbacks and advertised legacy capabilities agree");
+    }
+
+    #[test]
+    fn reverse_handlers_reject_modern_and_require_legacy_capability_parity() {
+        let sampling_handler = || {
+            ReverseRequestHandlers::new().with_sampling_create_message(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async {
+                        Ok(fastmcp_protocol::CreateMessageResult::text(
+                            "ok",
+                            "test-model",
+                        ))
+                    })
+                },
+            )
+        };
+        let modern = ClientBuilder::new().reverse_request_handlers(sampling_handler());
+        let modern_error = modern
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::ModernOnly,
+            ))
+            .expect_err("final negotiation cannot expose exact-2024 callbacks");
+        assert_eq!(modern_error.code, fastmcp_core::McpErrorCode::InvalidParams);
+
+        let modern_http_handlers = ReverseRequestHandlers::new()
+            .with_modern_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Err(fastmcp_core::McpError::internal_error(
+                        "modern HTTP reverse handlers must be rejected before contact",
+                    ))
+                })
+            });
+        assert!(
+            modern_http_handlers.has_modern_handlers(),
+            "modern sampling is a modern reverse handler"
+        );
+        assert!(
+            modern_http_handlers.is_empty(),
+            "modern handlers must not count as exact-2024 handlers"
+        );
+
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = Some(fastmcp_protocol::RootsCapability { list_changed: true });
+        let legacy = ClientBuilder::new()
+            .capabilities(capabilities)
+            .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+                },
+            ));
+        legacy
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::LegacyOnly,
+            ))
+            .expect("roots/listChanged may accompany its callable roots/list handler");
+
+        let missing_handler = ClientBuilder::new().capabilities(ClientCapabilities {
+            roots: Some(fastmcp_protocol::RootsCapability {
+                list_changed: false,
+            }),
+            ..ClientCapabilities::default()
+        });
+        let legacy_error = missing_handler
+            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
+                ProtocolPolicy::LegacyOnly,
+            ))
+            .expect_err("an advertised roots capability requires a roots/list handler");
+        assert_eq!(legacy_error.code, fastmcp_core::McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn http_connect_does_not_refuse_modern_reverse_handlers_before_contact() {
+        let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Err(McpError::internal_error(
+                        "modern HTTP reverse handler is unused when the peer is unreachable",
+                    ))
+                })
+            },
+        );
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(
+                fastmcp_core::CanonicalHttpUrl::parse("http://127.0.0.1:1/mcp")
+                    .expect("loopback HTTP URL is canonical"),
+            ),
+            None,
+            None,
+            "fastmcp-test-http".to_owned(),
+            "fastmcp-test-http".to_owned(),
+            "modern-http-reverse-contact".to_owned(),
+            0,
+            0,
+            0,
+        )
+        .expect("modern-only HTTP plan admits a POST target");
+        let builder = ClientBuilder::new()
+            .protocol_plan(plan)
+            .reverse_request_handlers(handlers);
+        let error = block_on(builder.connect_http_with_cx(&Cx::for_testing()))
+            .err()
+            .expect("an unreachable modern POST target still fails at contact");
+        assert!(
+            matches!(error, ClientHttpConnectionError::Modern(_)),
+            "unreachable modern POST remains a modern transport error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn builder_advertises_callbacks_before_legacy_initialize_and_dispatches_them() {
+        let script = "IFS= read -r initialize || exit 1; \
+            capabilities_ok=true; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"sampling\":{}'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"roots\":{}'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"elicitation\"'*) capabilities_ok=false;; *) ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            case \"$lifecycle\" in *notifications/initialized*) lifecycle_ok=true;; *) lifecycle_ok=false;; esac; \
+            IFS= read -r request || exit 1; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            IFS= read -r callback || exit 1; \
+            callback_ok=true; \
+            case \"$callback\" in *'\"id\":41'*) ;; *) callback_ok=false;; esac; \
+            case \"$callback\" in *'\"model\":\"builder-model\"'*) ;; *) callback_ok=false;; esac; \
+            case \"$callback\" in *'\"error\"'*) callback_ok=false;; *) ;; esac; \
+            case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"capabilities\":%s,\"lifecycle\":%s,\"callback\":%s,\"request\":%s}}\\n' \"$capabilities_ok\" \"$lifecycle_ok\" \"$callback_ok\" \"$request_ok\"; exec sleep 2";
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "configured before initialize",
+                        "builder-model",
+                    ))
+                })
+            })
+            .with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+            });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback test runtime must build");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("legacy callback configuration completes initialize before exposure");
+
+            let result = client
+                .request_with_cx(&cx, "test/builder-callback", Some(serde_json::json!({})))
+                .await
+                .expect("cooperative ingress lets the configured callback respond");
+            assert_eq!(
+                result.result.as_ref(),
+                Some(&serde_json::json!({
+                    "capabilities": true,
+                    "lifecycle": true,
+                    "callback": true,
+                    "request": true
+                })),
+            );
+            assert!(result.error.is_none());
+            client.close().expect("builder callback client cleanup");
+        });
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn current_thread_receive_cancellation_preserves_connection_and_callback_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CallbackCancellationProbe {
+            dropped: std::sync::Arc<AtomicBool>,
+        }
+
+        impl Drop for CallbackCancellationProbe {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let script = "IFS= read -r initialize || exit 1; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-cancellation-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+            IFS= read -r request || exit 1; \
+            case \"$request\" in *'\"id\":2'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            IFS= read -r control || exit 1; \
+            control_ok=true; \
+            case \"$control\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) ;; *) control_ok=false ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"late\":true}}'; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":41}}'; \
+            IFS= read -r next || exit 1; \
+            callback_response=false; follow_up_ok=true; \
+            case \"$next\" in \
+                *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; \
+                *'\"id\":41'*'\"error\"'*|*'\"id\":41'*'\"result\"'*) callback_response=true; IFS= read -r follow_up || exit 1; case \"$follow_up\" in *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; *) follow_up_ok=false ;; esac ;; \
+                *) callback_response=true; IFS= read -r follow_up || exit 1; case \"$follow_up\" in *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; *) follow_up_ok=false ;; esac ;; \
+            esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"control\":%s,\"callbackResponse\":%s,\"followUp\":%s}}\\n' \"$control_ok\" \"$callback_response\" \"$follow_up_ok\"; \
+            exec sleep 2";
+        let callback_started = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_future_dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_cx_observed = std::sync::Arc::new(std::sync::Mutex::new(None::<Cx>));
+        let callback_token_observed =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<ReverseRequestCancellation>));
+        let callback_mutated = std::sync::Arc::new(AtomicBool::new(false));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let callback_started = std::sync::Arc::clone(&callback_started);
+            let callback_future_dropped = std::sync::Arc::clone(&callback_future_dropped);
+            let callback_cx_observed = std::sync::Arc::clone(&callback_cx_observed);
+            let callback_token_observed = std::sync::Arc::clone(&callback_token_observed);
+            let callback_mutated = std::sync::Arc::clone(&callback_mutated);
+            move |callback_cx, cancellation, _params| {
+                let callback_started = std::sync::Arc::clone(&callback_started);
+                let callback_future_dropped = std::sync::Arc::clone(&callback_future_dropped);
+                let callback_cx_observed = std::sync::Arc::clone(&callback_cx_observed);
+                let callback_token_observed = std::sync::Arc::clone(&callback_token_observed);
+                let callback_mutated = std::sync::Arc::clone(&callback_mutated);
+                Box::pin(async move {
+                    callback_started.store(true, Ordering::SeqCst);
+                    *callback_cx_observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(callback_cx.clone());
+                    *callback_token_observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(cancellation.clone());
+                    let cancellation_probe = CallbackCancellationProbe {
+                        dropped: std::sync::Arc::clone(&callback_future_dropped),
+                    };
+                    let (_park_sender, mut park_receiver) =
+                        asupersync::channel::oneshot::channel::<()>();
+                    let parked = park_receiver.recv(callback_cx).await;
+                    if callback_cx.checkpoint().is_err() && cancellation.checkpoint().is_err() {
+                        drop(cancellation_probe);
+                        return Err(fastmcp_core::McpError::request_cancelled());
+                    }
+                    assert!(
+                        parked.is_ok(),
+                        "a live callback park cannot close before cancellation"
+                    );
+                    callback_mutated.store(true, Ordering::SeqCst);
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "must not be sent after cancellation",
+                        "cancelled-callback-model",
+                    ))
+                })
+            }
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback cancellation runtime must build");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("legacy callback cancellation configuration initializes");
+
+            let operation_cx = Cx::for_request();
+            let cancellation_cx = operation_cx.clone();
+            let callback_started_for_canceller = std::sync::Arc::clone(&callback_started);
+            let canceller = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !callback_started_for_canceller.load(Ordering::SeqCst)
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    callback_started_for_canceller.load(Ordering::SeqCst),
+                    "the reverse callback must start before forced operation cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+                cancellation_cx.set_cancel_requested(true);
+            });
+
+            let cancellation = client
+                .request_with_cx(
+                    &operation_cx,
+                    "test/builder-callback-cancellation",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect_err(
+                    "operation cancellation must settle its request without closing the connection",
+                );
+            canceller
+                .join()
+                .expect("forced operation cancellation thread must complete");
+            assert_eq!(cancellation.code, McpErrorCode::RequestCancelled);
+            assert!(client.is_initialized());
+
+            let response = client
+                .request_with_cx(
+                    &cx,
+                    "test/builder-callback-after-cancellation",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect("a later request drives late traffic and proves the connection reusable");
+            assert_eq!(
+                response.result.as_ref(),
+                Some(&serde_json::json!({
+                    "control": true,
+                    "callbackResponse": false,
+                    "followUp": true
+                }))
+            );
+            assert!(response.error.is_none());
+
+            let callback_settlement_deadline =
+                Instant::now() + crate::REVERSE_CALLBACK_SHUTDOWN_TIMEOUT;
+            while !callback_future_dropped.load(Ordering::SeqCst)
+                && Instant::now() < callback_settlement_deadline
+            {
+                client
+                    .drain_completed_reverse_callbacks()
+                    .expect("an expected cancelled callback join is not connection-terminal");
+                asupersync::runtime::yield_now().await;
+            }
+            client
+                .drain_completed_reverse_callbacks()
+                .expect("an expected cancelled callback join is not connection-terminal");
+            assert!(callback_started.load(Ordering::SeqCst));
+            assert!(callback_future_dropped.load(Ordering::SeqCst));
+            assert!(
+                callback_cx_observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(Cx::is_cancel_requested),
+                "task abort must cancel the callback-owned Cx"
+            );
+            assert!(
+                callback_token_observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(ReverseRequestCancellation::is_cancel_requested),
+                "peer cancellation must cancel the protocol token"
+            );
+            assert!(!callback_mutated.load(Ordering::SeqCst));
+            assert_eq!(client.responses.pending_len(), 0);
+            assert_eq!(client.responses.tombstone_len(), 0);
+            assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
+            assert!(client.responses.terminal_error().is_none());
+            client
+                .close()
+                .expect("cancelled callback is joined by its owning client");
+        });
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn current_thread_receive_deadline_reaps_panicked_reverse_callback() {
+        let script = "IFS= read -r initialize || exit 1; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-panic-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            IFS= read -r request || exit 1; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            exec sleep 2";
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_callback_cx, _cancellation, _params| {
+                Box::pin(async {
+                    panic!("reverse callback panic canary");
+                })
+            },
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback panic runtime must build");
+
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback panic runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("legacy callback panic configuration initializes");
+
+            let error = client
+                .request_with_cx(
+                    &cx,
+                    "test/builder-callback-panic",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect_err("the next bounded ingress turn must reap the callback panic");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "Client reverse callback task panicked");
+            assert!(!client.is_initialized());
+            client
+                .close()
+                .expect("terminal callback panic still settles subprocess ownership");
+        });
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn auto_with_reverse_handlers_keeps_a_modern_selected_connection_handler_free() {
+        let script = r#"IFS= read -r discover || exit 1;
+            case "$discover" in
+                *server/discover*) ;;
+                *) exit 1 ;;
+            esac;
+            case "$discover" in
+                *'"sampling"'*|*'"roots"'*) exit 1 ;;
+            esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-modern-callbacks","version":"1.0.0"}}}}';
+            exec sleep 2"#;
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "must stay out of modern discovery",
+                        "auto-modern-model",
+                    ))
+                })
+            },
+        );
+
+        let mut client = block_on(
+            ClientBuilder::new()
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+        )
+        .expect("Auto probes the final handshake before considering legacy callbacks");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        client.close().expect("Auto-modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn auto_with_reverse_handlers_installs_them_only_after_method_not_found_fallback() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}';
+                    exec sleep 2 ;;
+                *initialize*2024-11-05*)
+                    capabilities_ok=true;
+                    case "$first" in *'"sampling":{}'*) ;; *) capabilities_ok=false ;; esac;
+                    case "$first" in *'"roots"'*|*'"elicitation"'*) capabilities_ok=false ;; *) ;; esac;
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-legacy-callbacks","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) lifecycle_ok=true ;; *) lifecycle_ok=false ;; esac;
+                    IFS= read -r request || exit 1;
+                    printf '%s\n' '{"jsonrpc":"2.0","method":"sampling/createMessage","id":41,"params":{"messages":[],"maxTokens":9}}';
+                    IFS= read -r callback || exit 1;
+                    callback_ok=true;
+                    case "$callback" in *'"id":41'*) ;; *) callback_ok=false ;; esac;
+                    case "$callback" in *'"model":"auto-legacy-model"'*) ;; *) callback_ok=false ;; esac;
+                    case "$callback" in *'"error"'*) callback_ok=false ;; *) ;; esac;
+                    case "$request" in *'"id":2'*) request_ok=true ;; *) request_ok=false ;; esac;
+                    printf '{"jsonrpc":"2.0","id":2,"result":{"capabilities":%s,"lifecycle":%s,"callback":%s,"request":%s}}\n' "$capabilities_ok" "$lifecycle_ok" "$callback_ok" "$request_ok";
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "installed after fallback",
+                        "auto-legacy-model",
+                    ))
+                })
+            },
+        );
+
+        let runtime = reverse_callback_test_runtime();
+        let test = runtime.handle().spawn(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
+
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+            );
+            let result: serde_json::Value = client
+                .send_request("test/auto-fallback-callback", serde_json::json!({}))
+                .expect("the selected legacy client dispatches its configured callback");
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "capabilities": true,
+                    "lifecycle": true,
+                    "callback": true,
+                    "request": true
+                })
+            );
+            client.close().expect("Auto-legacy client cleanup");
+        });
+        runtime.block_on(test);
+    }
+
+    #[cfg(all(unix, not(feature = "legacy-2024-11-05")))]
+    #[test]
+    fn feature_off_builder_auto_and_legacy_refuse_before_command_resolution() {
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let error = block_on(
+                ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .connect_stdio_with_cx(
+                        &Cx::for_testing(),
+                        "fastmcp-client-builder-feature-off-must-not-spawn",
+                        &[],
+                    ),
+            )
+            .err()
+            .expect("feature-off builder policy must reject before command resolution");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+                "{policy:?} must fail at feature admission rather than process startup"
+            );
+        }
+
+        #[cfg(feature = "apps")]
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let error = block_on(
+                ClientBuilder::new()
+                    .mcp_apps(
+                        McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                            .expect("valid Apps MIME settings"),
+                    )
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .connect_stdio_with_cx(
+                        &Cx::for_testing(),
+                        "fastmcp-client-builder-apps-feature-off-must-not-spawn",
+                        &[],
+                    ),
+            )
+            .err()
+            .expect("Apps with an unavailable legacy policy must reject before startup");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+                "Apps {policy:?} must fail at feature admission rather than process startup"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_http_admission_reports_the_unavailable_configuration_before_contact() {
+        let builder =
+            ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+
+        assert!(matches!(
+            builder.http_negotiation(),
+            Err(
+                ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                    policy: ProtocolPolicy::Auto,
+                }
+            )
+        ));
+
+        let error = block_on(builder.connect_http_with_cx(&Cx::for_testing()))
+            .err()
+            .expect("feature admission must reject Auto before HTTP contact");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+                ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                    policy: ProtocolPolicy::Auto,
+                }
+            ))
+        ));
+    }
+
+    #[cfg(feature = "apps")]
+    #[test]
+    fn builder_retains_public_mcp_apps_configuration() {
+        let settings = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+            .expect("valid Apps MIME settings");
+        let builder = ClientBuilder::new().mcp_apps(settings.clone());
+        assert_eq!(builder.mcp_apps_settings, Some(settings));
     }
 
     #[test]
     fn test_builder_fluent_api() {
         let builder = ClientBuilder::new()
             .client_info("test-client", "2.0.0")
-            .timeout_ms(60_000)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(20), Duration::from_secs(60))
+                    .unwrap()
+                    .reset_idle_on_matching_progress(false),
+            )
             .max_retries(3)
             .retry_delay_ms(500)
             .working_dir("/tmp")
             .env("FOO", "bar")
             .env("BAZ", "qux")
-            .inherit_env(false);
+            .inherit_env(false)
+            .owned_process_group(true);
 
         assert_eq!(builder.client_info.name, "test-client");
         assert_eq!(builder.client_info.version, "2.0.0");
-        assert_eq!(builder.timeout_ms, 60_000);
+        assert_eq!(
+            builder.timeout_policy,
+            RequestTimeoutPolicy::new(Duration::from_secs(20), Duration::from_secs(60))
+                .unwrap()
+                .reset_idle_on_matching_progress(false)
+        );
         assert_eq!(builder.max_retries, 3);
         assert_eq!(builder.retry_delay_ms, 500);
         assert_eq!(builder.working_dir, Some(PathBuf::from("/tmp")));
         assert_eq!(builder.env_vars.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(builder.env_vars.get("BAZ"), Some(&"qux".to_string()));
         assert!(!builder.inherit_env);
+        assert!(builder.owned_process_group);
     }
 
     #[test]
@@ -515,12 +3649,17 @@ mod tests {
     fn test_builder_clone() {
         let builder1 = ClientBuilder::new()
             .client_info("test", "1.0")
-            .timeout_ms(5000);
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5)).unwrap(),
+            );
 
         let builder2 = builder1.clone();
 
         assert_eq!(builder2.client_info.name, "test");
-        assert_eq!(builder2.timeout_ms, 5000);
+        assert_eq!(
+            builder2.timeout_policy,
+            RequestTimeoutPolicy::new(Duration::from_secs(4), Duration::from_secs(5)).unwrap()
+        );
     }
 
     #[test]
@@ -533,25 +3672,35 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_capabilities() {
-        let caps = ClientCapabilities {
-            sampling: Some(fastmcp_protocol::SamplingCapability {}),
-            elicitation: None,
-            roots: None,
-        };
-        let builder = ClientBuilder::new().capabilities(caps);
-        assert!(builder.capabilities.sampling.is_some());
-        assert!(builder.capabilities.elicitation.is_none());
-        assert!(builder.capabilities.roots.is_none());
-    }
-
-    #[test]
     fn test_builder_default_trait() {
         let builder = ClientBuilder::default();
         assert_eq!(builder.client_info.name, "fastmcp-client");
-        assert_eq!(builder.timeout_ms, 30_000);
+        assert_eq!(builder.timeout_policy, RequestTimeoutPolicy::default());
         assert_eq!(builder.max_retries, 0);
         assert!(!builder.auto_initialize);
+        assert!(!builder.owned_process_group);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reality_check_regression_owned_process_group_preserves_spawn_command() {
+        let builder = ClientBuilder::new().owned_process_group(true);
+        let (command, ownership, mut anchor) = builder
+            .prepare_stdio_command(PathBuf::from("echo"), &["--flag"])
+            .expect("Unix owned-group command");
+
+        assert_eq!(ownership, ChildOwnership::OwnedProcessGroup);
+        assert_eq!(command.get_program(), "echo");
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(arguments, vec!["--flag".to_owned()]);
+        anchor
+            .as_mut()
+            .expect("owned group has an anchor")
+            .cleanup()
+            .expect("anchor cleanup");
     }
 
     #[test]
@@ -579,10 +3728,12 @@ mod tests {
     fn test_connect_stdio_with_cx_respects_cancellation_during_retries() {
         let cx = Cx::for_request();
         cx.set_cancel_requested(true);
-        let result = ClientBuilder::new()
-            .max_retries(2)
-            .retry_delay_ms(100)
-            .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx);
+        let result = block_on(
+            ClientBuilder::new()
+                .max_retries(2)
+                .retry_delay_ms(100)
+                .connect_stdio_with_cx(&cx, "definitely-not-a-real-command", &[]),
+        );
 
         assert!(
             result.is_err(),
@@ -592,38 +3743,922 @@ mod tests {
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_connect_stdio_with_cx_max_retries_does_not_overflow() {
-        let cx = Cx::for_request();
-        cx.set_cancel_requested(true);
+    fn public_connect_stdio_with_cx_retries_after_failed_first_child() {
+        let probe = run_public_stdio_retry_probe(false);
 
-        let result = ClientBuilder::new()
-            .max_retries(u32::MAX)
-            .retry_delay_ms(1)
-            .connect_stdio_with_cx("definitely-not-a-real-command", &[], &cx);
-
-        assert!(
-            result.is_err(),
-            "cancelled context should return an error, not panic from retry overflow"
+        assert_ne!(
+            probe.error.code,
+            McpErrorCode::RequestCancelled,
+            "an active caller context must not turn a failed retry sequence into cancellation"
         );
-        let err = result.err().expect("error result");
-        assert_eq!(err.code, McpErrorCode::RequestCancelled);
+        assert_eq!(probe.error.code, McpErrorCode::InternalError);
+        assert_eq!(probe.error.message, "planned retry probe failure");
+        assert_eq!(probe.error.data, None);
+        assert_eq!(
+            probe.attempt_events,
+            ["spawn", "response", "spawn", "response"],
+            "the public connection path must create and observe the second real child"
+        );
+        assert!(
+            probe.elapsed >= Duration::from_secs(2),
+            "the second child must remain gated by the configured caller-context retry delay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_connect_stdio_with_cx_cancellation_during_retry_delay_creates_no_second_child() {
+        let probe = run_public_stdio_retry_probe(true);
+
+        assert_eq!(probe.error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            probe.attempt_events,
+            ["spawn", "response"],
+            "cancellation after the failed first child must leave the attempt log unchanged"
+        );
+        assert!(
+            probe.elapsed < Duration::from_secs(2),
+            "caller cancellation must settle before the retry delay could admit attempt two"
+        );
     }
 
     #[test]
-    fn builder_debug_includes_client_info() {
-        let builder = ClientBuilder::new().client_info("dbg-test", "0.1");
+    fn cancelled_direct_attempt_is_refused_before_command_setup() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("short retry deadline fits the monotonic clock");
+
+        let error = match ClientBuilder::new().try_connect_with_protocol_plan(
+            "fastmcp-client-cancelled-direct-attempt-must-not-spawn",
+            &[],
+            &cx,
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            false,
+            false,
+            ConnectionRetryDeadline(Some(retry_deadline)),
+        ) {
+            Ok(_) => panic!("a cancelled retry attempt must be rejected before process creation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn connection_retry_policy_accepts_hard_boundaries_and_preserves_zero_retries() {
+        let policy = ConnectionRetryPolicy::new(
+            MAX_CONNECTION_ATTEMPTS,
+            Duration::ZERO,
+            MAX_CONNECTION_RETRY_ELAPSED,
+        )
+        .expect("hard retry policy boundaries are valid");
+        assert_eq!(policy.max_attempts, u64::from(MAX_CONNECTION_ATTEMPTS));
+        assert_eq!(policy.retry_delay, Duration::ZERO);
+        assert_eq!(policy.total_elapsed, Some(MAX_CONNECTION_RETRY_ELAPSED));
+
+        let maximum_delay_policy =
+            ConnectionRetryPolicy::new(2, MAX_CONNECTION_RETRY_DELAY, MAX_CONNECTION_RETRY_ELAPSED)
+                .expect("maximum per-retry delay fits the maximum elapsed limit");
+        assert_eq!(maximum_delay_policy.retry_delay, MAX_CONNECTION_RETRY_DELAY);
+        assert_eq!(
+            maximum_delay_policy.total_elapsed,
+            Some(MAX_CONNECTION_RETRY_ELAPSED)
+        );
+
+        let default_policy = ClientBuilder::new()
+            .effective_connection_retry_policy()
+            .expect("default retry policy is valid");
+        assert_eq!(default_policy.max_attempts, 1);
+        assert_eq!(default_policy.retry_delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn connection_retry_policy_rejects_one_field_attempt_count_above_hard_cap() {
+        let error = ClientBuilder::new()
+            .connection_retry_policy(
+                MAX_CONNECTION_ATTEMPTS + 1,
+                Duration::ZERO,
+                MAX_CONNECTION_RETRY_ELAPSED,
+            )
+            .expect_err("only the attempt count differs from the hard-boundary policy");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn application_retry_config_preserves_values_and_bounded_setters() {
+        let timeout = RequestTimeoutPolicy::from_application_timeout_ms(1_800_000).unwrap();
+        let builder = ClientBuilder::new()
+            .request_timeout_policy(timeout)
+            .application_retry_config(u32::MAX, u64::MAX);
+        let (policy, deadline) = builder.validated_connection_retry_plan().unwrap();
+        assert_eq!(policy.max_attempts, u64::from(u32::MAX) + 1);
+        assert_eq!(policy.retry_delay, Duration::from_millis(u64::MAX));
+        assert_eq!(policy.total_elapsed, None);
+        assert_eq!(deadline.remaining(Instant::now()), None);
+        assert!(!deadline.expired());
+        assert_eq!(
+            builder
+                .initialize_timeout_policy_for_retry_deadline(deadline)
+                .unwrap(),
+            timeout
+        );
+
+        let capped = builder
+            .initialize_timeout_policy_for_retry_deadline(ConnectionRetryDeadline(Some(
+                Instant::now()
+                    .checked_add(Duration::from_secs(600))
+                    .unwrap(),
+            )))
+            .unwrap();
+        assert!(capped.idle_timeout() > crate::MAX_CLIENT_IDLE_TIMEOUT);
+        assert!(capped.absolute_timeout() <= Duration::from_secs(600));
+        assert_eq!(capped.idle_timeout(), capped.absolute_timeout());
+        assert!(!capped.resets_idle_on_matching_progress());
+
+        assert!(
+            builder
+                .clone()
+                .max_retries(8)
+                .validated_connection_retry_plan()
+                .is_err()
+        );
+        assert!(
+            builder
+                .retry_delay_ms(1)
+                .validated_connection_retry_plan()
+                .is_err()
+        );
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn application_retry_config_large_values_connect_and_reap_real_child() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Bound a regressed handshake independently of the configured
+            // thirty-minute application timeout that this test must retain.
+            let cx = runtime.request_cx_with_budget(
+                Cx::current().unwrap().budget_for_timeout(Duration::from_secs(10)),
+            );
+            let timeout = RequestTimeoutPolicy::from_application_timeout_ms(1_800_000).unwrap();
+            let script = r#"
+IFS= read -r initialize || exit 90
+case "$initialize" in *initialize*2024-11-05*) ;; *) exit 91;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"application-policy-peer","version":"1"}}}'
+IFS= read -r initialized || exit 92
+case "$initialized" in *notifications/initialized*) ;; *) exit 93;; esac
+IFS= read -r ping || exit 94
+case "$ping" in *'"id":2'*'"method":"ping"'*|*'"method":"ping"'*'"id":2'*) ;; *) exit 95;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r remaining
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .request_timeout_policy(timeout)
+                .application_retry_config(u32::MAX, u64::MAX)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("large local settings must not reject a successful first child");
+            assert_eq!(client.server_info().map(|peer| peer.name.as_str()), Some("application-policy-peer"));
+            assert_eq!(client.request_timeout_policy(), timeout);
+            let pid = i32::try_from(client.child.as_ref().unwrap().id()).unwrap();
+            let response = client.request_with_cx(&cx, "ping", None).await.unwrap();
+            assert!(response.error.is_none());
+            assert_eq!(response.result, Some(serde_json::json!({})));
+            client.close_with_cx(&cx).await.expect("reap the owned child");
+            assert!(client.child.is_none());
+            assert_eq!(
+                rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()),
+                Err(rustix::io::Errno::SRCH)
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_builder_restores_requested_timeout_policy_for_ordinary_request() {
+        let requested = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+            .expect("ordinary request policy is valid");
+        let script = r#"
+IFS= read -r discover || exit 90
+case "$discover" in
+    *server/discover*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"timeout-retention-modern","version":"1"}}}}' ;;
+    *) exit 91 ;;
+esac
+IFS= read -r ping || exit 92
+case "$ping" in
+    *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}' ;;
+    *) exit 93 ;;
+esac
+exec sleep 2
+"#;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller runtime must build");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must install a current Cx");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(requested)
+                .connection_retry_policy(1, Duration::ZERO, Duration::from_secs(1))
+                .expect("one-attempt aggregate deadline is valid")
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .expect("modern initialization completes within its aggregate deadline");
+
+            assert_eq!(client.request_timeout_policy(), requested);
+            let executor = client
+                .multiplexed_stdio_executor()
+                .expect("successful modern client exposes its executor");
+            let mut execution = client
+                .start_multiplexed_request(&cx, "ping", None)
+                .expect("ordinary modern request commits");
+            let pending = executor.executor.pending_records();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0]
+                    .absolute_deadline
+                    .duration_since(pending[0].idle_deadline),
+                Duration::from_secs(2),
+                "the live executor must use the requested idle/absolute difference"
+            );
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("the caller runtime drives the real modern response");
+            let response = executor
+                .try_take_response(&mut execution)
+                .expect("modern response decodes")
+                .expect("modern response is correlated to the ordinary request");
+            assert_eq!(
+                response.result,
+                Some(serde_json::json!({"resultType": "complete"}))
+            );
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("successful modern client cleanup");
+        });
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn one_shot_builder_restores_requested_timeout_policy_after_bounded_initialization() {
+        let requested = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+            .expect("ordinary request policy is valid");
+        let script = r#"
+IFS= read -r first || exit 90
+case "$first" in
+    *server/discover*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"discovery unavailable"}}' ;;
+    *initialize*2024-11-05*)
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"timeout-retention-legacy","version":"1"}}}'
+        IFS= read -r lifecycle || exit 91
+        case "$lifecycle" in *notifications/initialized*) ;; *) exit 92 ;; esac
+        IFS= read -r ping || exit 93
+        case "$ping" in
+            *'"method":"ping"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;;
+            *) exit 94 ;;
+        esac
+        exec sleep 2 ;;
+    *) exit 95 ;;
+esac
+"#;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("caller runtime must build");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller runtime must install a current Cx");
+            let mut client = ClientBuilder::new()
+                .request_timeout_policy(requested)
+                .connection_retry_policy(1, Duration::ZERO, Duration::from_secs(1))
+                .expect("one-attempt aggregate deadline is valid")
+                .connect_stdio_once_with_cx("sh", &["-c", script], &cx)
+                .expect("Auto fallback initializes its fresh legacy child");
+
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(client.request_timeout_policy(), requested);
+            let executor = client
+                .multiplexed_stdio_executor()
+                .expect("successful legacy client exposes its executor");
+            let mut execution = client
+                .start_multiplexed_request(&cx, "ping", None)
+                .expect("ordinary legacy request commits");
+            let pending = executor.executor.pending_records();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0]
+                    .absolute_deadline
+                    .duration_since(pending[0].idle_deadline),
+                Duration::from_secs(2),
+                "the fallback executor must use the requested idle/absolute difference"
+            );
+            client
+                .drive_multiplexed_stdio(&cx)
+                .expect("the caller runtime drives the real legacy response");
+            let response = executor
+                .try_take_response(&mut execution)
+                .expect("legacy response decodes")
+                .expect("legacy response is correlated to the ordinary request");
+            assert_eq!(response.result, Some(serde_json::json!({})));
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("successful fallback client cleanup");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn application_retry_config_cancels_after_real_child_failure() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        // Retain this test artifact: no cleanup removes a peer's evidence.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fastmcp-application-retry-{}-{stamp}.log",
+            std::process::id()
+        ));
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let script = r#"
+printf 'spawn:%s\n' "$$" >> "$1" || exit 90
+IFS= read -r request || exit 91
+case "$request" in *server/discover*) ;; *) exit 92;; esac
+printf '%s' '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"application retry failure"}'
+printf '%s\n' response >> "$1" || exit 93
+printf '}\n'
+exit 73
+"#;
+            let args = [
+                "-c",
+                script,
+                "application-retry-peer",
+                path.to_str().unwrap(),
+            ];
+            let mut connecting = Box::pin(
+                ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .application_retry_config(u32::MAX, u64::MAX)
+                    .connect_stdio_with_cx(&cx, "sh", &args),
+            );
+            let observation_deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+            let mut observation_tick =
+                Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(10)));
+            let pid = std::future::poll_fn(|task_cx| {
+                assert!(
+                    connecting.as_mut().poll(task_cx).is_pending(),
+                    "the large retry delay must remain pending"
+                );
+                let events = std::fs::read_to_string(&path).unwrap();
+                let lines: Vec<_> = events.lines().collect();
+                assert!(
+                    lines.len() <= 2,
+                    "no second child may start during the retry delay"
+                );
+                if lines.len() == 2 && lines[1] == "response" {
+                    let pid: i32 = lines[0].strip_prefix("spawn:").unwrap().parse().unwrap();
+                    if rustix::process::test_kill_process(
+                        rustix::process::Pid::from_raw(pid).unwrap(),
+                    ) == Err(rustix::io::Errno::SRCH)
+                    {
+                        return Poll::Ready(pid);
+                    }
+                }
+                assert!(
+                    Instant::now() < observation_deadline,
+                    "the first real child was not observed and reaped"
+                );
+                // The watchdog must wake even if the connection future loses
+                // a wake. Re-arm its timer without relying on child I/O.
+                if observation_tick.as_mut().poll(task_cx).is_ready() {
+                    observation_tick
+                        .set(asupersync::time::sleep(cx.now(), Duration::from_millis(10)));
+                    task_cx.waker().wake_by_ref();
+                }
+                Poll::Pending
+            })
+            .await;
+            drop(observation_tick);
+            assert!(cx.checkpoint().is_ok());
+            let mut cancellation_watchdog =
+                Box::pin(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            cx.set_cancel_requested(true);
+            let cancelled = std::future::poll_fn(|task_cx| {
+                if let Poll::Ready(result) = connecting.as_mut().poll(task_cx) {
+                    return Poll::Ready(result);
+                }
+                assert!(
+                    cancellation_watchdog.as_mut().poll(task_cx).is_pending(),
+                    "cancellation did not settle within the independent watchdog"
+                );
+                Poll::Pending
+            })
+            .await;
+            drop(cancellation_watchdog);
+            let error = match cancelled {
+                Ok(_) => panic!("cancellation must interrupt the large application retry delay"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("spawn:{pid}\nresponse\n")
+            );
+        });
+    }
+
+    #[test]
+    fn application_retry_wait_registers_large_delay_and_retires_timer_on_cancel() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let timer = cx.timer_driver().expect("native runtime timer");
+            let before = timer.pending_count();
+            let mut waiting = Box::pin(ClientBuilder::wait_for_connection_retry(
+                &cx,
+                Duration::from_millis(u64::MAX),
+                ConnectionRetryDeadline(None),
+            ));
+            let first =
+                std::future::poll_fn(|task_cx| Poll::Ready(waiting.as_mut().poll(task_cx))).await;
+            assert!(first.is_pending());
+            assert_eq!(timer.pending_count(), before + 1);
+            let mut watchdog = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_secs(2)));
+            cx.set_cancel_requested(true);
+            let cancelled = std::future::poll_fn(|task_cx| {
+                if let Poll::Ready(result) = waiting.as_mut().poll(task_cx) {
+                    return Poll::Ready(result);
+                }
+                assert!(
+                    watchdog.as_mut().poll(task_cx).is_pending(),
+                    "the huge retry delay did not observe cancellation"
+                );
+                Poll::Pending
+            })
+            .await;
+            drop(watchdog);
+            assert_eq!(cancelled.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(timer.pending_count(), before);
+        });
+    }
+
+    #[test]
+    fn connection_retry_wait_awaits_active_caller_context() {
+        let cx = Cx::for_request();
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("short retry deadline fits the monotonic clock");
+
+        block_on(ClientBuilder::wait_for_connection_retry(
+            &cx,
+            Duration::from_millis(1),
+            ConnectionRetryDeadline(Some(retry_deadline)),
+        ))
+        .expect("an active caller context admits its bounded retry wait");
+
+        assert!(
+            cx.checkpoint().is_ok(),
+            "awaiting a retry timer must not mutate the caller cancellation state"
+        );
+    }
+
+    #[test]
+    fn connection_retry_wait_rejects_pre_cancelled_context() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("short retry deadline fits the monotonic clock");
+
+        let error = block_on(ClientBuilder::wait_for_connection_retry(
+            &cx,
+            Duration::from_millis(1),
+            ConnectionRetryDeadline(Some(retry_deadline)),
+        ))
+        .expect_err("a cancelled context must not begin a retry wait");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn connect_stdio_with_cx_rejects_legacy_retry_count_above_hard_limit() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+
+        let result = block_on(
+            ClientBuilder::new()
+                .max_retries(u32::MAX)
+                .retry_delay_ms(1)
+                .connect_stdio_with_cx(&cx, "definitely-not-a-real-command", &[]),
+        );
+
+        assert!(
+            result.is_err(),
+            "invalid retry configuration should return an error without attempting a connection"
+        );
+        let err = result.err().expect("error result");
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn invalid_timeout_policy_is_rejected_by_its_constructor() {
+        for (idle, absolute) in [
+            (Duration::ZERO, Duration::from_millis(1)),
+            (
+                crate::MAX_CLIENT_IDLE_TIMEOUT + Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+            (Duration::from_millis(1), Duration::ZERO),
+            (
+                Duration::from_millis(1),
+                crate::MAX_CLIENT_ABSOLUTE_TIMEOUT + Duration::from_millis(1),
+            ),
+            (Duration::MAX, Duration::MAX),
+        ] {
+            let error = RequestTimeoutPolicy::new(idle, absolute)
+                .expect_err("invalid timeout policy must be rejected");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+        }
+    }
+
+    #[test]
+    fn builder_debug_redacts_subprocess_environment_values() {
+        let env_value_canary = "builder-env-api-value-canary";
+        let builder = ClientBuilder::new()
+            .client_info("dbg-test", "0.1")
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(21), Duration::from_secs(42))
+                    .unwrap()
+                    .reset_idle_on_matching_progress(false),
+            )
+            .working_dir("/private/debug/path")
+            .env("SERVICE_API_TOKEN", env_value_canary)
+            .inherit_env(false);
         let debug = format!("{:?}", builder);
+
+        assert!(debug.contains("ClientBuilder"));
         assert!(debug.contains("dbg-test"));
         assert!(debug.contains("0.1"));
+        assert!(debug.contains("idle_timeout: 21s"));
+        assert!(debug.contains("absolute_timeout: 42s"));
+        assert!(debug.contains("reset_idle_on_matching_progress: false"));
+        assert!(debug.contains("working_dir_set: true"));
+        assert!(debug.contains("env_var_count: 1"));
+        assert!(debug.contains("inherit_env: false"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains("SERVICE_API_TOKEN"));
+        assert!(!debug.contains("/private/debug/path"));
     }
 
     #[test]
     fn connect_stdio_nonexistent_command_fails() {
-        let result = ClientBuilder::new()
-            .max_retries(0)
-            .connect_stdio("fastmcp_nonexistent_binary_xyz", &["--version"]);
+        let result = block_on(ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            &Cx::for_testing(),
+            "fastmcp_nonexistent_binary_xyz",
+            &["--version"],
+        ));
         assert!(result.is_err());
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_clean_first_probe_timeout_reopens_a_fresh_legacy_child() {
+        // One invocation can either consume discovery and remain silent, or
+        // consume exact-2024 initialization. The successful second branch
+        // therefore proves the selected legacy connection is a fresh child.
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*) exec sleep 5 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-timeout-legacy","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
+                    IFS= read -r request || exit 1;
+                    case "$request" in *ping*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;; *) exit 1 ;; esac;
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let started = Instant::now();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(3))
+                        .expect("bounded probe timeout is valid"),
+                )
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+        )
+        .expect("a clean first-probe timeout authorizes one fresh legacy child");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the fresh legacy child accepts its first ordinary request");
+        client
+            .close()
+            .expect("fresh legacy timeout-fallback cleanup");
+        // (c) KNOWN LOAD-DEPENDENT SITE. The era assertion proves the
+        // modern probe timed out and the legacy child was reopened; it does
+        // not prove the fallback happened PROMPTLY rather than waiting out
+        // the peer's `exec sleep 5`. That timing is the feature under test.
+        // Note the margin is the weakest here: the bound equals the child's
+        // sleep, so a fallback that did wait lands right at the boundary.
+        // Real `sh` child, so no virtual clock applies.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_rejects_wrong_id_partial_malformed_ambiguous_and_transport_probes() {
+        let legacy_success = concat!(
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"forbidden-legacy\",\"version\":\"1.0.0\"}}}'; ",
+            "IFS= read -r lifecycle || exit 1; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; exec sleep 2"
+        );
+        let cases = [
+            (
+                "wrong-id",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}'; exec sleep 2",
+            ),
+            (
+                "partial-frame-timeout",
+                "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601'; exec sleep 10",
+            ),
+            (
+                "malformed-result",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{}}}'; exec sleep 2",
+            ),
+            (
+                "ambiguous-envelope",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-32601,\"message\":\"method not found\"}}'; exec sleep 2",
+            ),
+            ("transport-closed", "exit 0"),
+        ];
+
+        for (name, discovery_branch) in cases {
+            let script = format!(
+                "IFS= read -r first || exit 1; case \"$first\" in *server/discover*) {discovery_branch} ;; *initialize*2024-11-05*) {legacy_success} ;; *) exit 1 ;; esac"
+            );
+            let result = block_on(
+                ClientBuilder::new()
+                    .max_retries(0)
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
+                            .expect("bounded probe timeout is valid"),
+                    )
+                    .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+            );
+            assert!(
+                result.is_err(),
+                "{name} must remain terminal instead of reaching the legacy-success branch"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_cancelled_probe_never_opens_legacy_child() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*) exec sleep 5 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"forbidden-cancelled-legacy","version":"1.0.0"}}}';
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let cx = Cx::for_request();
+        let cancelling_cx = cx.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancelling_cx.cancel_fast(asupersync::CancelKind::User);
+        });
+        let result = block_on(
+            ClientBuilder::new()
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
+                        .expect("bounded cancellation probe timeout is valid"),
+                )
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]),
+        );
+        canceller
+            .join()
+            .expect("probe cancellation helper joins after the public connection returns");
+        let error = match result {
+            Ok(_) => panic!("caller cancellation during the modern probe is terminal"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_stdio_times_out_during_silent_initialization() {
+        let started = std::time::Instant::now();
+        let result = block_on(
+            ClientBuilder::new()
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(40))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(&Cx::for_testing(), "sh", &["-c", "exec sleep 5"]),
+        );
+
+        let Err(error) = result else {
+            panic!("silent initialization should time out");
+        };
+        assert_eq!(error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the idle
+        // deadline fired rather than the request succeeding; this proves it
+        // fired AT its deadline rather than late. For a timeout feature the
+        // timing is the property, so this is not redundant. The peer is a
+        // real `sh` child sleeping 5s, so virtual time cannot replace it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_retry_elapsed_cap_terminates_slow_initialization() {
+        let started = Instant::now();
+        let builder = ClientBuilder::new()
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(30), Duration::from_secs(30))
+                    .expect("ordinary initialization policy is valid"),
+            )
+            .connection_retry_policy(1, Duration::ZERO, Duration::from_millis(25))
+            .expect("bounded retry policy is valid");
+
+        let error = match block_on(builder.connect_stdio_with_cx(
+            &Cx::for_testing(),
+            "sh",
+            &["-c", "exec sleep 5"],
+        )) {
+            Ok(mut client) => {
+                let _ = client.close();
+                panic!("slow initialization must not outlive the retry elapsed cap");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.message, "Connection retry elapsed limit exceeded");
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the retry
+        // elapsed cap was hit; this proves it was hit at the configured cap
+        // rather than after the peer's 5s sleep. Timing is the feature.
+        // Real `sh` child, so no virtual clock applies.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn default_builder_auto_with_configured_apps_falls_back_without_legacy_metadata_leak() {
+        let script = auto_legacy_lifecycle_script(-32601);
+        let mut client = block_on(
+            ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+        )
+        .expect("recognized discovery refusal starts a fresh exact legacy client");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the public builder returns a usable Auto-selected legacy client");
+        client.close().expect("Auto-selected legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
+        // This differs from the accepted default-Auto fallback fixture only in
+        // the discovery error code. If Auto starts a legacy child for -32602,
+        // the fixture's initialize branch succeeds and this test incorrectly
+        // receives a live legacy client. -32602 means the peer knows
+        // server/discover, so it proves the modern era (#80).
+        let script = auto_legacy_lifecycle_script(-32602);
+        let builder = ClientBuilder::new().mcp_apps(
+            McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                .expect("valid Apps MIME settings"),
+        );
+        let state_before_connect = builder.selected_protocol_plan().clone();
+
+        let error = match block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
+            "sh",
+            &["-c", script.as_str()],
+        )) {
+            Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
+    }
+
+    #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_with_configured_apps_rejects_only_an_unsupported_final_discovery_error()
+    {
+        let script = auto_legacy_lifecycle_script(-32022);
+        let builder = ClientBuilder::new()
+            .mcp_apps(
+                McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                    .expect("valid Apps MIME settings"),
+            )
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+        let state_before_connect = builder.selected_protocol_plan().clone();
+
+        let error = match block_on(builder.clone().connect_stdio_with_cx(
+            &Cx::for_request(),
+            "sh",
+            &["-c", script.as_str()],
+        )) {
+            Ok(_) => panic!("changing only the discovery error must not authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("final discovery unavailable"));
+        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "apps")]
+    #[test]
+    fn public_builder_advertises_configured_apps_after_active_modern_discovery() {
+        let script = modern_apps_lifecycle_script(true);
+        let mut client = block_on(
+            ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+        )
+        .expect("active modern discovery initializes the public Apps client");
+
+        assert!(client.mcp_apps_active());
+        client
+            .ping()
+            .expect("active Apps negotiation advertises Apps on the public request path");
+        client.close().expect("active Apps client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "apps")]
+    #[test]
+    fn public_builder_omits_configured_apps_after_one_field_inactive_modern_discovery() {
+        let script = modern_apps_lifecycle_script(false);
+        let mut client = block_on(
+            ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+        )
+        .expect("one missing server Apps declaration initializes modern inactive Apps state");
+
+        assert!(!client.mcp_apps_active());
+        client
+            .ping()
+            .expect("inactive Apps negotiation omits Apps on the public request path");
+        client.close().expect("inactive Apps client cleanup");
     }
 
     #[test]
@@ -638,14 +4673,15 @@ mod tests {
     // Additional coverage tests (bd-10fu)
     // =========================================================================
 
+    #[cfg(unix)]
     #[test]
     fn child_guard_disarm_returns_child() {
-        let child = Command::new("true")
+        let mut command = Command::new("true");
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn 'true'");
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("failed to spawn 'true'");
         let guard = ChildGuard::new(child);
         let mut returned = guard.disarm();
         // disarm gives back a valid Child we can wait on
@@ -653,15 +4689,16 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn child_guard_drop_kills_child() {
-        let child = Command::new("sleep")
+        let mut command = Command::new("sleep");
+        command
             .arg("60")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn 'sleep'");
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("failed to spawn 'sleep'");
         let pid = child.id();
         {
             let _guard = ChildGuard::new(child);
@@ -685,10 +4722,27 @@ mod tests {
     }
 
     #[test]
+    fn builder_capabilities_replaces_the_advertised_set() {
+        let capabilities = ClientCapabilities {
+            sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+            elicitation: None,
+            roots: None,
+            ..Default::default()
+        };
+        let builder = ClientBuilder::new().capabilities(capabilities);
+
+        assert!(builder.capabilities.sampling.is_some());
+        assert!(builder.capabilities.elicitation.is_none());
+        assert!(builder.capabilities.roots.is_none());
+    }
+
+    #[test]
     fn connect_stdio_spawn_failure_error_message() {
-        let result = ClientBuilder::new()
-            .max_retries(0)
-            .connect_stdio("fastmcp_no_such_binary_abc123", &[]);
+        let result = block_on(ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            &Cx::for_testing(),
+            "fastmcp_no_such_binary_abc123",
+            &[],
+        ));
         match result {
             Err(err) => assert!(
                 err.message.contains("spawn"),

@@ -8,35 +8,119 @@
 //! - Error handling
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use asupersync::{Budget, CancelKind, Cx};
+// Exact-2024 era: used only by the legacy receive-pump runner.
+#[cfg(feature = "legacy-2024-11-05")]
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+use asupersync::{Budget, CancelKind, Cx, time::wall_now};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{info, targets};
-use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
+use fastmcp_core::{
+    AuthContext, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
+    SessionState,
+};
 use fastmcp_derive::tool;
 use fastmcp_protocol::{
-    CallToolParams, CancelTaskParams, CancelledParams, ClientCapabilities, ClientInfo, Content,
-    GetPromptParams, GetTaskParams, InitializeParams, JsonRpcResponse, ListTasksParams, LogLevel,
-    LogMessageParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams, RequestId,
-    Resource, ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams, Role,
-    ServerCapabilities, ServerInfo, SetLogLevelParams, SubmitTaskParams, TaskId, TaskStatus,
-    TaskStatusNotificationParams, Tool,
+    CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, GetPromptParams,
+    InitializeParams, JsonRpcRequest, JsonRpcResponse, LegacyContent, LegacyResourceContent,
+    LogLevel, LogMessageParams, Prompt, PromptArgument, PromptMessage, ReadResourceParams,
+    RequestId, Resource, ResourceContent, ResourceTemplate, ResourceUpdatedNotificationParams,
+    Role, ServerCapabilities, ServerInfo, SetLogLevelParams, Tool,
 };
+// Exact-2024 era: used only by the legacy receive-pump tests and runner.
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{CreateMessageResult, JsonRpcMessage, SamplingCapability};
 
+#[cfg(feature = "tasks")]
+use crate::TaskManager;
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
 use crate::caching::ResponseCachingMiddleware;
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
 use crate::rate_limiting::RateLimitingMiddleware;
 use crate::router::Router;
-use crate::session::Session;
-use crate::{
-    ActiveRequest, ActiveRequestGuard, AuthRequest, NotificationSender, RequestCompletion, Server,
-    StaticTokenVerifier, TaskManager, TokenAuthProvider,
+use crate::session::{
+    MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION, Session,
 };
+use crate::{
+    ActiveRequest, ActiveRequestGuard, ActiveRequestKey, AuthRequest, InboundRequestContext,
+    InboundRequestTransport, NotificationSender, RequestCompletion, Server, StaticTokenVerifier,
+    TokenAuthProvider,
+};
+
+// Exact-2024 era: used only by the receive-pump tests that open with a legacy handshake.
+#[cfg(feature = "legacy-2024-11-05")]
+fn run_returning_pump_with_caller_runtime<R, S>(
+    server: Server,
+    recv: R,
+    send: S,
+    notification_sender: NotificationSender,
+    connection_failure: Option<Arc<AtomicBool>>,
+    transport_label: &'static str,
+) -> McpResult<()>
+where
+    R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, fastmcp_transport::TransportError>
+        + Send
+        + 'static,
+    S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), fastmcp_transport::TransportError>
+        + Send
+        + Sync
+        + 'static,
+{
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("returning pump test reactor must initialize"))
+        .blocking_threads(4, crate::MAX_DISPATCH_QUEUE_DEPTH)
+        .build()
+        .expect("returning pump test runtime must initialize");
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+    runtime.block_on(async move {
+        let caller_cx = Cx::current().expect("returning pump test runtime must install Cx");
+        let dispatch_cx = caller_cx.clone();
+        let pump = caller_cx
+            .spawn_blocking(move |pump_cx| {
+                let result = server.run_loop_returning_with_dispatch_cx(
+                    &pump_cx,
+                    &dispatch_cx,
+                    recv,
+                    send,
+                    notification_sender,
+                    connection_failure,
+                    transport_label,
+                );
+                let _ = result_sender.send(result);
+            })
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        let deadline = caller_cx
+            .now()
+            .saturating_add_nanos(crate::RETURNING_PUMP_WATCHDOG_NANOS);
+        loop {
+            match result_receiver.try_recv() {
+                Ok(result) => {
+                    drop(pump);
+                    break result;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    drop(pump);
+                    break Err(McpError::internal_error(
+                        "returning pump exited without a result",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    asupersync::time::timeout_at(
+                        deadline,
+                        asupersync::time::sleep(caller_cx.now(), Duration::from_millis(1)),
+                    )
+                    .await
+                    .map_err(|_| McpError::internal_error("returning pump test timed out"))?;
+                }
+            }
+        }
+    })
+}
 
 /// Creates a request sender for tests that should not perform server-to-client requests.
 ///
@@ -62,6 +146,64 @@ fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("Hello, {name}!"))
 }
 
+#[test]
+fn poll_on_cx_preserves_caller_capabilities_and_restores_parent() {
+    let ((), report) = asupersync::lab::run_async_under_lab(5050, |root| async move {
+        let parent = Cx::current().expect("lab installs a caller context");
+        let parent_caps = parent.capabilities();
+        assert!(parent.timer_driver().is_some(), "positive timer control");
+
+        for restricted in [false, true] {
+            let caller = if restricted {
+                let _guard = root
+                    .restrict::<asupersync::cx::cap::None>()
+                    .set_current_restricted();
+                Cx::current().expect("capture the caller's narrowed runtime ceiling")
+            } else {
+                root.clone()
+            };
+            let expected_caps = caller.capabilities();
+            let request = McpContext::new(caller.clone(), 1);
+            let mut polls = 0;
+            let greeting = crate::poll_on_cx(
+                &caller,
+                std::future::poll_fn(|task| {
+                    polls += 1;
+                    let ambient = Cx::current().expect("server polling installs the caller");
+                    assert_eq!(ambient.task_id(), caller.task_id());
+                    assert_eq!(ambient.capabilities(), expected_caps);
+                    assert_eq!(ambient.timer_driver().is_some(), !restricted);
+                    if restricted {
+                        assert!(!ambient.capabilities().spawn);
+                        assert!(!ambient.capabilities().io);
+                        assert!(!ambient.capabilities().remote);
+                        assert!(ambient.io().is_none());
+                    }
+                    if polls == 1 {
+                        task.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(greet(&request, "caller".to_owned()))
+                    }
+                }),
+            );
+            assert_eq!(
+                greeting.expect("authorized pure tool completes"),
+                "Hello, caller!"
+            );
+            assert_eq!(polls, 2);
+            let restored = Cx::current().expect("server polling restores its parent");
+            assert_eq!(restored.task_id(), parent.task_id());
+            assert_eq!(restored.capabilities(), parent_caps);
+            assert!(restored.timer_driver().is_some());
+        }
+    });
+    assert!(report.quiescent, "{report:?}");
+    assert!(report.oracle_report.total > 0, "{report:?}");
+    assert!(report.oracle_report.all_passed(), "{report:?}");
+    assert!(report.invariant_violations.is_empty(), "{report:?}");
+}
+
 #[tool(
     name = "greet_default",
     description = "Greets a user by name (with a default)",
@@ -70,6 +212,37 @@ fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
 fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
     ctx.checkpoint()?;
     Ok(format!("Hello, {name}!"))
+}
+
+// These fixture handlers never actually fail, so clippy flags the Result as
+// unnecessary; the McpResult return is retained deliberately so the fixtures
+// keep the same fallible handler shape production tools use.
+#[allow(clippy::unnecessary_wraps)]
+#[tool(name = "announce", description = "Emits handler log notifications")]
+fn announce(ctx: &McpContext, name: String) -> McpResult<String> {
+    ctx.debug("handler-debug");
+    ctx.info(format!("handler-info:{name}"));
+    Ok(format!("announced {name}"))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+#[tool(
+    name = "hide_greet",
+    description = "Disables the greet tool for this session"
+)]
+fn hide_greet(ctx: &McpContext) -> McpResult<String> {
+    ctx.disable_tool("greet");
+    Ok("hidden".to_string())
+}
+
+#[allow(clippy::unnecessary_wraps)]
+#[tool(
+    name = "touch_file",
+    description = "Notifies subscribers that a file changed"
+)]
+fn touch_file(ctx: &McpContext, uri: String) -> McpResult<String> {
+    let notified = ctx.notify_resource_updated(&uri);
+    Ok(if notified { "notified" } else { "silent" }.to_string())
 }
 
 #[tool(name = "formal_greet", description = "Formally greets a user")]
@@ -129,10 +302,18 @@ fn compute_json_tool(_ctx: &McpContext) -> String {
 
 #[tool(name = "failing", description = "Always fails")]
 fn failing_tool_test(_ctx: &McpContext) -> McpResult<String> {
+    // An application-level error: framework-terminal codes (InternalError,
+    // RequestCancelled) now propagate as JSON-RPC failures instead of
+    // converting to is_error tool content.
     Err(McpError::new(
-        McpErrorCode::InternalError,
+        McpErrorCode::InvalidParams,
         "Something went wrong",
     ))
+}
+
+#[tool(name = "declined", description = "Returns a typed caller refusal")]
+fn declined_tool(_ctx: &McpContext) -> McpResult<String> {
+    Err(McpError::invalid_params("caller input was declined"))
 }
 
 #[tool(name = "get_state", description = "Returns session state value")]
@@ -145,17 +326,24 @@ fn get_state_from_ctx(ctx: &McpContext) -> String {
     name = "nested_state",
     description = "Sets state then calls another tool"
 )]
-fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
+async fn nested_state_call(ctx: &McpContext) -> McpResult<String> {
     ctx.set_state("tool_test_key", "tool_propagated_value");
-    let inner_result = fastmcp_core::block_on(ctx.call_tool("get_state", serde_json::json!({})))?;
+    let inner_result = ctx.call_tool("get_state", serde_json::json!({})).await?;
     let text = inner_result.first_text().unwrap_or("(no content)");
     Ok(format!("Inner tool saw: {}", text))
 }
 
-static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<Arc<Barrier>>>> = OnceLock::new();
+#[derive(Clone)]
+struct BlockingToolState {
+    barrier: Arc<Barrier>,
+    started: Option<Arc<AtomicBool>>,
+    completed: Option<Arc<AtomicBool>>,
+}
+
+static BLOCKING_TOOL_STATE: OnceLock<Mutex<Option<BlockingToolState>>> = OnceLock::new();
 static BLOCKING_TOOL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn blocking_tool_state() -> &'static Mutex<Option<Arc<Barrier>>> {
+fn blocking_tool_state() -> &'static Mutex<Option<BlockingToolState>> {
     BLOCKING_TOOL_STATE.get_or_init(|| Mutex::new(None))
 }
 
@@ -176,12 +364,24 @@ impl Drop for BlockingToolConfigGuard {
 }
 
 fn configure_blocking_tool(barrier: Arc<Barrier>) -> BlockingToolConfigGuard {
+    configure_blocking_tool_with_completion(barrier, None, None)
+}
+
+fn configure_blocking_tool_with_completion(
+    barrier: Arc<Barrier>,
+    started: Option<Arc<AtomicBool>>,
+    completed: Option<Arc<AtomicBool>>,
+) -> BlockingToolConfigGuard {
     let lock = blocking_tool_lock()
         .lock()
         .expect("blocking tool lock poisoned");
     *blocking_tool_state()
         .lock()
-        .expect("blocking tool state lock poisoned") = Some(barrier);
+        .expect("blocking tool state lock poisoned") = Some(BlockingToolState {
+        barrier,
+        started,
+        completed,
+    });
     BlockingToolConfigGuard { _lock: lock }
 }
 
@@ -190,17 +390,38 @@ fn configure_blocking_tool(barrier: Arc<Barrier>) -> BlockingToolConfigGuard {
     description = "Blocks until cancellation is observed"
 )]
 fn block_until_cancelled(ctx: &McpContext) -> McpResult<String> {
-    let barrier = blocking_tool_state()
+    let state = blocking_tool_state()
         .lock()
         .expect("blocking tool state lock poisoned")
         .clone()
         .ok_or_else(|| McpError::internal_error("blocking tool not configured for test"))?;
 
-    barrier.wait();
+    if let Some(started) = state.started {
+        started.store(true, Ordering::Release);
+    }
+    state.barrier.wait();
+    // Sleep between liveness checks: a hot yield_now spin charges the
+    // request's poll quota fast enough to exhaust it before an in-band
+    // cancellation notification can arrive, which turns this fixture into a
+    // budget-death probe instead of a cancellation probe.
     while !ctx.is_cancelled() {
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if let Some(completed) = state.completed {
+        completed.store(true, Ordering::Release);
     }
     Err(McpError::request_cancelled())
+}
+
+// Exact-2024 era: used only by the legacy receive-pump sampling test.
+#[cfg(feature = "legacy-2024-11-05")]
+#[tool(
+    name = "sampling_round_trip",
+    description = "Requests one sampling completion"
+)]
+fn sampling_round_trip(ctx: &McpContext) -> McpResult<String> {
+    let response = fastmcp_core::block_on(ctx.sample("reply with a test value", 16))?;
+    Ok(response.text)
 }
 
 struct LoggingBlockingToolState {
@@ -289,7 +510,6 @@ fn block_until_cancelled_logged(ctx: &McpContext, request_id: i64) -> McpResult<
 struct RequestEvent {
     request_id: i64,
     phase: &'static str,
-    elapsed: Duration,
 }
 
 fn record_event(
@@ -300,11 +520,7 @@ fn record_event(
 ) {
     let elapsed = start.elapsed();
     let mut guard = events.lock().expect("events lock poisoned");
-    guard.push(RequestEvent {
-        request_id,
-        phase,
-        elapsed,
-    });
+    guard.push(RequestEvent { request_id, phase });
     info!(
         target: targets::SESSION,
         "e2e event request_id={} phase={} elapsed_ms={}",
@@ -336,13 +552,26 @@ fn request_id_to_u64_string_stable_nonzero() {
 }
 
 #[test]
+fn request_id_to_u64_integer_stable_nonzero() {
+    let id = RequestId::Integer("9223372036854775808".to_string());
+    let first = crate::request_id_to_u64(Some(&id));
+    let second = crate::request_id_to_u64(Some(&id));
+    assert_eq!(first, second);
+    assert_eq!(first, crate::stable_hash_request_id("9223372036854775808"));
+    assert_ne!(first, 0);
+}
+
+#[test]
 fn request_id_to_u64_none_is_zero() {
     assert_eq!(crate::request_id_to_u64(None), 0);
 }
 
 #[tool(name = "error_tool", description = "Always returns an error")]
 fn error_tool(_ctx: &McpContext) -> McpResult<String> {
-    Err(McpError::internal_error("Intentional error for testing"))
+    // An application-level error: framework-terminal codes (InternalError,
+    // RequestCancelled) now propagate as JSON-RPC failures instead of
+    // converting to is_error tool content.
+    Err(McpError::invalid_params("Intentional error for testing"))
 }
 
 // ============================================================================
@@ -413,7 +642,7 @@ struct TemplateResource;
 impl ResourceHandler for TemplateResource {
     fn definition(&self) -> Resource {
         Resource {
-            uri: "resource://{id}".to_string(),
+            uri: "resource:///items/{id}".to_string(),
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -425,7 +654,7 @@ impl ResourceHandler for TemplateResource {
 
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
-            uri_template: "resource://{id}".to_string(),
+            uri_template: "resource:///items/{id}".to_string(),
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -465,7 +694,7 @@ struct SpecificTemplateResource;
 impl ResourceHandler for SpecificTemplateResource {
     fn definition(&self) -> Resource {
         Resource {
-            uri: "resource://foo/{id}".to_string(),
+            uri: "resource:///items/foo/{id}".to_string(),
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -477,7 +706,7 @@ impl ResourceHandler for SpecificTemplateResource {
 
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
-            uri_template: "resource://foo/{id}".to_string(),
+            uri_template: "resource:///items/foo/{id}".to_string(),
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -646,10 +875,16 @@ mod router_tests {
         let mut router = Router::new();
 
         // Register tools
-        router.add_tool(Greet);
-        router.add_tool(CancellationCheck);
-        router.add_tool(SlowTool);
-        router.add_tool(ErrorTool);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(CancellationCheck)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(SlowTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool)
+            .expect("tool registration succeeds");
 
         // Register resources
         router.add_resource(StaticResource {
@@ -661,7 +896,7 @@ mod router_tests {
 
         // Register resource templates
         router.add_resource_template(ResourceTemplate {
-            uri_template: "resource://{name}".to_string(),
+            uri_template: "resource:///named/{name}".to_string(),
             name: "Manual Template".to_string(),
             description: Some("Resource template for manual listing".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -689,15 +924,37 @@ mod router_tests {
 
     #[test]
     fn test_middleware_short_circuit_prevents_late_middleware() {
-        // If caching is registered before rate limiting, cached responses should
-        // not consume rate-limit budget because the rate limiter is never entered.
-        let caching = ResponseCachingMiddleware::new();
-        let rate_limiter = RateLimitingMiddleware::new(0.0).burst_capacity(1).global();
+        struct ImmediateResponse;
+        impl Middleware for ImmediateResponse {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                Ok(crate::MiddlewareDecision::Respond(
+                    serde_json::json!({"short_circuit": true}),
+                ))
+            }
+        }
+
+        struct CountEntry(Arc<Mutex<usize>>);
+        impl Middleware for CountEntry {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                *self.0.lock().expect("entry counter mutex poisoned") += 1;
+                Ok(crate::MiddlewareDecision::Continue)
+            }
+        }
+
+        let late_entries = Arc::new(Mutex::new(0_usize));
 
         let server = Server::new("test-server", "1.0.0")
             .tool(Greet)
-            .middleware(caching)
-            .middleware(rate_limiter)
+            .middleware(ImmediateResponse)
+            .middleware(CountEntry(Arc::clone(&late_entries)))
             .build();
         let cx = Cx::for_testing();
         let mut session = create_test_session();
@@ -722,58 +979,31 @@ mod router_tests {
             1,
         );
 
-        // First call: cache miss, rate limiter consumes its only token.
-        let first = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request.clone(),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("first response");
-        assert!(first.error.is_none(), "expected successful first response");
-
-        // Second call: should be served from cache and never reach the rate limiter.
-        let second = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("second response");
-        assert!(second.error.is_none(), "expected cached second response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("short-circuit response");
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({"short_circuit": true}))
+        );
+        assert_eq!(
+            *late_entries.lock().expect("entry counter mutex poisoned"),
+            0
+        );
     }
 
     #[test]
-    fn test_middleware_short_circuit_runs_response_stack_for_entered_middleware() {
-        // If an earlier middleware is entered and a later middleware short-circuits with
-        // Respond, the response still flows through `on_response` for the already-entered
-        // middleware stack in reverse order.
+    fn production_session_cache_hits_within_one_session_and_isolates_sessions() {
         let cache_a = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
         let cache_b = Arc::new(ResponseCachingMiddleware::new().max_entries(10));
 
         let cx = Cx::for_testing();
-        let ctx = McpContext::new(cx.clone(), 1);
-
-        let params = CallToolParams {
-            name: "greet".to_string(),
-            arguments: Some(serde_json::json!({"name": "Ada"})),
-            meta: None,
-        };
-        let request = fastmcp_protocol::JsonRpcRequest::new(
-            "tools/call",
-            Some(serde_json::to_value(params).expect("params")),
-            2,
-        );
-
-        // Prime cache_b so it will short-circuit in `on_request`.
-        let primed_value = serde_json::json!({"primed": true});
-        let _ = cache_b
-            .on_response(&ctx, &request, primed_value.clone())
-            .expect("prime cache_b");
+        let request = fastmcp_protocol::JsonRpcRequest::new("tools/list", None, 2);
 
         let server = Server::new("test-server", "1.0.0")
             .tool(Greet)
@@ -793,36 +1023,59 @@ mod router_tests {
 
         let sender: NotificationSender = Arc::new(|_| {});
 
-        // First call: cache_a miss, cache_b hit -> Respond. cache_a must still see on_response.
-        let first = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request.clone(),
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("first response");
-        assert_eq!(first.result, Some(primed_value));
-        assert_eq!(cache_a.stats().hits, 0);
-        assert_eq!(cache_a.stats().misses, 1);
-        assert_eq!(cache_b.stats().hits, 1);
-        assert_eq!(cache_b.stats().misses, 0);
+        let first = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("first response");
+        assert!(first.error.is_none());
 
-        // Second call: cache_a should now hit (because it cached during the response stack)
-        // and cache_b should not be entered.
-        let second = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("second response");
+        let second = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request.clone(),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("second response");
         assert!(second.error.is_none());
-        assert_eq!(cache_a.stats().hits, 1);
-        assert_eq!(cache_b.stats().hits, 1);
+        assert_eq!(second.result, first.result);
+
+        let cache_a_same_session = cache_a.stats();
+        let cache_b_same_session = cache_b.stats();
+        assert_eq!(cache_a_same_session.entries, 1);
+        assert_eq!(cache_b_same_session.entries, 1);
+        assert!(cache_a_same_session.hits + cache_b_same_session.hits >= 1);
+
+        let mut isolated_session = create_test_session();
+        isolated_session.initialize(
+            ClientInfo {
+                name: "other-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let isolated = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut isolated_session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("isolated-session response");
+        assert!(isolated.error.is_none());
+        assert_eq!(isolated.result, first.result);
+
+        let cache_a_isolated = cache_a.stats();
+        let cache_b_isolated = cache_b.stats();
+        assert_eq!(cache_a_isolated.entries, 2);
+        assert_eq!(cache_b_isolated.entries, 2);
+        assert!(cache_a_isolated.misses > cache_a_same_session.misses);
+        assert!(cache_b_isolated.misses > cache_b_same_session.misses);
     }
 
     #[test]
@@ -831,28 +1084,46 @@ mod router_tests {
         let request = AuthRequest {
             method: "tools/list",
             params: Some(&params),
+            transport_authorization: None,
             request_id: 10,
         };
         let access = request.access_token().expect("missing access credential");
         assert_eq!(access.scheme, "Bearer");
         assert_eq!(access.token, "alpha");
 
-        let params = serde_json::json!({"auth": {"token": "beta"}});
+        // Object credentials must carry an explicit scheme under the strict
+        // fail-closed grammar; a token-only object is malformed, not Bearer.
+        let params = serde_json::json!({"auth": {"scheme": "Bearer", "token": "beta"}});
         let request = AuthRequest {
             method: "tools/list",
             params: Some(&params),
+            transport_authorization: None,
             request_id: 11,
         };
         let access = request.access_token().expect("missing access credential");
         assert_eq!(access.scheme, "Bearer");
         assert_eq!(access.token, "beta");
+
+        let params = serde_json::json!({"auth": {"token": "gamma"}});
+        let request = AuthRequest {
+            method: "tools/list",
+            params: Some(&params),
+            transport_authorization: None,
+            request_id: 12,
+        };
+        assert!(
+            request.access_token().is_none(),
+            "a scheme-less object credential must be refused, not defaulted"
+        );
     }
 
     #[test]
     fn test_token_auth_provider_allows_and_denies() {
         let verifier =
             StaticTokenVerifier::new([("good-token", AuthContext::with_subject("user-1"))])
-                .with_allowed_schemes(["Bearer"]);
+                .expect("valid verifier configuration")
+                .with_allowed_schemes(["Bearer"])
+                .expect("valid scheme configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -880,15 +1151,14 @@ mod router_tests {
             })),
             6,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
 
         let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -900,18 +1170,20 @@ mod router_tests {
             })),
             7,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.is_error(), "expected auth error");
         let error = response.error.expect("error payload");
-        assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden));
+        assert_eq!(
+            error.code,
+            i32::from(McpErrorCode::ResourceForbidden).into()
+        );
     }
 
     #[test]
@@ -919,7 +1191,8 @@ mod router_tests {
         let verifier = StaticTokenVerifier::new([(
             "resource-token",
             AuthContext::with_subject("resource-user"),
-        )]);
+        )])
+        .expect("valid verifier configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -946,15 +1219,14 @@ mod router_tests {
             Some(serde_json::json!({"uri": "resource://secure"})),
             8,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.is_error(), "expected auth error");
 
         let request = fastmcp_protocol::JsonRpcRequest::new(
@@ -965,21 +1237,21 @@ mod router_tests {
             })),
             9,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                request,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            request,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none(), "expected authorized response");
     }
 
     #[test]
     fn test_e2e_auth_decisions_logged() {
-        let verifier = StaticTokenVerifier::new([("good", AuthContext::with_subject("user-e2e"))]);
+        let verifier = StaticTokenVerifier::new([("good", AuthContext::with_subject("user-e2e"))])
+            .expect("valid verifier configuration");
         let provider = TokenAuthProvider::new(verifier);
 
         let server = Server::new("test-server", "1.0.0")
@@ -1005,15 +1277,14 @@ mod router_tests {
             Some(serde_json::json!({ "cursor": null })),
             12,
         );
-        let unauthorized_response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                unauthorized,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let unauthorized_response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            unauthorized,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         info!(
             target: targets::SESSION,
             "e2e auth unauthorized ts={} error={:?}",
@@ -1027,15 +1298,14 @@ mod router_tests {
             Some(serde_json::json!({ "cursor": null, "auth": "Bearer good" })),
             13,
         );
-        let authorized_response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                authorized,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let authorized_response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            authorized,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         info!(
             target: targets::SESSION,
             "e2e auth authorized ts={} result={:?}",
@@ -1082,8 +1352,8 @@ mod router_tests {
             .iter()
             .map(|template| template.uri_template.as_str())
             .collect();
-        assert!(template_uris.contains(&"resource://{id}"));
-        assert!(template_uris.contains(&"resource://{name}"));
+        assert!(template_uris.contains(&"resource:///items/{id}"));
+        assert!(template_uris.contains(&"resource:///named/{name}"));
     }
 
     // ========================================================================
@@ -1170,7 +1440,7 @@ mod router_tests {
 
         // Disable a template by its URI template
         let mut disabled: std::collections::HashSet<String> = std::collections::HashSet::new();
-        disabled.insert("resource://{id}".to_string());
+        disabled.insert("resource:///items/{id}".to_string());
         state.set("fastmcp.disabled_resources", disabled);
 
         // Now filtered list should have one less template
@@ -1179,12 +1449,12 @@ mod router_tests {
         assert!(
             !filtered_templates
                 .iter()
-                .any(|t| t.uri_template == "resource://{id}")
+                .any(|t| t.uri_template == "resource:///items/{id}")
         );
         assert!(
             filtered_templates
                 .iter()
-                .any(|t| t.uri_template == "resource://{name}")
+                .any(|t| t.uri_template == "resource:///named/{name}")
         );
     }
 
@@ -1194,19 +1464,20 @@ mod router_tests {
         let cx = Cx::for_testing();
         let params = ListResourceTemplatesParams::default();
 
-        let result = router.handle_resource_templates_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_resource_templates_list(&request_ctx, params, None);
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let templates = result.unwrap().resource_templates;
 
         assert_eq!(templates.len(), 2);
-        assert_eq!(templates[0].uri_template, "resource://{id}");
+        assert_eq!(templates[0].uri_template, "resource:///items/{id}");
         assert_eq!(templates[0].name, "Template Resource");
         assert_eq!(
             templates[0].description.as_deref(),
             Some("Template resource for tests")
         );
         assert_eq!(templates[0].mime_type.as_deref(), Some("text/plain"));
-        assert_eq!(templates[1].uri_template, "resource://{name}");
+        assert_eq!(templates[1].uri_template, "resource:///named/{name}");
         assert_eq!(templates[1].name, "Manual Template");
         assert_eq!(
             templates[1].description.as_deref(),
@@ -1221,8 +1492,9 @@ mod router_tests {
         let cx = Cx::for_testing();
         let params = ListResourceTemplatesParams::default();
 
+        let request_ctx = McpContext::new(cx, 1);
         let result = router
-            .handle_resource_templates_list(&cx, params, None)
+            .handle_resource_templates_list(&request_ctx, params, None)
             .expect("resource templates list");
 
         info!(
@@ -1234,233 +1506,9 @@ mod router_tests {
         assert!(!result.resource_templates.is_empty());
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
-    fn test_handle_tasks_submit_get_list_cancel() {
-        let router = Router::new();
-        let manager = TaskManager::new_for_testing();
-        manager.register_handler("demo_task", |_cx, _params| async {
-            Ok(serde_json::json!({"ok": true}))
-        });
-        let shared = manager.into_shared();
-
-        let cx = Cx::for_testing();
-
-        let submit = router
-            .handle_tasks_submit(
-                &cx,
-                SubmitTaskParams {
-                    task_type: "demo_task".to_string(),
-                    params: None,
-                },
-                Some(&shared),
-            )
-            .expect("submit task");
-
-        assert_eq!(submit.task.status, TaskStatus::Pending);
-        let task_id = submit.task.id.clone();
-
-        let list = router
-            .handle_tasks_list(
-                &cx,
-                ListTasksParams {
-                    status: None,
-                    cursor: None,
-                    limit: None,
-                },
-                Some(&shared),
-            )
-            .expect("list tasks");
-        assert_eq!(list.tasks.len(), 1);
-
-        let get = router
-            .handle_tasks_get(
-                &cx,
-                GetTaskParams {
-                    id: task_id.clone(),
-                },
-                Some(&shared),
-            )
-            .expect("get task");
-        assert_eq!(get.task.id, task_id);
-        assert!(get.result.is_none());
-
-        let cancel = router
-            .handle_tasks_cancel(
-                &cx,
-                CancelTaskParams {
-                    id: task_id.clone(),
-                    reason: Some("stop".to_string()),
-                },
-                Some(&shared),
-            )
-            .expect("cancel task");
-        assert_eq!(cancel.task.status, TaskStatus::Cancelled);
-
-        let list_cancelled = router
-            .handle_tasks_list(
-                &cx,
-                ListTasksParams {
-                    status: Some(TaskStatus::Cancelled),
-                    cursor: None,
-                    limit: None,
-                },
-                Some(&shared),
-            )
-            .expect("list cancelled");
-        assert_eq!(list_cancelled.tasks.len(), 1);
-    }
-
-    #[test]
-    fn test_e2e_task_manager_state_logging() {
-        let router = Router::new();
-        let manager = TaskManager::new_for_testing();
-        manager.register_handler("log_task", |_cx, _params| async {
-            Ok(serde_json::json!({"ok": true}))
-        });
-        let shared = manager.into_shared();
-
-        let cx = Cx::for_testing();
-        let submit = router
-            .handle_tasks_submit(
-                &cx,
-                SubmitTaskParams {
-                    task_type: "log_task".to_string(),
-                    params: Some(serde_json::json!({"payload": 1})),
-                },
-                Some(&shared),
-            )
-            .expect("submit task");
-
-        info!(
-            target: targets::SESSION,
-            "e2e task transition ts={} status={:?} id={}",
-            chrono::Utc::now().to_rfc3339(),
-            submit.task.status,
-            submit.task.id
-        );
-
-        shared.start_task(&submit.task.id).expect("start task");
-        info!(
-            target: targets::SESSION,
-            "e2e task transition ts={} status={:?} id={}",
-            chrono::Utc::now().to_rfc3339(),
-            TaskStatus::Running,
-            submit.task.id
-        );
-
-        shared.complete_task(&submit.task.id, serde_json::json!({"ok": true}));
-        info!(
-            target: targets::SESSION,
-            "e2e task transition ts={} status={:?} id={}",
-            chrono::Utc::now().to_rfc3339(),
-            TaskStatus::Completed,
-            submit.task.id
-        );
-
-        let get = router
-            .handle_tasks_get(
-                &cx,
-                GetTaskParams {
-                    id: submit.task.id.clone(),
-                },
-                Some(&shared),
-            )
-            .expect("get task after completion");
-
-        info!(
-            target: targets::SESSION,
-            "e2e tasks/get response={:?}",
-            get
-        );
-    }
-
-    #[test]
-    fn test_e2e_task_lifecycle_with_cancel_logging() {
-        let router = Router::new();
-        let manager = TaskManager::new_for_testing();
-        manager.register_handler("long_task", |_cx, _params| async {
-            Ok(serde_json::json!({"ok": true}))
-        });
-        let shared = manager.into_shared();
-
-        let cx = Cx::for_testing();
-        let submit = router
-            .handle_tasks_submit(
-                &cx,
-                SubmitTaskParams {
-                    task_type: "long_task".to_string(),
-                    params: Some(serde_json::json!({"duration": 10})),
-                },
-                Some(&shared),
-            )
-            .expect("submit long task");
-
-        info!(
-            target: targets::SESSION,
-            "e2e task submit ts={} id={}",
-            chrono::Utc::now().to_rfc3339(),
-            submit.task.id
-        );
-
-        shared.start_task(&submit.task.id).expect("start long task");
-        shared.update_progress(&submit.task.id, 0.2, Some("starting".to_string()));
-
-        let list = router
-            .handle_tasks_list(
-                &cx,
-                ListTasksParams {
-                    status: None,
-                    cursor: None,
-                    limit: None,
-                },
-                Some(&shared),
-            )
-            .expect("list tasks");
-        info!(
-            target: targets::SESSION,
-            "e2e tasks/list ts={} count={}",
-            chrono::Utc::now().to_rfc3339(),
-            list.tasks.len()
-        );
-
-        let get = router
-            .handle_tasks_get(
-                &cx,
-                GetTaskParams {
-                    id: submit.task.id.clone(),
-                },
-                Some(&shared),
-            )
-            .expect("get task");
-        info!(
-            target: targets::SESSION,
-            "e2e tasks/get ts={} status={:?}",
-            chrono::Utc::now().to_rfc3339(),
-            get.task.status
-        );
-
-        let cancel = router
-            .handle_tasks_cancel(
-                &cx,
-                CancelTaskParams {
-                    id: submit.task.id.clone(),
-                    reason: Some("test cancel".to_string()),
-                },
-                Some(&shared),
-            )
-            .expect("cancel task");
-        info!(
-            target: targets::SESSION,
-            "e2e task cancel ts={} status={:?}",
-            chrono::Utc::now().to_rfc3339(),
-            cancel.task.status
-        );
-
-        assert_eq!(cancel.task.status, TaskStatus::Cancelled);
-    }
-
-    #[test]
-    fn test_e2e_task_status_notifications_logged() {
+    fn test_e2e_task_rpc_quarantine_emits_no_status_notifications() {
         let manager = TaskManager::new_for_testing();
         manager.register_handler("notify_task", |_cx, _params| async {
             Ok(serde_json::json!({"ok": true}))
@@ -1481,22 +1529,16 @@ mod router_tests {
             "2024-11-05".to_string(),
         );
 
-        let notifications: Arc<std::sync::Mutex<Vec<TaskStatusNotificationParams>>> =
+        let notifications: Arc<std::sync::Mutex<Vec<String>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let notifications_clone = Arc::clone(&notifications);
         let sender: NotificationSender = Arc::new(move |request| {
-            if request.method != "notifications/tasks/status" {
-                return;
+            if request.method == "notifications/tasks/status" {
+                notifications_clone
+                    .lock()
+                    .expect("notifications lock poisoned")
+                    .push(request.method.clone());
             }
-            let params: TaskStatusNotificationParams = request
-                .params
-                .as_ref()
-                .and_then(|value| serde_json::from_value(value.clone()).ok())
-                .expect("task status params");
-            notifications_clone
-                .lock()
-                .expect("notifications lock poisoned")
-                .push(params);
         });
 
         let submit = fastmcp_protocol::JsonRpcRequest::new(
@@ -1504,52 +1546,25 @@ mod router_tests {
             Some(serde_json::json!({"taskType": "notify_task"})),
             20,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                submit,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("submit response");
-        let task_id = response
-            .result
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            submit,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("submit response");
+        let error = response
+            .error
             .as_ref()
-            .and_then(|value| value.get("task"))
-            .and_then(|value| value.get("id"))
-            .and_then(|value| value.as_str())
-            .map(TaskId::from_string)
-            .expect("task id");
-
-        shared.start_task(&task_id).expect("start task");
-        shared.update_progress(&task_id, 0.25, Some("quarter".to_string()));
-        shared.complete_task(&task_id, serde_json::json!({"ok": true}));
+            .expect("quarantined tasks/submit must return an error");
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());
+        assert!(response.result.is_none());
 
         let recorded = notifications.lock().expect("notifications lock poisoned");
-        info!(
-            target: targets::SESSION,
-            "e2e task notifications ts={} count={}",
-            chrono::Utc::now().to_rfc3339(),
-            recorded.len()
-        );
         assert!(
-            recorded.iter().any(|evt| evt.status == TaskStatus::Pending),
-            "expected pending notification"
-        );
-        assert!(
-            recorded.iter().any(|evt| evt.status == TaskStatus::Running),
-            "expected running notification"
-        );
-        assert!(
-            recorded.iter().any(|evt| evt.progress == Some(0.25)),
-            "expected progress notification"
-        );
-        assert!(
-            recorded
-                .iter()
-                .any(|evt| evt.status == TaskStatus::Completed),
-            "expected completed notification"
+            recorded.is_empty(),
+            "quarantined task RPC emitted status notifications: {recorded:?}"
         );
     }
 
@@ -1581,57 +1596,65 @@ mod router_tests {
         let params = CancelledParams {
             request_id: RequestId::Number(1),
             reason: Some("unit test".to_string()),
-            await_cleanup: None,
+            meta: None,
         };
         let request = fastmcp_protocol::JsonRpcRequest::notification(
             "notifications/cancelled",
             Some(serde_json::to_value(params).unwrap()),
         );
 
-        let response = server.handle_request(
+        let response = fastmcp_core::block_on(server.handle_request(
             &cx,
             &mut session,
             request,
             &sender,
             &create_test_request_sender(),
-        );
+        ));
         assert!(response.is_none());
     }
 
     #[test]
     fn test_cancelled_notification_marks_request_cancelled() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(99);
         let cx = Cx::for_testing();
 
         let completion = Arc::new(RequestCompletion::new());
+        let active = ActiveRequest::new(cx.clone(), completion);
+        let cancellation = active.cancellation.clone();
         {
             let mut guard = server
                 .active_requests
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                request_id.clone(),
-                ActiveRequest::new(cx.clone(), completion),
+                ActiveRequestKey::new(session_id, &request_id)
+                    .expect("test request ID must have a canonical correlation key"),
+                active,
             );
         }
 
         let params = CancelledParams {
             request_id: request_id.clone(),
             reason: Some("test cancellation".to_string()),
-            await_cleanup: None,
+            meta: None,
         };
-        server.handle_cancelled_notification(params);
+        server.handle_cancelled_notification(session_id, params);
 
-        assert!(cx.is_cancel_requested());
+        assert!(cancellation.is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
     }
 
     #[test]
-    fn test_cancelled_notification_await_cleanup_waits_for_completion() {
+    fn test_cancelled_notification_remains_nonblocking() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(100);
         let cx = Cx::for_testing();
         let completion = Arc::new(RequestCompletion::new());
+        let active = ActiveRequest::new(cx.clone(), completion.clone());
+        let cancellation = active.cancellation.clone();
 
         {
             let mut guard = server
@@ -1639,42 +1662,52 @@ mod router_tests {
                 .lock()
                 .expect("active_requests lock poisoned");
             guard.insert(
-                request_id.clone(),
-                ActiveRequest::new(cx.clone(), completion.clone()),
+                ActiveRequestKey::new(session_id, &request_id)
+                    .expect("test request ID must have a canonical correlation key"),
+                active,
             );
         }
 
-        let completion_for_thread = completion.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(25));
-            completion_for_thread.mark_done();
-        });
-
         let params = CancelledParams {
             request_id: request_id.clone(),
-            reason: Some("await cleanup".to_string()),
-            await_cleanup: Some(true),
+            reason: Some("test cancellation".to_string()),
+            meta: None,
         };
-        server.handle_cancelled_notification(params);
+        server.handle_cancelled_notification(session_id, params);
 
-        assert!(completion.is_done());
-        assert!(cx.is_cancel_requested());
+        // bd-mvpne: an `assert!(start.elapsed() < Duration::from_secs(1))` stood here and was
+        // removed, with its `Instant::now()` binding. It ran AFTER the call it bounded, so a
+        // genuine block never reached it -- it could not detect the defect its own message
+        // named -- while still being able to fail because the machine was merely slow. The
+        // three assertions below carry everything recoverable. Do not re-add a wall-clock
+        // bound here; the property is structural, not temporal.
+        assert!(!completion.is_done());
+        assert!(cancellation.is_cancel_requested());
+        assert!(!cx.is_cancel_requested());
     }
 
     #[test]
     fn test_active_request_guard_registers_and_cleans_up() {
         let server = Server::new("test-server", "1.0.0").build();
+        let session_id = 1;
         let request_id = RequestId::Number(77);
         let cx = Cx::for_testing();
+        let key = ActiveRequestKey::new(session_id, &request_id)
+            .expect("test request ID must have a canonical correlation key");
 
-        let guard =
-            ActiveRequestGuard::new(&server.active_requests, request_id.clone(), cx.clone());
+        let guard = ActiveRequestGuard::try_new(
+            Arc::clone(&server.active_requests),
+            session_id,
+            request_id,
+            cx.clone(),
+        )
+        .expect("active request should register");
         {
             let guard_map = server
                 .active_requests
                 .lock()
                 .expect("active_requests lock poisoned");
-            let entry = guard_map.get(&request_id).expect("active request missing");
+            let entry = guard_map.get(&key).expect("active request missing");
             assert_eq!(entry.region_id, cx.region_id());
             assert!(!entry.completion.is_done());
         }
@@ -1684,7 +1717,7 @@ mod router_tests {
             .active_requests
             .lock()
             .expect("active_requests lock poisoned");
-        assert!(!guard_map.contains_key(&request_id));
+        assert!(!guard_map.contains_key(&key));
     }
 
     #[test]
@@ -1697,6 +1730,7 @@ mod router_tests {
         let mut cxs = Vec::new();
 
         for i in 0..thread_count {
+            let session_id = 1;
             let request_id =
                 RequestId::Number(i64::try_from(i + 1).expect("request id fits in i64"));
             let cx = Cx::for_testing();
@@ -1708,8 +1742,13 @@ mod router_tests {
             let server = Arc::clone(&server);
             let ready = Arc::clone(&ready);
             let handle = thread::spawn(move || {
-                let _guard =
-                    ActiveRequestGuard::new(&server.active_requests, request_id, cx.clone());
+                let _guard = ActiveRequestGuard::try_new(
+                    Arc::clone(&server.active_requests),
+                    session_id,
+                    request_id,
+                    cx.clone(),
+                )
+                .expect("active request should register");
                 ready.wait();
                 let _ = release_rx.recv();
             });
@@ -1749,6 +1788,7 @@ mod router_tests {
     #[test]
     fn test_cancel_active_requests_waits_for_guard_drop() {
         let server = Arc::new(Server::new("test-server", "1.0.0").build());
+        let session_id = 1;
         let request_id = RequestId::Number(500);
         let cx = Cx::for_testing();
 
@@ -1757,11 +1797,13 @@ mod router_tests {
         let server_for_worker = Arc::clone(&server);
         let cx_for_worker = cx.clone();
         let worker = thread::spawn(move || {
-            let _guard = ActiveRequestGuard::new(
-                &server_for_worker.active_requests,
+            let _guard = ActiveRequestGuard::try_new(
+                Arc::clone(&server_for_worker.active_requests),
+                session_id,
                 request_id,
                 cx_for_worker,
-            );
+            )
+            .expect("active request should register");
             ready_tx.send(()).expect("ready send failed");
             let _ = release_rx.recv();
         });
@@ -1769,14 +1811,31 @@ mod router_tests {
         ready_rx.recv().expect("ready recv failed");
 
         let (done_tx, done_rx) = mpsc::channel::<()>();
+        let (cancel_started_tx, cancel_started_rx) = mpsc::channel::<()>();
         let server_for_cancel = Arc::clone(&server);
         let canceler = thread::spawn(move || {
+            cancel_started_tx
+                .send(())
+                .expect("cancel-started send failed");
             server_for_cancel.cancel_active_requests(CancelKind::User, true);
             done_tx.send(()).expect("done send failed");
         });
 
-        thread::sleep(Duration::from_millis(25));
-        assert!(done_rx.try_recv().is_err());
+        cancel_started_rx
+            .recv()
+            .expect("cancel-started recv failed");
+        let cancellation_deadline = Instant::now() + Duration::from_secs(5);
+        while !cx.is_cancel_requested() && Instant::now() < cancellation_deadline {
+            thread::yield_now();
+        }
+        assert!(
+            cx.is_cancel_requested(),
+            "the shutdown thread must cancel the registered request before cleanup can wait"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "shutdown cleanup must remain blocked while the active guard is alive"
+        );
 
         release_tx.send(()).expect("release send failed");
         worker.join().expect("worker join failed");
@@ -1788,7 +1847,6 @@ mod router_tests {
             .lock()
             .expect("active_requests lock poisoned");
         assert!(guard.is_empty());
-        assert!(cx.is_cancel_requested());
     }
 
     #[test]
@@ -1830,15 +1888,14 @@ mod router_tests {
                     Some(serde_json::to_value(params).expect("params")),
                     i64::try_from(i + 1).expect("request id fits in i64"),
                 );
-                let response = server
-                    .handle_request(
-                        &cx,
-                        &mut session,
-                        request,
-                        &sender,
-                        &create_test_request_sender(),
-                    )
-                    .expect("response");
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    request,
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .expect("response");
                 tx.send(response).expect("response send failed");
             });
         }
@@ -1871,7 +1928,7 @@ mod router_tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("response recv timeout");
             let err = response.error.expect("expected error");
-            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled));
+            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled).into());
         }
     }
 
@@ -1918,15 +1975,14 @@ mod router_tests {
                     Some(serde_json::to_value(params).expect("params")),
                     request_id,
                 );
-                let response = server
-                    .handle_request(
-                        &cx,
-                        &mut session,
-                        request,
-                        &sender,
-                        &create_test_request_sender(),
-                    )
-                    .expect("response");
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    request,
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .expect("response");
                 tx.send(response).expect("response send failed");
             });
         }
@@ -1959,7 +2015,7 @@ mod router_tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("response recv timeout");
             let err = response.error.expect("expected error");
-            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled));
+            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled).into());
         }
 
         let mut by_request: HashMap<i64, Vec<&RequestEvent>> = HashMap::new();
@@ -2021,15 +2077,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                subscribe,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            subscribe,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none());
         assert!(session.is_resource_subscribed("resource://test"));
 
@@ -2059,15 +2114,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let response = server
-            .handle_request(
-                &cx,
-                &mut session,
-                unsubscribe,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("response");
+        let response = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            unsubscribe,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("response");
         assert!(response.error.is_none());
         assert!(!session.is_resource_subscribed("resource://test"));
 
@@ -2079,6 +2133,483 @@ mod router_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn resource_subscription_dispatch_reports_capacity_and_preserves_liveness() {
+        const DUPLICATE_URI: &str = "resource://subscription/already-retained";
+        const OVER_LIMIT_URI_CANARY: &str = "resource://subscription/private-capacity-canary-71c9";
+
+        let server = Server::new("subscription-admission-test", "1.0.0")
+            .resource(StaticResource {
+                uri: DUPLICATE_URI.to_string(),
+                content: "duplicate".to_string(),
+            })
+            .resource(StaticResource {
+                uri: OVER_LIMIT_URI_CANARY.to_string(),
+                content: "over-limit".to_string(),
+            })
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-admission-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+
+        let admission_ctx = McpContext::new(Cx::for_testing(), 9_000);
+        session
+            .subscribe_resource(&admission_ctx, DUPLICATE_URI.to_string())
+            .expect("first subscription should be admitted");
+        for index in 1..MAX_RESOURCE_SUBSCRIPTIONS_PER_SESSION {
+            session
+                .subscribe_resource(&admission_ctx, format!("resource://filler/{index}"))
+                .expect("subscription at the exact count cap should be admitted");
+        }
+
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+        let duplicate = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: DUPLICATE_URI.to_string(),
+                })
+                .expect("serialize duplicate subscription"),
+            ),
+            10_i64,
+        );
+        let duplicate_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            duplicate,
+            &sender,
+            &request_sender,
+        ))
+        .expect("duplicate subscribe request should produce a response");
+        assert!(duplicate_response.error.is_none());
+        assert!(session.is_resource_subscribed(DUPLICATE_URI));
+
+        let over_limit = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: OVER_LIMIT_URI_CANARY.to_string(),
+                })
+                .expect("serialize over-limit subscription"),
+            ),
+            11_i64,
+        );
+        let over_limit_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            over_limit,
+            &sender,
+            &request_sender,
+        ))
+        .expect("over-limit subscribe request should produce a response");
+        let capacity_error = over_limit_response
+            .error
+            .expect("over-limit subscription must fail");
+        assert_eq!(
+            capacity_error.code,
+            crate::RESOURCE_EXHAUSTED_ERROR_CODE.into()
+        );
+        assert_eq!(
+            capacity_error.message,
+            crate::RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
+        );
+        assert!(capacity_error.data.is_none());
+        assert!(!capacity_error.message.contains(OVER_LIMIT_URI_CANARY));
+        let encoded_capacity_error =
+            serde_json::to_string(&capacity_error).expect("serialize capacity error");
+        assert!(!encoded_capacity_error.contains(OVER_LIMIT_URI_CANARY));
+        assert!(!session.is_resource_subscribed(OVER_LIMIT_URI_CANARY));
+
+        let impossible_uri = "x".repeat(MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION + 1);
+        let impossible = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: impossible_uri,
+                })
+                .expect("serialize individually over-limit subscription"),
+            ),
+            12_i64,
+        );
+        let impossible_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            impossible,
+            &sender,
+            &request_sender,
+        ))
+        .expect("individually over-limit subscribe should produce a response");
+        let impossible_error = impossible_response
+            .error
+            .expect("individually over-limit subscription must fail before lookup");
+        assert_eq!(
+            impossible_error.code,
+            crate::RESOURCE_EXHAUSTED_ERROR_CODE.into()
+        );
+        assert_eq!(
+            impossible_error.message,
+            crate::RESOURCE_SUBSCRIPTION_CAPACITY_MESSAGE
+        );
+
+        let mut cancelled_session = create_test_session();
+        cancelled_session.initialize(
+            ClientInfo {
+                name: "cancelled-subscription-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        cancelled_session
+            .subscribe_resource(&admission_ctx, DUPLICATE_URI.to_string())
+            .expect("cancelled-dispatch fixture subscription should be retained");
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let cancelled_request = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: OVER_LIMIT_URI_CANARY.to_string(),
+                })
+                .expect("serialize cancelled subscription"),
+            ),
+            13_i64,
+        );
+        let cancelled_response = fastmcp_core::block_on(server.handle_request(
+            &cancelled_cx,
+            &mut cancelled_session,
+            cancelled_request,
+            &sender,
+            &request_sender,
+        ))
+        .expect("cancelled subscribe request should produce a response");
+        let cancellation = cancelled_response
+            .error
+            .expect("cancelled subscription must fail");
+        assert_eq!(
+            cancellation.code,
+            i32::from(McpErrorCode::RequestCancelled).into()
+        );
+        assert!(!cancelled_session.is_resource_subscribed(OVER_LIMIT_URI_CANARY));
+
+        let cancelled_unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: DUPLICATE_URI.to_string(),
+                })
+                .expect("serialize cancelled unsubscription"),
+            ),
+            14_i64,
+        );
+        let cancelled_unsubscribe_response = fastmcp_core::block_on(server.handle_request(
+            &cancelled_cx,
+            &mut cancelled_session,
+            cancelled_unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("cancelled unsubscribe request should produce a response");
+        let unsubscribe_cancellation = cancelled_unsubscribe_response
+            .error
+            .expect("cancelled unsubscription must fail");
+        assert_eq!(
+            unsubscribe_cancellation.code,
+            i32::from(McpErrorCode::RequestCancelled).into()
+        );
+        assert!(cancelled_session.is_resource_subscribed(DUPLICATE_URI));
+    }
+
+    #[test]
+    fn subscription_hook_errors_preserve_session_state() {
+        use std::sync::atomic::AtomicU8;
+
+        const URI: &str = "resource://subscription/hook-rollback";
+        struct HookResource(Arc<AtomicU8>);
+        impl HookResource {
+            fn hook(&self, ctx: &McpContext) -> McpResult<()> {
+                match self.0.load(Ordering::Acquire) {
+                    0 => Ok(()),
+                    1 => Err(McpError::invalid_request("upstream rejected subscription")),
+                    2 => {
+                        ctx.cx().set_cancel_requested(true);
+                        Err(McpError::request_cancelled())
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        impl ResourceHandler for HookResource {
+            fn definition(&self) -> Resource {
+                StaticResource {
+                    uri: URI.to_owned(),
+                    content: "ready".to_owned(),
+                }
+                .definition()
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Ok(Vec::new())
+            }
+            fn on_subscribe(&self, ctx: &McpContext, _uri: &str) -> McpResult<()> {
+                self.hook(ctx)
+            }
+            fn on_unsubscribe(&self, ctx: &McpContext, _uri: &str) -> McpResult<()> {
+                self.hook(ctx)
+            }
+        }
+        for mode in 0..=2 {
+            for (method, initially_subscribed) in [
+                ("resources/subscribe", false),
+                ("resources/subscribe", true),
+                ("resources/unsubscribe", true),
+            ] {
+                let server = Server::new("subscription-hook-rollback", "1")
+                    .resource(HookResource(Arc::new(AtomicU8::new(mode))))
+                    .build();
+                let cx = Cx::for_testing();
+                let mut session = create_test_session();
+                session.initialize(
+                    ClientInfo {
+                        name: "hook-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    "2024-11-05".to_owned(),
+                );
+                if initially_subscribed {
+                    session
+                        .subscribe_resource(&McpContext::new(cx.clone(), 1), URI.to_owned())
+                        .unwrap();
+                }
+                let before: Vec<String> = session
+                    .subscribed_resource_uris()
+                    .map(str::to_owned)
+                    .collect();
+                let sender: NotificationSender = Arc::new(|_| {});
+                let response = fastmcp_core::block_on(server.handle_request(
+                    &cx,
+                    &mut session,
+                    JsonRpcRequest::new(method, Some(serde_json::json!({"uri":URI})), 91_i64),
+                    &sender,
+                    &create_test_request_sender(),
+                ))
+                .unwrap();
+                if mode == 0 {
+                    assert!(
+                        response.error.is_none(),
+                        "successful hook completes: {response:?}"
+                    );
+                    assert_eq!(
+                        session.is_resource_subscribed(URI),
+                        method == "resources/subscribe"
+                    );
+                } else {
+                    assert_eq!(
+                        response.error.unwrap().code,
+                        i32::from(if mode == 2 {
+                            McpErrorCode::RequestCancelled
+                        } else {
+                            McpErrorCode::InvalidRequest
+                        })
+                        .into()
+                    );
+                    let after: Vec<String> = session
+                        .subscribed_resource_uris()
+                        .map(str::to_owned)
+                        .collect();
+                    assert_eq!(
+                        after, before,
+                        "hook failure preserves exact prior membership"
+                    );
+                    cx.set_cancel_requested(false);
+                    assert_eq!(
+                        session.notify_resource_updated(URI, &sender),
+                        initially_subscribed
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn middleware_cannot_forge_subscription_mutation_success() {
+        const URI: &str = "resource://subscription/short-circuit-guard";
+
+        struct ForgedSuccess;
+        impl Middleware for ForgedSuccess {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+            ) -> McpResult<crate::MiddlewareDecision> {
+                Ok(crate::MiddlewareDecision::Respond(serde_json::json!({})))
+            }
+        }
+
+        let server = Server::new("subscription-short-circuit-test", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "guarded".to_string(),
+            })
+            .middleware(ForgedSuccess)
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-short-circuit-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+
+        let subscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize guarded subscription"),
+            ),
+            20_i64,
+        );
+        let subscribe_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            subscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("guarded subscribe request should produce a response");
+        assert_eq!(
+            subscribe_response.error.expect("subscribe must fail").code,
+            i32::from(McpErrorCode::InternalError).into()
+        );
+        assert!(!session.is_resource_subscribed(URI));
+
+        session
+            .subscribe_resource(&McpContext::new(Cx::for_testing(), 21), URI.to_string())
+            .expect("fixture subscription should be admitted");
+        let unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize guarded unsubscription"),
+            ),
+            21_i64,
+        );
+        let unsubscribe_response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("guarded unsubscribe request should produce a response");
+        assert_eq!(
+            unsubscribe_response
+                .error
+                .expect("unsubscribe must fail")
+                .code,
+            i32::from(McpErrorCode::InternalError).into()
+        );
+        assert!(session.is_resource_subscribed(URI));
+    }
+
+    #[test]
+    fn subscription_mutations_roll_back_when_response_middleware_fails() {
+        const URI: &str = "resource://subscription/finalization-rollback";
+
+        struct RejectResponse;
+        impl Middleware for RejectResponse {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &fastmcp_protocol::JsonRpcRequest,
+                _response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                Err(McpError::internal_error(
+                    "response middleware rejected subscription result",
+                ))
+            }
+        }
+
+        let server = Server::new("subscription-rollback-test", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "guarded".to_string(),
+            })
+            .middleware(RejectResponse)
+            .build();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "subscription-rollback-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let sender: NotificationSender = Arc::new(|_| {});
+        let request_sender = create_test_request_sender();
+
+        let subscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/subscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::SubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize subscription"),
+            ),
+            22_i64,
+        );
+        let response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            subscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("subscribe produces response");
+        assert!(response.error.is_some());
+        assert!(!session.is_resource_subscribed(URI));
+
+        session
+            .subscribe_resource(&McpContext::new(Cx::for_testing(), 23), URI.to_string())
+            .expect("fixture subscription should be admitted");
+        let unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
+            "resources/unsubscribe",
+            Some(
+                serde_json::to_value(fastmcp_protocol::UnsubscribeResourceParams {
+                    uri: URI.to_string(),
+                })
+                .expect("serialize unsubscription"),
+            ),
+            23_i64,
+        );
+        let response = fastmcp_core::block_on(server.handle_request(
+            &Cx::for_testing(),
+            &mut session,
+            unsubscribe,
+            &sender,
+            &request_sender,
+        ))
+        .expect("unsubscribe produces response");
+        assert!(response.error.is_some());
+        assert!(session.is_resource_subscribed(URI));
     }
 
     #[test]
@@ -2115,15 +2646,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                set_level,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("set level response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            set_level,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
             "tools/call",
@@ -2137,15 +2667,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("tool call response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
         let mut logs = guard
@@ -2161,12 +2690,489 @@ mod router_tests {
         let log = logs.pop().expect("log message");
         assert_eq!(log.level, LogLevel::Info);
         let text = log.data.as_str().expect("log data string");
-        assert!(text.contains("Handled tools/call"));
+        // The handled-notification deliberately reports the sanitized method
+        // key (after its timestamp prefix), never the raw peer-visible
+        // method literal.
+        assert!(text.ends_with(&format!(
+            "Handled method={}",
+            crate::safe_peer_log_key("tools/call")
+        )));
+        assert!(!text.contains("tools/call"));
         info!(
             target: targets::SESSION,
             "e2e log notification {}",
             text
         );
+    }
+
+    #[test]
+    fn handler_info_emits_after_set_level_and_debug_stays_filtered() {
+        let server = Server::new("handler-log-server", "1.0.0")
+            .tool(Announce)
+            .build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.initialize(
+            ClientInfo {
+                name: "handler-log-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "announce".to_string(),
+                        arguments: Some(serde_json::json!({"name": "Ada"})),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("handler log without setLevel still responds");
+        let handler_logs = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/message")
+            .filter_map(|req| req.params.as_ref())
+            .filter(|params| {
+                params
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| data.contains("handler-"))
+            })
+            .count();
+        assert_eq!(
+            handler_logs, 0,
+            "MCP forbids notifications/message before logging/setLevel"
+        );
+
+        let _ = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "logging/setLevel",
+                    Some(
+                        serde_json::to_value(SetLogLevelParams {
+                            level: LogLevel::Info,
+                        })
+                        .expect("set level params"),
+                    ),
+                    2_i64,
+                ),
+                &sender,
+                &create_test_request_sender(),
+            ),
+        )
+        .expect("setLevel must respond");
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(3),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("handler log after setLevel must respond");
+        let emitted: Vec<String> = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/message")
+            .filter_map(|req| {
+                req.params
+                    .as_ref()
+                    .and_then(|params| params.get("data"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            emitted.iter().any(|data| data.contains("handler-info:Ada")),
+            "ctx.info must emit after setLevel info: {emitted:?}"
+        );
+        assert!(
+            emitted.iter().all(|data| !data.contains("handler-debug")),
+            "ctx.debug must stay below an info floor: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn disable_tool_emits_list_changed_only_when_the_catalog_mutates() {
+        let server = Server::new("catalog-change", "1.0.0")
+            .tool(Greet)
+            .tool(HideGreet)
+            .build();
+        assert!(
+            server
+                .capabilities()
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed)
+        );
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "catalog-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "hide_greet".to_string(),
+                        arguments: Some(serde_json::json!({})),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("first hide must respond");
+        let first = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(first, 1, "first disable must emit one tools/list_changed");
+
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(2),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("repeat hide must respond");
+        let repeat = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(
+            repeat, 0,
+            "disabling an already-disabled tool must not emit list_changed"
+        );
+    }
+
+    #[test]
+    fn disable_tool_publishes_to_modern_subscription_listeners() {
+        let server = Server::new("modern-catalog-listen", "1.0.0")
+            .tool(Greet)
+            .tool(HideGreet)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<fastmcp_protocol::JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let listen_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _lease = server
+            .final_subscriptions
+            .open(
+                RequestId::String("listen-hide".to_owned()),
+                fastmcp_protocol::SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..fastmcp_protocol::SubscriptionFilter::default()
+                },
+                false,
+                None,
+                fastmcp_core::McpRequestCancellation::new(),
+                None,
+                listen_sender,
+            )
+            .expect("listen stream must open");
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "listen-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let session_sender: NotificationSender = Arc::new(|_| {});
+        let _ = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "hide_greet".to_string(),
+                            arguments: Some(serde_json::json!({})),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
+                ),
+                &session_sender,
+                &create_test_request_sender(),
+            ),
+        )
+        .expect("hide_greet must respond");
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|request| request.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "handler-driven disable must publish to subscriptions/listen"
+        );
+    }
+
+    #[test]
+    fn notify_resource_updated_publishes_to_matching_listen_filters() {
+        const URI: &str = "file:///watched.txt";
+        let server = Server::new("modern-resource-listen", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "watched".to_string(),
+            })
+            .tool(TouchFile)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<fastmcp_protocol::JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let listen_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _lease = server
+            .final_subscriptions
+            .open(
+                RequestId::String("listen-touch".to_owned()),
+                fastmcp_protocol::SubscriptionFilter {
+                    resource_subscriptions: Some(vec![URI.to_owned()]),
+                    ..fastmcp_protocol::SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                listen_sender,
+            )
+            .expect("listen stream must open");
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "listen-touch-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let session_sender: NotificationSender = Arc::new(|_| {});
+        let response = fastmcp_core::block_on(
+            server.handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "touch_file".to_string(),
+                            arguments: Some(serde_json::json!({ "uri": URI })),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
+                ),
+                &session_sender,
+                &create_test_request_sender(),
+            ),
+        )
+        .expect("touch_file must respond");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("notified"),
+            "a matching modern listener must count as delivery"
+        );
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|request| request.method == "notifications/resources/updated")
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "handler-driven resource update must publish to subscriptions/listen"
+        );
+    }
+
+    #[test]
+    fn notify_resource_updated_emits_only_for_subscribed_uris() {
+        const URI: &str = "file:///watched.txt";
+        let server = Server::new("resource-update", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "watched".to_string(),
+            })
+            .tool(TouchFile)
+            .build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "resource-update-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "touch_file".to_string(),
+                        arguments: Some(serde_json::json!({ "uri": URI })),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+        let silent = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(1),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("unsubscribed touch must respond");
+        assert_eq!(
+            silent
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("silent")
+        );
+        assert!(
+            notifications
+                .lock()
+                .expect("notifications lock poisoned")
+                .iter()
+                .all(|req| req.method != "notifications/resources/updated")
+        );
+
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            fastmcp_protocol::JsonRpcRequest::new(
+                "resources/subscribe",
+                Some(serde_json::json!({ "uri": URI })),
+                2_i64,
+            ),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("subscribe must respond");
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let notified = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call(3),
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("subscribed touch must respond");
+        assert_eq!(
+            notified
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("notified")
+        );
+        let updates = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/resources/updated")
+            .count();
+        assert_eq!(updates, 1, "subscribed URI must emit one resources/updated");
     }
 
     #[test]
@@ -2203,15 +3209,14 @@ mod router_tests {
             ),
             1i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                set_level,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("set level response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            set_level,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("set level response");
 
         let call = fastmcp_protocol::JsonRpcRequest::new(
             "tools/call",
@@ -2225,15 +3230,14 @@ mod router_tests {
             ),
             2i64,
         );
-        let _ = server
-            .handle_request(
-                &cx,
-                &mut session,
-                call,
-                &sender,
-                &create_test_request_sender(),
-            )
-            .expect("tool call response");
+        let _ = fastmcp_core::block_on(server.handle_request(
+            &cx,
+            &mut session,
+            call,
+            &sender,
+            &create_test_request_sender(),
+        ))
+        .expect("tool call response");
 
         let guard = notifications.lock().expect("notifications lock poisoned");
         let log_count = guard
@@ -2258,7 +3262,13 @@ mod router_tests {
             },
         };
 
-        let result = router.handle_initialize(&cx, &mut session, params, Some("Test instructions"));
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_initialize(
+            &request_ctx,
+            &mut session,
+            params,
+            Some("Test instructions"),
+        );
 
         assert!(result.is_ok());
         let init_result = result.unwrap();
@@ -2282,16 +3292,23 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
         assert!(!call_result.is_error);
         assert_eq!(call_result.content.len(), 1);
 
-        assert!(matches!(call_result.content[0], Content::Text { .. }));
-        let Content::Text { text } = &call_result.content[0] else {
+        assert!(matches!(call_result.content[0], LegacyContent::Text { .. }));
+        let LegacyContent::Text { text, .. } = &call_result.content[0] else {
             return;
         };
         assert_eq!(text, "Hello, Alice!");
@@ -2309,12 +3326,22 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("nonexistent"));
+        // The refusal deliberately does not echo the peer-controlled tool
+        // name; only the sanitized method-not-found classification surfaces.
+        assert_eq!(err.code, McpErrorCode::MethodNotFound);
+        assert!(!err.message.contains("nonexistent"));
     }
 
     #[test]
@@ -2329,8 +3356,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Tool errors are returned as content with is_error=true
         assert!(result.is_ok());
@@ -2352,8 +3386,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Request should be cancelled before handler runs
         assert!(result.is_err());
@@ -2371,13 +3412,21 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
-        // Request should fail due to exhausted budget
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("budget") || err.message.contains("exhausted"));
+        // The handler explicitly requests a poll checkpoint, so a zero poll
+        // balance rejects that next admission rather than retroactively
+        // invalidating some earlier operation.
+        let err = result.expect_err("checkpoint should require a poll unit");
+        assert_eq!(err.code, McpErrorCode::RequestCancelled);
     }
 
     #[test]
@@ -2391,16 +3440,23 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
         assert_eq!(read_result.contents.len(), 1);
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Test content".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Test content"
+        ));
     }
 
     #[test]
@@ -2410,19 +3466,26 @@ mod router_tests {
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://abc".to_string(),
+            uri: "resource:///items/abc".to_string(),
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template abc".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template abc"
+        ));
     }
 
     #[test]
@@ -2432,24 +3495,85 @@ mod router_tests {
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://hello%20world".to_string(),
+            uri: "resource:///items/hello%20world".to_string(),
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template hello world".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template hello world"
+        ));
     }
 
     #[test]
     fn test_handle_resources_read_template_match_with_slash() {
-        let router = create_test_router();
+        // A simple `{id}` expression cannot span "/" under RFC 6570 matching;
+        // slash-bearing values are reachable through reserved expansion.
+        struct SlashTemplateResource;
+
+        impl ResourceHandler for SlashTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "resource://{+id}".to_string(),
+                    name: "Slash Template Resource".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(ResourceTemplate {
+                    uri_template: "resource://{+id}".to_string(),
+                    name: "Slash Template Resource".to_string(),
+                    description: None,
+                    mime_type: Some("text/plain".to_string()),
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                })
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                Err(McpError::invalid_params(
+                    "uri parameters required for template resource",
+                ))
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                let id = params
+                    .get("id")
+                    .ok_or_else(|| McpError::invalid_params("missing uri parameter: id"))?;
+                Ok(vec![ResourceContent {
+                    uri: uri.to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(format!("Template {id}")),
+                    blob: None,
+                }])
+            }
+        }
+
+        let mut router = Router::new();
+        router.add_resource(SlashTemplateResource);
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
@@ -2458,40 +3582,68 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Template foo/bar".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template foo/bar"
+        ));
     }
 
     #[test]
-    fn test_handle_resources_read_template_precedence() {
+    fn test_overlapping_resource_template_registration_is_rejected_without_mutation() {
         let mut router = Router::new();
         router.add_resource(TemplateResource);
-        router.add_resource(SpecificTemplateResource);
+        let templates_before = serde_json::to_value(router.resource_templates())
+            .expect("resource template catalog serializes");
+        let error = router
+            .add_resource_with_behavior(SpecificTemplateResource, crate::DuplicateBehavior::Replace)
+            .expect_err("a conservatively overlapping final template must be rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "resource template collides with an admitted final resource template"
+        );
+        assert_eq!(
+            serde_json::to_value(router.resource_templates())
+                .expect("resource template catalog serializes"),
+            templates_before
+        );
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://foo/123".to_string(),
+            uri: "resource:///items/123".to_string(),
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text,
-            Some("Specific 123".to_string())
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Template 123"
+        ));
     }
 
     #[test]
@@ -2510,15 +3662,22 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok(), "Expected Ok, got Err: {:?}", result.err());
         let read_result = result.unwrap();
-        assert_eq!(
-            read_result.contents[0].text.as_deref(),
-            Some("Logged dir/file.txt")
-        );
+        assert!(matches!(
+            &read_result.contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Logged dir/file.txt"
+        ));
 
         let guard = events.lock().expect("template log lock poisoned");
         assert_eq!(guard.len(), 1);
@@ -2544,8 +3703,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
     }
@@ -2562,8 +3728,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx,
+            &params,
+            state,
+            None,
+            None,
+        ));
 
         // Should be cancelled
         assert!(result.is_err());
@@ -2585,8 +3758,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_prompts_get(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let get_result = result.unwrap();
@@ -2594,9 +3774,9 @@ mod router_tests {
 
         assert!(matches!(
             get_result.messages[0].content,
-            Content::Text { .. }
+            LegacyContent::Text { .. }
         ));
-        let Content::Text { text } = &get_result.messages[0].content else {
+        let LegacyContent::Text { text, .. } = &get_result.messages[0].content else {
             return;
         };
         assert!(text.contains("Bob"));
@@ -2614,8 +3794,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_prompts_get(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_prompts_get(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
     }
@@ -2633,8 +3820,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2654,8 +3848,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2675,8 +3876,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         assert!(result.is_ok());
         let call_result = result.unwrap();
@@ -2697,8 +3905,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should pass in lenient mode
         assert!(result.is_ok());
@@ -2721,8 +3936,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should fail in strict mode due to extra property
         assert!(result.is_err());
@@ -2745,8 +3967,15 @@ mod router_tests {
             meta: None,
         };
 
-        let result =
-            router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+        let result = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx,
+            params,
+            state,
+            None,
+            None,
+        ));
 
         // Should pass in strict mode with valid input
         assert!(result.is_ok());
@@ -2852,7 +4081,8 @@ mod cancellation_tests {
         // Inside masked section, checkpoint should succeed
         ctx.masked(|| {
             assert!(ctx.checkpoint().is_ok());
-        });
+        })
+        .expect("mask should be admitted");
 
         // Outside masked section, checkpoint should fail
         assert!(ctx.checkpoint().is_err());
@@ -2882,7 +4112,7 @@ mod budget_tests {
     #[test]
     fn test_deadline_budget() {
         // A budget with a deadline far in the future
-        let budget = Budget::with_deadline_secs(3600);
+        let budget = Budget::new().with_timeout(wall_now(), Duration::from_secs(3600));
         assert!(!budget.is_exhausted());
     }
 }
@@ -2904,7 +4134,7 @@ mod handler_definition_tests {
 
         assert_eq!(def.name, "greet");
         assert!(def.description.is_some());
-        assert!(def.input_schema["type"] == "object");
+        assert_eq!(def.input_schema["type"], "object");
     }
 
     #[test]
@@ -2977,11 +4207,21 @@ mod handler_definition_tests {
     fn create_tagged_tools_router() -> Router {
         let mut router = Router::new();
         // Tools with various tag combinations
-        router.add_tool(TaggedSearchTool);
-        router.add_tool(TaggedCreateTool);
-        router.add_tool(TaggedAdminTool);
-        router.add_tool(TaggedDebugTool);
-        router.add_tool(TaggedUntaggedTool);
+        router
+            .add_tool(TaggedSearchTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedCreateTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedAdminTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedDebugTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(TaggedUntaggedTool)
+            .expect("tool registration succeeds");
         router
     }
 
@@ -3086,7 +4326,8 @@ mod handler_definition_tests {
             include_tags: Some(vec!["public".to_string()]),
             exclude_tags: None,
         };
-        let result = router.handle_tools_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_tools_list(&request_ctx, params, None);
         let tools = result.unwrap().tools;
         assert_eq!(tools.len(), 2, "Expected search, create");
     }
@@ -3100,7 +4341,8 @@ mod handler_definition_tests {
             include_tags: None,
             exclude_tags: Some(vec!["private".to_string(), "internal".to_string()]),
         };
-        let result = router.handle_tools_list(&cx, params, None);
+        let request_ctx = McpContext::new(cx, 1);
+        let result = router.handle_tools_list(&request_ctx, params, None);
         let tools = result.unwrap().tools;
         assert_eq!(tools.len(), 3, "Expected search, create, untagged");
     }
@@ -3117,8 +4359,10 @@ mod multi_handler_tests {
     #[test]
     fn test_multiple_tools() {
         let mut router = Router::new();
-        router.add_tool(Greet);
-        router.add_tool(FormalGreet);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(FormalGreet)
+            .expect("tool registration succeeds");
 
         let tools = router.tools();
         assert_eq!(tools.len(), 2);
@@ -3127,39 +4371,41 @@ mod multi_handler_tests {
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
-        let result1 = router.handle_tools_call(
-            &cx,
-            1,
+        let state1 = SessionState::new();
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx1,
             CallToolParams {
                 name: "greet".to_string(),
                 arguments: Some(serde_json::json!({"name": "Alice"})),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
+            state1,
             None,
             None,
-        );
+        ));
         assert!(result1.is_ok());
 
-        let result2 = router.handle_tools_call(
-            &cx,
-            2,
+        let state2 = SessionState::new();
+        let request_ctx2 =
+            McpContext::with_state(cx, 2, state2.clone()).with_budget_ceiling(budget);
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx2,
             CallToolParams {
                 name: "formal_greet".to_string(),
                 arguments: Some(serde_json::json!({"name": "Alice"})),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
+            state2,
             None,
             None,
-        );
+        ));
         assert!(result2.is_ok());
 
         // Verify different outputs
-        if let Content::Text { text: text1 } = &result1.unwrap().content[0] {
-            if let Content::Text { text: text2 } = &result2.unwrap().content[0] {
+        if let LegacyContent::Text { text: text1, .. } = &result1.unwrap().content[0] {
+            if let LegacyContent::Text { text: text2, .. } = &result2.unwrap().content[0] {
                 assert_eq!(text1, "Hello, Alice!");
                 assert_eq!(text2, "Good day, Alice.");
             }
@@ -3184,39 +4430,41 @@ mod multi_handler_tests {
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
-        let result_a = router.handle_resources_read(
-            &cx,
-            1,
+        let state_a = SessionState::new();
+        let request_ctx_a =
+            McpContext::with_state(cx.clone(), 1, state_a.clone()).with_budget_ceiling(budget);
+        let result_a = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx_a,
             &ReadResourceParams {
                 uri: "resource://a".to_string(),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
+            state_a,
             None,
             None,
-        );
-        let result_b = router.handle_resources_read(
-            &cx,
-            2,
+        ));
+        let state_b = SessionState::new();
+        let request_ctx_b =
+            McpContext::with_state(cx, 2, state_b.clone()).with_budget_ceiling(budget);
+        let result_b = fastmcp_core::block_on(router.handle_resources_read(
+            &request_ctx_b,
             &ReadResourceParams {
                 uri: "resource://b".to_string(),
                 meta: None,
             },
-            &budget,
-            SessionState::new(),
+            state_b,
             None,
             None,
-        );
+        ));
 
-        assert_eq!(
-            result_a.unwrap().contents[0].text,
-            Some("Content A".to_string())
-        );
-        assert_eq!(
-            result_b.unwrap().contents[0].text,
-            Some("Content B".to_string())
-        );
+        assert!(matches!(
+            &result_a.unwrap().contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Content A"
+        ));
+        assert!(matches!(
+            &result_b.unwrap().contents[0],
+            LegacyResourceContent::Text { text, .. } if text == "Content B"
+        ));
     }
 }
 
@@ -3230,7 +4478,9 @@ mod session_state_tests {
     #[test]
     fn test_session_state_persists_across_calls() {
         let mut router = Router::new();
-        router.add_tool(Increment);
+        router
+            .add_tool(Increment)
+            .expect("tool registration succeeds");
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -3244,25 +4494,46 @@ mod session_state_tests {
             arguments: None,
             meta: None,
         };
-        let result1 =
-            router.handle_tools_call(&cx, 1, params.clone(), &budget, state.clone(), None, None);
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state.clone()).with_budget_ceiling(budget);
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx1,
+            params.clone(),
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result1.is_ok());
-        if let Content::Text { text } = &result1.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result1.unwrap().content[0] {
             assert_eq!(text, "Counter: 1");
         }
 
         // Second call with same state - counter should be 2
-        let result2 =
-            router.handle_tools_call(&cx, 2, params.clone(), &budget, state.clone(), None, None);
+        let request_ctx2 =
+            McpContext::with_state(cx.clone(), 2, state.clone()).with_budget_ceiling(budget);
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx2,
+            params.clone(),
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result2.is_ok());
-        if let Content::Text { text } = &result2.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result2.unwrap().content[0] {
             assert_eq!(text, "Counter: 2");
         }
 
         // Third call - counter should be 3
-        let result3 = router.handle_tools_call(&cx, 3, params, &budget, state.clone(), None, None);
+        let request_ctx3 = McpContext::with_state(cx, 3, state.clone()).with_budget_ceiling(budget);
+        let result3 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx3,
+            params,
+            state.clone(),
+            None,
+            None,
+        ));
         assert!(result3.is_ok());
-        if let Content::Text { text } = &result3.unwrap().content[0] {
+        if let LegacyContent::Text { text, .. } = &result3.unwrap().content[0] {
             assert_eq!(text, "Counter: 3");
         }
     }
@@ -3270,7 +4541,9 @@ mod session_state_tests {
     #[test]
     fn test_different_session_states_are_independent() {
         let mut router = Router::new();
-        router.add_tool(Increment);
+        router
+            .add_tool(Increment)
+            .expect("tool registration succeeds");
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
@@ -3286,23 +4559,44 @@ mod session_state_tests {
         };
 
         // Call with state1 twice
-        router
-            .handle_tools_call(&cx, 1, params.clone(), &budget, state1.clone(), None, None)
-            .unwrap();
-        let result1 = router
-            .handle_tools_call(&cx, 2, params.clone(), &budget, state1.clone(), None, None)
-            .unwrap();
+        let request_ctx1 =
+            McpContext::with_state(cx.clone(), 1, state1.clone()).with_budget_ceiling(budget);
+        fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx1,
+            params.clone(),
+            state1.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
+        let request_ctx2 =
+            McpContext::with_state(cx.clone(), 2, state1.clone()).with_budget_ceiling(budget);
+        let result1 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx2,
+            params.clone(),
+            state1.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
 
         // Call with state2 once
-        let result2 = router
-            .handle_tools_call(&cx, 3, params, &budget, state2.clone(), None, None)
-            .unwrap();
+        let request_ctx3 =
+            McpContext::with_state(cx, 3, state2.clone()).with_budget_ceiling(budget);
+        let result2 = fastmcp_core::block_on(router.handle_tools_call(
+            &request_ctx3,
+            params,
+            state2.clone(),
+            None,
+            None,
+        ))
+        .unwrap();
 
         // state1 should have counter=2, state2 should have counter=1
-        if let Content::Text { text } = &result1.content[0] {
+        if let LegacyContent::Text { text, .. } = &result1.content[0] {
             assert_eq!(text, "Counter: 2");
         }
-        if let Content::Text { text } = &result2.content[0] {
+        if let LegacyContent::Text { text, .. } = &result2.content[0] {
             assert_eq!(text, "Counter: 1");
         }
     }
@@ -3363,7 +4657,6 @@ mod console_config_tests {
             .with_traffic_logging(TrafficVerbosity::Summary)
             .build();
 
-        assert!(server.console_config().show_request_traffic);
         assert_eq!(
             server.console_config().traffic_verbosity,
             TrafficVerbosity::Summary
@@ -3371,11 +4664,25 @@ mod console_config_tests {
     }
 
     #[test]
-    fn test_server_with_periodic_stats() {
-        let server = Server::new("test", "1.0.0").with_periodic_stats(30).build();
+    fn traffic_verbosity_is_the_single_enablement_source() {
+        let disabled = Server::new("test", "1.0.0").build();
+        assert!(disabled.configured_traffic_renderer().is_none());
 
-        assert!(server.console_config().show_stats_periodic);
-        assert_eq!(server.console_config().stats_interval_secs, 30);
+        let summary = Server::new("test", "1.0.0")
+            .with_traffic_logging(TrafficVerbosity::Summary)
+            .build()
+            .configured_traffic_renderer()
+            .expect("summary traffic should create a renderer");
+        assert!(!summary.show_params);
+        assert!(!summary.show_result);
+
+        let full = Server::new("test", "1.0.0")
+            .with_traffic_logging(TrafficVerbosity::Full)
+            .build()
+            .configured_traffic_renderer()
+            .expect("full traffic should create a renderer");
+        assert!(full.show_params);
+        assert!(full.show_result);
     }
 
     #[test]
@@ -3396,16 +4703,13 @@ mod console_config_tests {
     fn test_console_config_chaining() {
         let server = Server::new("test", "1.0.0")
             .with_banner(BannerStyle::Compact)
-            .with_traffic_logging(TrafficVerbosity::Headers)
-            .with_periodic_stats(60)
+            .with_traffic_logging(TrafficVerbosity::Full)
             .plain_mode()
             .build();
 
         let config = server.console_config();
         assert_eq!(config.banner_style, BannerStyle::Compact);
-        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Headers);
-        assert!(config.show_stats_periodic);
-        assert_eq!(config.stats_interval_secs, 60);
+        assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
         assert!(config.force_plain);
     }
 }
@@ -3537,7 +4841,9 @@ mod lab_runtime_tests {
 
             LabRuntimeTarget::block_on(runtime, async move {
                 let mut router = Router::new();
-                router.add_tool(CancellationCheck);
+                router
+                    .add_tool(CancellationCheck)
+                    .expect("tool registration succeeds");
 
                 let cx = Cx::for_testing();
                 cx.cancel_with(CancelKind::User, None);
@@ -3547,15 +4853,12 @@ mod lab_runtime_tests {
                     arguments: Some(serde_json::json!({})),
                     meta: None,
                 };
-                let result = router.handle_tools_call(
-                    &cx,
-                    1,
-                    params,
-                    &Budget::INFINITE,
-                    SessionState::new(),
-                    None,
-                    None,
-                );
+                let state = SessionState::new();
+                let request_ctx = McpContext::with_state(cx, 1, state.clone())
+                    .with_budget_ceiling(Budget::INFINITE);
+                let result = router
+                    .handle_tools_call(&request_ctx, params, state, None, None)
+                    .await;
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task
@@ -3596,15 +4899,12 @@ mod lab_runtime_tests {
                     meta: None,
                 };
 
-                let result = router.handle_resources_read(
-                    &cx,
-                    1,
-                    &params,
-                    &budget,
-                    SessionState::new(),
-                    None,
-                    None,
-                );
+                let state = SessionState::new();
+                let request_ctx =
+                    McpContext::with_state(cx, 1, state.clone()).with_budget_ceiling(budget);
+                let result = router
+                    .handle_resources_read(&request_ctx, &params, state, None, None)
+                    .await;
 
                 let err = result.as_ref().err().map(|e| e.message.clone());
                 events_for_task
@@ -3618,7 +4918,10 @@ mod lab_runtime_tests {
                     err
                 );
 
-                assert!(result.is_err());
+                assert!(
+                    result.is_ok(),
+                    "a resource that requests no poll admission may complete at an exact zero balance"
+                );
             });
 
             assert_eq!(events.lock().expect("events lock poisoned").len(), 1);
@@ -3628,7 +4931,7 @@ mod lab_runtime_tests {
     #[test]
     fn test_lab_runtime_deadline_progression() {
         with_lab_runtime(|runtime| {
-            let budget = Budget::with_deadline_secs(1);
+            let budget = Budget::with_deadline_at_secs(1);
             let start = runtime.now();
             assert!(!budget.is_past_deadline(start));
 
@@ -3712,8 +5015,12 @@ mod mount_tests {
     fn test_mount_with_prefix_renames_tools() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(MountQuery);
-        db_router.add_tool(MountInsert);
+        db_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
+        db_router
+            .add_tool(MountInsert)
+            .expect("tool registration succeeds");
 
         let result = main_router.mount(db_router, Some("db"));
 
@@ -3728,7 +5035,9 @@ mod mount_tests {
     fn test_mount_without_prefix_keeps_names() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let result = main_router.mount(other_router, None);
 
@@ -3765,10 +5074,14 @@ mod mount_tests {
     #[test]
     fn test_mount_conflict_generates_warning() {
         let mut main_router = Router::new();
-        main_router.add_tool(MountQuery);
+        main_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         // Mount without prefix, causing a conflict
         let result = main_router.mount(other_router, None);
@@ -3782,7 +5095,9 @@ mod mount_tests {
     fn test_mount_preserves_tool_definition() {
         let mut main_router = Router::new();
         let mut db_router = Router::new();
-        db_router.add_tool(MountQuery);
+        db_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         main_router.mount(db_router, Some("db"));
 
@@ -3795,7 +5110,9 @@ mod mount_tests {
     fn test_mount_all_components() {
         let mut main_router = Router::new();
         let mut other_router = Router::new();
-        other_router.add_tool(MountQuery);
+        other_router
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
         other_router.add_resource(ConfigResource);
         other_router.add_prompt(GreetingPrompt);
 
@@ -3825,8 +5142,8 @@ mod mount_tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "db/query");
-        assert!(resources.is_empty());
-        assert!(prompts.is_empty());
+        assert_eq!(resources.len(), 0);
+        assert_eq!(prompts.len(), 0);
     }
 
     #[test]
@@ -3922,13 +5239,14 @@ mod mount_tests {
     fn test_prefix_validation_rejects_slashes() {
         let mut router = Router::new();
         let mut other = Router::new();
-        other.add_tool(MountQuery);
+        other
+            .add_tool(MountQuery)
+            .expect("tool registration succeeds");
 
         let result = router.mount(other, Some("bad/prefix"));
 
         // Should still mount but generate a warning
-        assert!(!result.warnings.is_empty());
-        assert!(result.warnings[0].contains("slash"));
+        assert_ne!(result.warnings.len(), 0);
     }
 
     #[test]
@@ -3984,7 +5302,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_error_returns_error() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Error);
         assert!(result.is_err());
@@ -3994,7 +5314,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_warn_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Warn);
         assert!(result.is_ok());
@@ -4007,7 +5329,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_replace_replaces() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Replace);
         assert!(result.is_ok());
@@ -4020,7 +5344,9 @@ mod duplicate_behavior_tests {
     #[test]
     fn test_duplicate_behavior_ignore_keeps_original() {
         let mut router = Router::new();
-        router.add_tool(DupTool1);
+        router
+            .add_tool(DupTool1)
+            .expect("tool registration succeeds");
 
         let result = router.add_tool_with_behavior(DupTool2, DuplicateBehavior::Ignore);
         assert!(result.is_ok());
@@ -4065,18 +5391,20 @@ mod duplicate_behavior_tests {
     }
 
     #[test]
-    fn test_server_builder_error_behavior_logs_but_continues() {
-        // Create server with error behavior
-        let server = Server::new("test", "1.0")
-            .on_duplicate(DuplicateBehavior::Error)
-            .tool(DupTool1)
-            .tool(DupTool2) // Should fail silently in builder
-            .build();
-
-        let tools = server.tools();
-        // Only first tool should be registered
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].description, Some("Tool #1".to_string()));
+    fn test_server_builder_error_behavior_refuses_the_build() {
+        // A duplicate refused under Error must fail the build, not vanish.
+        let Err(crate::ServerBuildError::InvalidConfiguration(refused)) =
+            Server::new("test", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .tool(DupTool1)
+                .tool(DupTool2)
+                .try_build()
+        else {
+            panic!("a duplicate refused under DuplicateBehavior::Error must fail try_build");
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].kind, crate::RegistrationKind::Tool);
+        assert_eq!(refused[0].name, "dup_tool");
     }
 }
 
@@ -4126,51 +5454,6 @@ mod ctx_read_resource_tests {
                 uri: "config://app".to_string(),
                 mime_type: Some("application/json".to_string()),
                 text: Some(self.config_json.clone()),
-                blob: None,
-            }])
-        }
-    }
-
-    /// A resource that reads another resource.
-    struct NestedResource {
-        inner_uri: String,
-    }
-
-    impl NestedResource {
-        fn new(inner_uri: &str) -> Self {
-            Self {
-                inner_uri: inner_uri.to_string(),
-            }
-        }
-    }
-
-    impl ResourceHandler for NestedResource {
-        fn definition(&self) -> Resource {
-            Resource {
-                uri: "nested://wrapper".to_string(),
-                name: "nested_wrapper".to_string(),
-                description: Some("Wraps another resource".to_string()),
-                mime_type: Some("text/plain".to_string()),
-                icon: None,
-                version: None,
-                tags: vec![],
-            }
-        }
-
-        fn template(&self) -> Option<ResourceTemplate> {
-            None
-        }
-
-        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-            // Read the inner resource using ctx
-            let inner_uri = self.inner_uri.clone();
-            let inner_result = fastmcp_core::block_on(ctx.read_resource(&inner_uri))?;
-
-            let text = inner_result.first_text().unwrap_or("(no content)");
-            Ok(vec![ResourceContent {
-                uri: "nested://wrapper".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some(format!("Wrapped: {}", text)),
                 blob: None,
             }])
         }
@@ -4230,7 +5513,8 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://app", 0));
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
+        let result = fastmcp_core::block_on(reader.read_resource(&request_ctx, "config://app", 0));
 
         assert!(result.is_ok());
         let read_result = result.unwrap();
@@ -4244,7 +5528,9 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result = fastmcp_core::block_on(reader.read_resource(&cx, "config://missing", 0));
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
+        let result =
+            fastmcp_core::block_on(reader.read_resource(&request_ctx, "config://missing", 0));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4258,9 +5544,10 @@ mod ctx_read_resource_tests {
         let reader = RouterResourceReader::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Call with depth at limit
         let result = fastmcp_core::block_on(reader.read_resource(
-            &cx,
+            &request_ctx,
             "any://uri",
             MAX_RESOURCE_READ_DEPTH + 1,
         ));
@@ -4350,9 +5637,7 @@ mod ctx_read_resource_tests {
         let ctx = McpContext::new(cx, 1).with_resource_reader(reader);
 
         #[derive(Debug, serde::Deserialize)]
-        struct Config {
-            value: i32,
-        }
+        struct Config {}
 
         let result: McpResult<Config> =
             fastmcp_core::block_on(ctx.read_resource_json("config://app"));
@@ -4426,20 +5711,34 @@ mod ctx_read_resource_tests {
             None
         }
 
-        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-            // Set a value in session state
-            ctx.set_state("test_key", "propagated_value");
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // A nested read is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested reads use read_async"))
+        }
 
-            // Read another resource - it should see our session state
-            let inner_result = fastmcp_core::block_on(ctx.read_resource("session://state"))?;
-            let text = inner_result.first_text().unwrap_or("(no content)");
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<ResourceContent>>> {
+            Box::pin(async move {
+                // Set a value in session state
+                ctx.set_state("test_key", "propagated_value");
 
-            Ok(vec![ResourceContent {
-                uri: "nested://session".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: Some(format!("Inner saw: {}", text)),
-                blob: None,
-            }])
+                // Read another resource - it should see our session state
+                let inner_result = match ctx.read_resource("session://state").await {
+                    Ok(result) => result,
+                    Err(error) => return fastmcp_core::Outcome::Err(error),
+                };
+                let text = inner_result.first_text().unwrap_or("(no content)");
+
+                fastmcp_core::Outcome::Ok(vec![ResourceContent {
+                    uri: "nested://session".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(format!("Inner saw: {}", text)),
+                    blob: None,
+                }])
+            })
         }
     }
 
@@ -4468,6 +5767,246 @@ mod ctx_read_resource_tests {
             text.contains("propagated_value"),
             "Expected session state to propagate, got: {}",
             text
+        );
+    }
+
+    struct AuthEchoResource;
+
+    impl ResourceHandler for AuthEchoResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "auth://subject".to_string(),
+                name: "auth_subject".to_string(),
+                description: Some("Returns the current auth subject".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: "auth://subject".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(
+                    ctx.auth()
+                        .and_then(|auth| auth.subject)
+                        .unwrap_or_else(|| "anonymous".to_string()),
+                ),
+                blob: None,
+            }])
+        }
+    }
+
+    struct NestedAuthResource;
+
+    impl ResourceHandler for NestedAuthResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "nested://auth".to_string(),
+                name: "nested_auth".to_string(),
+                description: Some(
+                    "Reads another resource and expects auth to propagate".to_string(),
+                ),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            // A nested read is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested reads use read_async"))
+        }
+
+        fn read_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<ResourceContent>>> {
+            Box::pin(async move {
+                let inner = match ctx.read_resource("auth://subject").await {
+                    Ok(result) => result,
+                    Err(error) => return fastmcp_core::Outcome::Err(error),
+                };
+                fastmcp_core::Outcome::Ok(vec![ResourceContent {
+                    uri: "nested://auth".to_string(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: Some(inner.first_text().unwrap_or("missing").to_string()),
+                    blob: None,
+                }])
+            })
+        }
+    }
+
+    #[test]
+    fn test_request_auth_propagates_through_nested_reads() {
+        let mut router = Router::new();
+        router.add_resource(AuthEchoResource);
+        router.add_resource(NestedAuthResource);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state)
+            .with_resource_reader(reader)
+            .with_auth(AuthContext::with_subject("reader-auth"));
+
+        let result = fastmcp_core::block_on(ctx.read_resource("nested://auth"))
+            .expect("nested resource read should succeed");
+        assert_eq!(result.first_text(), Some("reader-auth"));
+    }
+
+    // ========================================================================
+    // bd-v9ev3 area (d): reading the payload the redaction hides.
+    //
+    // The four (d) tests let a handler's panic escape into the server's
+    // extension-unwind catch, which converts it to a payload-free
+    // `InternalError`, while the process panic hook prints a fixed redaction
+    // constant instead of the message. Neither surface can name what fired,
+    // which is why area (d) has no observed root cause.
+    //
+    // The hook governs what is PRINTED. `catch_unwind` still RETURNS the
+    // payload. A handler that catches its own unwind can therefore read the
+    // message the redaction withholds, with no change to any shipped path.
+    // ========================================================================
+
+    /// Renders a caught panic payload as text, naming the shapes it does not
+    /// recognise rather than collapsing them into an empty string.
+    pub(super) fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(text) = payload.downcast_ref::<&'static str>() {
+            (*text).to_string()
+        } else if let Some(text) = payload.downcast_ref::<String>() {
+            text.clone()
+        } else {
+            "PANIC WITH A NON-STRING PAYLOAD".to_string()
+        }
+    }
+
+    /// Reproduces the (d) shape and reports what it observes instead of
+    /// propagating it.
+    ///
+    /// The body is identical whether or not a bridge is already active on this
+    /// thread; only the caller differs. That is what makes the negative below
+    /// near-identical to the positive.
+    struct BridgeProbeResource;
+
+    impl ResourceHandler for BridgeProbeResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "probe://bridge".to_string(),
+                name: "bridge_probe".to_string(),
+                description: Some("Reports the payload of its own nested bridge".to_string()),
+                mime_type: Some("text/plain".to_string()),
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            None
+        }
+
+        fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            ctx.set_state("test_key", "probe_value");
+
+            let observed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fastmcp_core::block_on(ctx.read_resource("session://state"))
+            })) {
+                Ok(Ok(inner)) => format!(
+                    "NO PANIC: inner read returned {}",
+                    inner.first_text().unwrap_or("(no content)")
+                ),
+                Ok(Err(error)) => format!("NO PANIC: inner read returned Err {error}"),
+                Err(payload) => panic_payload_text(payload.as_ref()),
+            };
+
+            Ok(vec![ResourceContent {
+                uri: "probe://bridge".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some(observed),
+                blob: None,
+            }])
+        }
+    }
+
+    /// Builds the (d) fixture: a probe handler and the resource it reads.
+    fn bridge_probe_context() -> McpContext {
+        let mut router = Router::new();
+        router.add_resource(SessionStateResource);
+        router.add_resource(BridgeProbeResource);
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let reader: Arc<dyn ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        McpContext::with_state(Cx::for_testing(), 1, session_state).with_resource_reader(reader)
+    }
+
+    /// POSITIVE. bd-v9ev3 (d): names the assertion the redaction hides.
+    ///
+    /// This test can refute the diagnosis it was written for. If the payload is
+    /// any other message, or no panic occurs at all, the assertion fails and
+    /// prints what actually happened.
+    #[test]
+    fn a_nested_bridge_from_a_sync_handler_panics_with_the_reentrancy_rejection() {
+        let ctx = bridge_probe_context();
+
+        // The outer bridge. The handler it dispatches to enters a second one,
+        // which is the position the four (d) tests reach.
+        let observed = fastmcp_core::block_on(ctx.read_resource("probe://bridge"))
+            .expect("the probe catches its own unwind, so the outer read must succeed")
+            .first_text()
+            .expect("the probe reports its observation as text")
+            .to_string();
+
+        assert_eq!(
+            observed, "nested fastmcp_core::runtime::block_on is not supported",
+            "the payload behind the extension-panic redaction is not the reentrancy \
+             rejection, so bd-v9ev3's (d) chain is refuted and this is what fired instead"
+        );
+    }
+
+    /// NEAR-IDENTICAL NEGATIVE (RH-5). Same handler, same method, same closure,
+    /// same runtime, same fixture.
+    ///
+    /// The single varied dimension is whether a bridge is ALREADY ACTIVE on this
+    /// thread when the handler runs: here the handler is invoked directly rather
+    /// than from inside an outer `block_on`, so its bridge is the first entry
+    /// rather than the second. Without this control, the positive above would be
+    /// consistent with the handler panicking for some reason unrelated to
+    /// nesting.
+    #[test]
+    fn the_same_handler_completes_when_no_bridge_is_already_active() {
+        let ctx = bridge_probe_context();
+
+        let observed = BridgeProbeResource
+            .read(&ctx)
+            .expect("the probe handler returns Ok on the unnested path")
+            .first()
+            .and_then(|content| content.text.clone())
+            .expect("the probe reports its observation as text");
+
+        assert_eq!(
+            observed, "NO PANIC: inner read returned probe_value",
+            "the first bridge entry must not be rejected, and the inner read must \
+             observe the state the handler set; if this fails, the positive above \
+             is not evidence about nesting"
         );
     }
 }
@@ -4522,14 +6061,17 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_router_tool_caller_calls_tool() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "add",
             serde_json::json!({"a": 5, "b": 3}),
             0,
@@ -4548,8 +6090,13 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
-        let result =
-            fastmcp_core::block_on(caller.call_tool(&cx, "nonexistent", serde_json::json!({}), 0));
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
+        let result = fastmcp_core::block_on(caller.call_tool(
+            &request_ctx,
+            "nonexistent",
+            serde_json::json!({}),
+            0,
+        ));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -4563,9 +6110,10 @@ mod ctx_call_tool_tests {
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Call with depth at limit
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "any_tool",
             serde_json::json!({}),
             MAX_TOOL_CALL_DEPTH + 1,
@@ -4579,7 +6127,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_with_tool_caller() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4602,7 +6152,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4620,7 +6172,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_json() {
         let mut router = Router::new();
-        router.add_tool(ComputeJsonTool);
+        router
+            .add_tool(ComputeJsonTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4643,7 +6197,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_returns_error_result() {
         let mut router = Router::new();
-        router.add_tool(FailingToolTest);
+        router
+            .add_tool(FailingToolTest)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4662,7 +6218,9 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_ctx_call_tool_text_propagates_error() {
         let mut router = Router::new();
-        router.add_tool(FailingToolTest);
+        router
+            .add_tool(FailingToolTest)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller: Arc<dyn ToolCaller> =
@@ -4695,15 +6253,18 @@ mod ctx_call_tool_tests {
     #[test]
     fn test_tool_validation_error() {
         let mut router = Router::new();
-        router.add_tool(AddNumbersTool);
+        router
+            .add_tool(AddNumbersTool)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let caller = RouterToolCaller::new(router_arc, SessionState::new());
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1).with_budget_ceiling(Budget::INFINITE);
         // Missing required parameters
         let result = fastmcp_core::block_on(caller.call_tool(
-            &cx,
+            &request_ctx,
             "add",
             serde_json::json!({}), // Missing a and b
             0,
@@ -4719,8 +6280,12 @@ mod ctx_call_tool_tests {
         use crate::RouterResourceReader;
 
         let mut router = Router::new();
-        router.add_tool(GetStateFromCtx);
-        router.add_tool(NestedStateCall);
+        router
+            .add_tool(GetStateFromCtx)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(NestedStateCall)
+            .expect("tool registration succeeds");
 
         let router_arc = Arc::new(router);
         let session_state = SessionState::new();
@@ -4747,6 +6312,218 @@ mod ctx_call_tool_tests {
             text.contains("tool_propagated_value"),
             "Expected session state to propagate through tool calls, got: {}",
             text
+        );
+    }
+
+    struct CurrentAuthTool;
+
+    impl ToolHandler for CurrentAuthTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "current_auth".to_string(),
+                description: Some("Returns the current auth subject".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: ctx
+                    .auth()
+                    .and_then(|auth| auth.subject)
+                    .unwrap_or_else(|| "anonymous".to_string()),
+            }])
+        }
+    }
+
+    struct NestedAuthTool;
+
+    impl ToolHandler for NestedAuthTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested_auth".to_string(),
+                description: Some("Calls another tool and expects auth to propagate".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn execution_mode(&self) -> crate::handler::ToolExecutionMode {
+            crate::handler::ToolExecutionMode::Async
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            // A nested call is async; bridging it with block_on from this
+            // synchronous hook is the rejected pattern (bd-6rfrg).
+            Err(McpError::internal_error("nested calls use call_async"))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _arguments: serde_json::Value,
+        ) -> crate::handler::BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+            Box::pin(async move {
+                match ctx.call_tool("current_auth", serde_json::json!({})).await {
+                    Ok(inner) => fastmcp_core::Outcome::Ok(vec![Content::Text {
+                        text: inner.first_text().unwrap_or("missing").to_string(),
+                    }]),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn test_request_auth_propagates_through_nested_tool_calls() {
+        use crate::RouterResourceReader;
+
+        let mut router = Router::new();
+        router
+            .add_tool(CurrentAuthTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(NestedAuthTool)
+            .expect("tool registration succeeds");
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let caller: Arc<dyn ToolCaller> = Arc::new(RouterToolCaller::new(
+            router_arc.clone(),
+            session_state.clone(),
+        ));
+        let reader: Arc<dyn fastmcp_core::ResourceReader> =
+            Arc::new(RouterResourceReader::new(router_arc, session_state.clone()));
+
+        let cx = Cx::for_testing();
+        let ctx = McpContext::with_state(cx, 1, session_state)
+            .with_tool_caller(caller)
+            .with_resource_reader(reader)
+            .with_auth(AuthContext::with_subject("tool-auth"));
+
+        let result = fastmcp_core::block_on(ctx.call_tool("nested_auth", serde_json::json!({})))
+            .expect("nested tool call should succeed");
+        assert_eq!(result.first_text(), Some("tool-auth"));
+    }
+
+    // ========================================================================
+    // bd-v9ev3 area (d), SECOND SHAPE: the call_tool column.
+    //
+    // STRENGTHENING, NOT REQUIRED BY A1 AS WRITTEN. A1 is satisfied by an
+    // explanation that predicts each area's observed failure text, and the
+    // mechanism named on the read_resource column already does that for all
+    // four (d) tests. This test exists because the mechanism is shared while
+    // the SHAPE is not: `ToolHandler::call` dispatched through a tool caller is
+    // a different path from `ResourceHandler::read` through a resource reader,
+    // and a true fact about one caller is not a fact about a different one.
+    // It buys the difference between predicted and observed on that column.
+    // ========================================================================
+
+    /// The `BridgeProbeResource` seam on the tool dispatch path: bridge a
+    /// nested call, catch the unwind, and report the payload as the tool's own
+    /// output instead of letting the redaction swallow it.
+    struct BridgeProbeTool;
+
+    impl ToolHandler for BridgeProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "bridge_probe".to_string(),
+                description: Some("Reports the payload of its own nested bridge".to_string()),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                annotations: None,
+                tags: vec![],
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let observed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fastmcp_core::block_on(ctx.call_tool("current_auth", serde_json::json!({})))
+            })) {
+                Ok(Ok(inner)) => format!(
+                    "NO PANIC: inner call returned {}",
+                    inner.first_text().unwrap_or("(no content)")
+                ),
+                Ok(Err(error)) => format!("NO PANIC: inner call returned Err {error}"),
+                Err(payload) => {
+                    super::ctx_read_resource_tests::panic_payload_text(payload.as_ref())
+                }
+            };
+
+            Ok(vec![Content::Text { text: observed }])
+        }
+    }
+
+    /// POSITIVE, second shape. Moves the call_tool column from PREDICTED to
+    /// OBSERVED.
+    ///
+    /// No separate negative accompanies this one, and that is a judgement I am
+    /// recording rather than an omission: the RH-5 control for the varied
+    /// dimension -- whether a bridge is already active -- is owned by
+    /// `the_same_handler_completes_when_no_bridge_is_already_active`, and the
+    /// reentrancy flag it exercises is one process-global thread-local shared
+    /// by both shapes. The alternative this shape could otherwise admit -- that
+    /// the tool path panics for some unrelated reason -- is excluded by the
+    /// assertion being an EQUALITY on the payload rather than a check that
+    /// something panicked.
+    #[test]
+    fn a_nested_bridge_from_a_sync_tool_handler_panics_with_the_reentrancy_rejection() {
+        let mut router = Router::new();
+        router
+            .add_tool(CurrentAuthTool)
+            .expect("tool registration succeeds");
+        router
+            .add_tool(BridgeProbeTool)
+            .expect("tool registration succeeds");
+
+        let router_arc = Arc::new(router);
+        let session_state = SessionState::new();
+        let caller: Arc<dyn ToolCaller> =
+            Arc::new(RouterToolCaller::new(router_arc, session_state.clone()));
+
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, session_state)
+            .with_tool_caller(caller)
+            .with_auth(AuthContext::with_subject("probe-auth"));
+
+        // The outer bridge. The tool it dispatches to enters a second one.
+        let observed = fastmcp_core::block_on(ctx.call_tool("bridge_probe", serde_json::json!({})))
+            .expect("the probe catches its own unwind, so the outer call must succeed")
+            .first_text()
+            .expect("the probe reports its observation as text")
+            .to_string();
+
+        assert_eq!(
+            observed, "nested fastmcp_core::runtime::block_on is not supported",
+            "the tool dispatch path does not reach the same reentrancy rejection as the \
+             resource path, so the call_tool column is NOT the same defect and (d) is two \
+             defects rather than one"
         );
     }
 }
@@ -4813,7 +6590,7 @@ mod handler_direct_tests {
         let result = tool.call(&ctx, serde_json::json!({}));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, McpErrorCode::InternalError);
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
@@ -4841,7 +6618,7 @@ mod handler_direct_tests {
     #[test]
     fn tool_handler_default_tags_is_empty() {
         let tool = Greet;
-        assert!(tool.tags().is_empty());
+        assert_eq!(tool.tags().len(), 0);
     }
 
     #[test]
@@ -4887,7 +6664,7 @@ mod handler_direct_tests {
                     destructive: Some(false),
                     idempotent: Some(true),
                     read_only: Some(true),
-                    open_world_hint: Some("none".to_string()),
+                    open_world_hint: Some(false),
                 },
                 output_schema: serde_json::json!({
                     "type": "object",
@@ -5052,7 +6829,7 @@ mod handler_direct_tests {
             uri: "test://data".to_string(),
             content: "".to_string(),
         };
-        assert!(resource.tags().is_empty());
+        assert_eq!(resource.tags().len(), 0);
     }
 
     #[test]
@@ -5093,7 +6870,7 @@ mod handler_direct_tests {
         let resource = TemplateResource;
         let tmpl = resource.template();
         assert!(tmpl.is_some());
-        assert_eq!(tmpl.unwrap().uri_template, "resource://{id}");
+        assert_eq!(tmpl.unwrap().uri_template, "resource:///items/{id}");
     }
 
     #[test]
@@ -5152,7 +6929,7 @@ mod handler_direct_tests {
     #[test]
     fn prompt_handler_default_tags_is_empty() {
         let prompt = GreetingPrompt;
-        assert!(prompt.tags().is_empty());
+        assert_eq!(prompt.tags().len(), 0);
     }
 
     #[test]
@@ -5239,7 +7016,11 @@ mod handler_direct_tests {
             uri: "test://orig".to_string(),
             content: "data".to_string(),
         });
-        let mounted = MountedResourceHandler::new(inner, "ns/test://orig".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "test://orig".to_string(),
+            "ns/test://orig".to_string(),
+        );
         let def = mounted.definition();
         assert_eq!(def.uri, "ns/test://orig");
         // Other fields preserved
@@ -5252,18 +7033,24 @@ mod handler_direct_tests {
             uri: "test://data".to_string(),
             content: "mounted_data".to_string(),
         });
-        let mounted = MountedResourceHandler::new(inner, "ns/test://data".to_string());
+        let mounted = MountedResourceHandler::new(
+            inner,
+            "test://data".to_string(),
+            "ns/test://data".to_string(),
+        );
         let ctx = test_ctx();
         let result = mounted.read(&ctx);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap()[0].text, Some("mounted_data".to_string()));
+        let contents = result.unwrap();
+        assert_eq!(contents[0].text, Some("mounted_data".to_string()));
+        assert_eq!(contents[0].uri, "ns/test://data");
     }
 
     #[test]
     fn mounted_resource_handler_with_template() {
         let inner: Box<dyn ResourceHandler> = Box::new(TemplateResource);
         let tmpl = ResourceTemplate {
-            uri_template: "ns/resource://{id}".to_string(),
+            uri_template: "ns/resource:///items/{id}".to_string(),
             name: "Mounted Template".to_string(),
             description: None,
             mime_type: None,
@@ -5271,11 +7058,15 @@ mod handler_direct_tests {
             version: None,
             tags: vec![],
         };
-        let mounted =
-            MountedResourceHandler::with_template(inner, "ns/resource://{id}".to_string(), tmpl);
+        let mounted = MountedResourceHandler::with_template(
+            inner,
+            "resource:///items/{id}".to_string(),
+            "ns/resource:///items/{id}".to_string(),
+            tmpl,
+        );
         let template = mounted.template();
         assert!(template.is_some());
-        assert_eq!(template.unwrap().uri_template, "ns/resource://{id}");
+        assert_eq!(template.unwrap().uri_template, "ns/resource:///items/{id}");
     }
 
     // ── MountedPromptHandler ─────────────────────────────────────────
@@ -5312,6 +7103,89 @@ mod handler_direct_tests {
 
     // ── ProgressNotificationSender ───────────────────────────────────
 
+    fn final_progress_timer_rearm_probe(cancel: bool) {
+        use fastmcp_core::NotificationSender;
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Force every real Sleep, including each replacement, to become ready
+        // immediately. This needs no wall-clock delay or scheduler lottery.
+        let ambient = Cx::for_testing();
+        ambient.set_cancel_requested(true);
+        let _ambient = Cx::set_current(Some(ambient));
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let sent = Mutex::new(Vec::new());
+        let runtime = crate::handler::FinalProgressRuntime::new(
+            fastmcp_protocol::ProgressMarker::from("rearm"),
+            |request| sent.lock().unwrap().push(request),
+        );
+        let mut polls = 0;
+        let handler = std::future::poll_fn(|_| {
+            polls += 1;
+            if polls <= 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(73)
+            }
+        });
+        let mut wait = Box::pin(crate::await_final_progress_rate_tick(
+            &cx,
+            &cancellation,
+            &runtime,
+            handler,
+        ));
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task_cx = Context::from_waker(&waker);
+        for step in 1..=3 {
+            if cancel && step == 3 {
+                assert!(cancellation.cancel());
+            }
+            runtime.send_progress_exact(serde_json::Number::from(step), None, None);
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+        }
+        let expected_frames = if cancel { 2 } else { 3 };
+        assert!(
+            wakes.0.load(Ordering::SeqCst) >= expected_frames,
+            "successive rate ticks must arrange another handler poll"
+        );
+        let notifications = sent.lock().unwrap();
+        assert_eq!(notifications.len(), expected_frames);
+        for (index, notification) in notifications.iter().enumerate() {
+            assert_eq!(notification.method, "notifications/progress");
+            let params = notification.params.as_ref().unwrap();
+            assert_eq!(params["progressToken"], "rearm");
+            assert_eq!(params["progress"], index + 1);
+        }
+        drop(notifications);
+        assert_eq!(wait.as_mut().poll(&mut task_cx), Poll::Ready(73));
+        assert_eq!(sent.lock().unwrap().len(), expected_frames);
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn final_progress_timer_rearm_positive() {
+        final_progress_timer_rearm_probe(false);
+    }
+
+    #[test]
+    fn final_progress_timer_rearm_planted_negative() {
+        final_progress_timer_rearm_probe(true);
+    }
+
     #[test]
     fn progress_notification_sender_sends_notification() {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5336,7 +7210,7 @@ mod handler_direct_tests {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sent_clone = sent.clone();
         let sender = ProgressNotificationSender::new(
-            fastmcp_protocol::ProgressMarker::Number(99),
+            fastmcp_protocol::ProgressMarker::Number(fastmcp_protocol::JsonInteger::from(99_i64)),
             move |req: fastmcp_protocol::JsonRpcRequest| {
                 sent_clone.lock().unwrap().push(req);
             },
@@ -5382,7 +7256,7 @@ mod handler_direct_tests {
     #[test]
     fn router_registers_tool_and_lists_it() {
         let mut router = Router::new();
-        router.add_tool(Greet);
+        router.add_tool(Greet).expect("tool registration succeeds");
         let tools = router.tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "greet");
@@ -5412,8 +7286,10 @@ mod handler_direct_tests {
     #[test]
     fn router_counts_match_registrations() {
         let mut router = Router::new();
-        router.add_tool(Greet);
-        router.add_tool(ErrorTool);
+        router.add_tool(Greet).expect("tool registration succeeds");
+        router
+            .add_tool(ErrorTool)
+            .expect("tool registration succeeds");
         router.add_resource(StaticResource {
             uri: "test://a".to_string(),
             content: "".to_string(),
@@ -5756,7 +7632,7 @@ mod builder_tests {
     }
 
     #[test]
-    fn builder_zero_timeout_disables_enforcement() {
+    fn builder_zero_timeout_omits_only_server_ceiling() {
         let server = ServerBuilder::new("s", "0.1").request_timeout(0).build();
         assert_eq!(server.info().name, "s");
     }
@@ -5861,7 +7737,7 @@ mod builder_tests {
     #[test]
     fn builder_full_logging_config() {
         let config = LoggingConfig {
-            level: Level::Trace,
+            level: log::LevelFilter::Trace,
             timestamps: false,
             targets: false,
             file_line: true,
@@ -5920,14 +7796,6 @@ mod builder_tests {
         assert_eq!(server.info().name, "s");
     }
 
-    #[test]
-    fn builder_periodic_stats() {
-        let server = ServerBuilder::new("s", "0.1")
-            .with_periodic_stats(10)
-            .build();
-        assert_eq!(server.info().name, "s");
-    }
-
     // ── DuplicateBehavior ────────────────────────────────────────────
 
     #[test]
@@ -5967,16 +7835,19 @@ mod builder_tests {
     }
 
     #[test]
-    fn builder_on_duplicate_error_logs_and_skips() {
-        // With Error behavior, duplicate registration fails but builder doesn't panic
-        let server = ServerBuilder::new("s", "0.1")
-            .on_duplicate(DuplicateBehavior::Error)
-            .tool(BuilderDupTool)
-            .tool(BuilderDupTool)
-            .build();
-        // Only the first registration succeeds
-        let tools = server.tools();
-        assert_eq!(tools.len(), 1);
+    fn builder_on_duplicate_error_refuses_the_build() {
+        // With Error behavior the duplicate is refused and the build fails.
+        let Err(crate::ServerBuildError::InvalidConfiguration(refused)) =
+            ServerBuilder::new("s", "0.1")
+                .on_duplicate(DuplicateBehavior::Error)
+                .tool(BuilderDupTool)
+                .tool(BuilderDupTool)
+                .try_build()
+        else {
+            panic!("a duplicate refused under DuplicateBehavior::Error must fail try_build");
+        };
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].name, "dup");
     }
 
     #[test]
@@ -6019,10 +7890,10 @@ mod builder_tests {
     fn builder_auth_provider_static_token() {
         let ctx = fastmcp_core::AuthContext::with_subject("test-user");
         let server = ServerBuilder::new("s", "0.1")
-            .auth_provider(TokenAuthProvider::new(StaticTokenVerifier::new(vec![(
-                "secret-token".to_string(),
-                ctx,
-            )])))
+            .auth_provider(TokenAuthProvider::new(
+                StaticTokenVerifier::new(vec![("secret-token".to_string(), ctx)])
+                    .expect("valid verifier configuration"),
+            ))
             .build();
         assert_eq!(server.info().name, "s");
     }
@@ -6222,6 +8093,7 @@ mod builder_tests {
 
     // ── Task Manager ─────────────────────────────────────────────────
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn builder_without_task_manager() {
         let server = ServerBuilder::new("s", "0.1").build();
@@ -6229,14 +8101,15 @@ mod builder_tests {
         assert!(server.capabilities().tasks.is_none());
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
-    fn builder_with_task_manager_enables_tasks_capability() {
+    fn builder_with_task_manager_keeps_tasks_capability_quarantined() {
         let tm = TaskManager::new();
         let server = ServerBuilder::new("s", "0.1")
             .with_task_manager(tm.into_shared())
             .build();
         assert!(server.task_manager().is_some());
-        assert!(server.capabilities().tasks.is_some());
+        assert!(server.capabilities().tasks.is_none());
     }
 
     // ── List Pagination ─────────────────────────────────────────────
@@ -6252,15 +8125,20 @@ mod builder_tests {
             .into_router();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let first = router
-            .handle_tools_list(&cx, fastmcp_protocol::ListToolsParams::default(), None)
+            .handle_tools_list(
+                &request_ctx,
+                fastmcp_protocol::ListToolsParams::default(),
+                None,
+            )
             .expect("tools/list first page");
         assert_eq!(first.tools.len(), 2);
         let cursor = first.next_cursor.expect("nextCursor present");
 
         let second = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some(cursor),
                     ..Default::default()
@@ -6281,9 +8159,10 @@ mod builder_tests {
             .into_router();
 
         let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 1);
         let err = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some("not-base64".to_string()),
                     ..Default::default()
@@ -6297,29 +8176,50 @@ mod builder_tests {
     #[test]
     fn tools_list_handles_extreme_cursor_offset_without_overflow() {
         let router = ServerBuilder::new("s", "0.1")
-            .list_page_size(2)
+            .list_page_size(1)
             .tool(BuilderT1Tool)
+            .tool(BuilderT2Tool)
             .build()
             .into_router();
 
-        let payload = serde_json::json!({ "offset": usize::MAX });
-        let cursor = BASE64_STANDARD
-            .encode(serde_json::to_vec(&payload).expect("extreme cursor payload should serialize"));
-
         let cx = Cx::for_testing();
-        let page = router
+        let request_ctx = McpContext::new(cx, 1);
+        let first = router
             .handle_tools_list(
-                &cx,
+                &request_ctx,
+                fastmcp_protocol::ListToolsParams::default(),
+                None,
+            )
+            .expect("tools/list should mint a bound continuation cursor");
+        let cursor = first
+            .next_cursor
+            .expect("the first page has a continuation");
+        let mut payload: serde_json::Value = serde_json::from_slice(
+            &BASE64_STANDARD
+                .decode(cursor)
+                .expect("router-minted cursor is base64"),
+        )
+        .expect("router-minted cursor is JSON");
+        payload["offset"] = serde_json::json!(u64::MAX);
+        let cursor = BASE64_STANDARD
+            .encode(serde_json::to_vec(&payload).expect("extreme bound cursor should serialize"));
+
+        let error = router
+            .handle_tools_list(
+                &request_ctx,
                 fastmcp_protocol::ListToolsParams {
                     cursor: Some(cursor),
                     ..Default::default()
                 },
                 None,
             )
-            .expect("tools/list should not overflow on extreme cursor offset");
+            .expect_err("an extreme offset must fail closed without overflowing");
 
-        assert!(page.tools.is_empty());
-        assert!(page.next_cursor.is_none());
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "final catalog cursor offset is outside the requested catalog page"
+        );
     }
 }
 
@@ -6368,7 +8268,7 @@ mod helper_function_tests {
     fn parse_params_or_default_none_returns_default() {
         let result = parse_params_or_default::<Vec<String>>(None);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[test]
@@ -6424,6 +8324,267 @@ mod helper_function_tests {
             }
             other => panic!("expected Io error, got {:?}", other),
         }
+    }
+
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn receive_pump_cancels_a_running_handler_in_band() {
+        let barrier = Arc::new(Barrier::new(1));
+        let started = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let _configuration = configure_blocking_tool_with_completion(
+            barrier,
+            Some(Arc::clone(&started)),
+            Some(Arc::clone(&completed)),
+        );
+        let server = Server::new("receive-pump-cancellation", "1.0.0")
+            .tool(BlockUntilCancelled)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcMessage>::new()));
+        let sent_for_transport = Arc::clone(&sent);
+        let started_for_receive = Arc::clone(&started);
+        let completed_for_receive = Arc::clone(&completed);
+        let mut step = 0_u8;
+
+        run_returning_pump_with_caller_runtime(
+            server,
+            move |_, _worker_failed| {
+                let current = step;
+                step = step.saturating_add(1);
+                match current {
+                    0 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "initialize",
+                            Some(
+                                serde_json::to_value(InitializeParams {
+                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                        .to_string(),
+                                    capabilities: ClientCapabilities::default(),
+                                    client_info: ClientInfo {
+                                        name: "pump-client".to_string(),
+                                        version: "1.0.0".to_string(),
+                                    },
+                                })
+                                .expect("serialize initialize"),
+                            ),
+                            1_i64,
+                        ),
+                    )),
+                    // Operating requests are refused with -32600 until the
+                    // initialized notification completes the handshake.
+                    1 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        ),
+                    )),
+                    2 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "tools/call",
+                            Some(
+                                serde_json::to_value(CallToolParams {
+                                    name: "block_until_cancelled".to_string(),
+                                    arguments: Some(serde_json::json!({})),
+                                    meta: None,
+                                })
+                                .expect("serialize call"),
+                            ),
+                            2_i64,
+                        ),
+                    )),
+                    3 => {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !started_for_receive.load(Ordering::Acquire)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        if started_for_receive.load(Ordering::Acquire) {
+                            Ok(JsonRpcMessage::Request(
+                                fastmcp_protocol::JsonRpcRequest::notification(
+                                    "notifications/cancelled",
+                                    Some(
+                                        serde_json::to_value(CancelledParams {
+                                            request_id: RequestId::Number(2),
+                                            reason: Some("test cancellation".to_string()),
+                                            meta: None,
+                                        })
+                                        .expect("serialize cancellation"),
+                                    ),
+                                ),
+                            ))
+                        } else {
+                            Err(fastmcp_transport::TransportError::Timeout)
+                        }
+                    }
+                    _ => {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !completed_for_receive.load(Ordering::Acquire)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                        if completed_for_receive.load(Ordering::Acquire) {
+                            Err(fastmcp_transport::TransportError::Closed)
+                        } else {
+                            Err(fastmcp_transport::TransportError::Timeout)
+                        }
+                    }
+                }
+            },
+            move |_, message| {
+                sent_for_transport
+                    .lock()
+                    .expect("sent messages lock")
+                    .push(message.clone());
+                Ok(())
+            },
+            Arc::new(|_| {}),
+            None,
+            "test",
+        )
+        .expect("scripted returning loop must close cleanly");
+
+        let sent = sent.lock().expect("sent messages lock");
+        assert_eq!(
+            sent.iter()
+                .filter(|message| matches!(message, JsonRpcMessage::Response(_)))
+                .count(),
+            1,
+            "accepted exact legacy cancellation must suppress the cancelled request response"
+        );
+        assert!(sent.iter().any(
+            |message| matches!(message, JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(1)))
+        ));
+        assert!(!sent.iter().any(
+            |message| matches!(message, JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)))
+        ));
+    }
+
+    // Exact-2024 era: opens with a legacy initialize handshake.
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn receive_pump_routes_sampling_response_while_handler_waits() {
+        let server = Server::new("receive-pump-sampling", "1.0.0")
+            .tool(SamplingRoundTrip)
+            .build();
+        let (outbound_tx, outbound_rx) = mpsc::channel::<JsonRpcMessage>();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcMessage>::new()));
+        let sent_for_transport = Arc::clone(&sent);
+        let mut step = 0_u8;
+
+        run_returning_pump_with_caller_runtime(
+            server,
+            move |_, _worker_failed| {
+                let current = step;
+                step = step.saturating_add(1);
+                match current {
+                    0 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "initialize",
+                            Some(
+                                serde_json::to_value(InitializeParams {
+                                    protocol_version: fastmcp_protocol::PROTOCOL_VERSION
+                                        .to_string(),
+                                    capabilities: ClientCapabilities {
+                                        sampling: Some(SamplingCapability::default()),
+                                        ..ClientCapabilities::default()
+                                    },
+                                    client_info: ClientInfo {
+                                        name: "sampling-client".to_string(),
+                                        version: "1.0.0".to_string(),
+                                    },
+                                })
+                                .expect("serialize initialize"),
+                            ),
+                            1_i64,
+                        ),
+                    )),
+                    // Operating requests are refused with -32600 until the
+                    // initialized notification completes the handshake.
+                    1 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::notification(
+                            "notifications/initialized",
+                            None,
+                        ),
+                    )),
+                    2 => Ok(JsonRpcMessage::Request(
+                        fastmcp_protocol::JsonRpcRequest::new(
+                            "tools/call",
+                            Some(
+                                serde_json::to_value(CallToolParams {
+                                    name: "sampling_round_trip".to_string(),
+                                    arguments: Some(serde_json::json!({})),
+                                    meta: None,
+                                })
+                                .expect("serialize call"),
+                            ),
+                            2_i64,
+                        ),
+                    )),
+                    3 => loop {
+                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(JsonRpcMessage::Request(request))
+                                if request.method == "sampling/createMessage" =>
+                            {
+                                let id = request.id.expect("sampling request id");
+                                return Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    id,
+                                    serde_json::to_value(CreateMessageResult::text(
+                                        "sampled-value",
+                                        "test-model",
+                                    ))
+                                    .expect("serialize sampling result"),
+                                )));
+                            }
+                            Ok(_) => {}
+                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
+                        }
+                    },
+                    _ => loop {
+                        match outbound_rx.recv_timeout(Duration::from_secs(2)) {
+                            Ok(JsonRpcMessage::Response(response))
+                                if response.id == Some(RequestId::Number(2)) =>
+                            {
+                                return Err(fastmcp_transport::TransportError::Closed);
+                            }
+                            Ok(_) => {}
+                            Err(_) => return Err(fastmcp_transport::TransportError::Timeout),
+                        }
+                    },
+                }
+            },
+            move |_, message| {
+                sent_for_transport
+                    .lock()
+                    .expect("sent messages lock")
+                    .push(message.clone());
+                outbound_tx
+                    .send(message.clone())
+                    .map_err(|_| fastmcp_transport::TransportError::Closed)
+            },
+            Arc::new(|_| {}),
+            None,
+            "test",
+        )
+        .expect("scripted returning loop must close cleanly");
+
+        let sent = sent.lock().expect("sent messages lock");
+        let tool_response = sent.iter().find_map(|message| match message {
+            JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(2)) => {
+                Some(response)
+            }
+            _ => None,
+        });
+        let tool_response = tool_response.expect("tool response must be sent");
+        assert!(tool_response.error.is_none());
+        assert!(
+            tool_response
+                .result
+                .as_ref()
+                .is_some_and(|result| result.to_string().contains("sampled-value"))
+        );
     }
 
     // ── RequestCompletion ───────────────────────────────────────────
@@ -6484,7 +8645,7 @@ mod helper_function_tests {
     #[test]
     fn logging_config_default() {
         let cfg = LoggingConfig::default();
-        assert_eq!(cfg.level, log::Level::Info);
+        assert_eq!(cfg.level, log::LevelFilter::Info);
         assert!(cfg.timestamps);
         assert!(cfg.targets);
         assert!(!cfg.file_line);
@@ -6524,5 +8685,268 @@ mod helper_function_tests {
         assert!(d < i);
         assert!(i < w);
         assert!(w < e);
+    }
+
+    fn stateless_public_catalog_snapshot(server: &Server) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "info": server.info(),
+            "capabilities": server.capabilities(),
+            "tools": server.tools(),
+            "resources": server.resources(),
+            "resourceTemplates": server.resource_templates(),
+            "prompts": server.prompts(),
+        }))
+        .expect("public stateless catalog must serialize")
+    }
+
+    // The four `srv_01_*_unit_*` names below deliberately do NOT match the
+    // frozen SRV-01 acceptance IDs. Those IDs must resolve to exactly one
+    // definition in the workspace, because the frozen runner on
+    // bd-mcp-2026-07-28-support-ahet.15.1/.15.2 is
+    // `cargo test --workspace --all-targets <id> -- --exact` and AC bullet 3
+    // forbids substituted rows. The shipped proof lives at the crate root of
+    // crates/fastmcp-server/tests/srv_01_stateless.rs; `cfg(test)` behaviour
+    // cannot prove shipped behaviour (AC bullet 4, PL-3), so these remain
+    // in-crate unit coverage under distinct names. Renaming them back would
+    // reintroduce the duplicate. Same convention as fnd_03_i_* and
+    // fnd_03_integration_*.
+    #[test]
+    fn srv_01_a_unit_positive() {
+        let server = Server::new("stateless-public-handler", "1.0.0")
+            .tool(Greet)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+        // `dispatch_stateless` is the modern-only public surface; requests
+        // must carry the final protocol marker and client capabilities.
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "greet",
+                "arguments": { "name": "stateless client" },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            71_i64,
+        );
+        let catalog_before = stateless_public_catalog_snapshot(&server);
+
+        let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
+            .expect("request with an id must receive a response");
+
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("Hello, stateless client!")
+        );
+        assert_eq!(inbound.request_id(), 71);
+        assert_eq!(inbound.transport(), InboundRequestTransport::Memory);
+        assert_eq!(stateless_public_catalog_snapshot(&server), catalog_before);
+    }
+
+    #[test]
+    fn srv_01_a_unit_planted_negative() {
+        let server = Server::new("stateless-forbidden-mutation", "1.0.0")
+            .tool(Greet)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 72, InboundRequestTransport::Memory);
+        let baseline = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            72_i64,
+        );
+        let mut planted = baseline.clone();
+        planted.method = "logging/setLevel".to_string();
+
+        // The forbidden dimension is only the method: request identity and
+        // parameters are byte-for-byte identical to the accepted baseline.
+        assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(baseline.params, planted.params);
+        let planted_input_before =
+            serde_json::to_vec(&planted).expect("planted request must serialize");
+        let catalog_before = stateless_public_catalog_snapshot(&server);
+
+        let baseline_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &baseline))
+                .expect("stateless tools/list baseline must respond");
+        assert!(baseline_response.error.is_none());
+
+        let planted_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &planted))
+                .expect("planted request with an id must receive a response");
+        assert_eq!(
+            planted_response
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
+            Some(McpErrorCode::MethodNotFound.into())
+        );
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("planted request remains serializable"),
+            planted_input_before,
+            "forbidden stateless mutation changed caller input"
+        );
+        assert_eq!(
+            stateless_public_catalog_snapshot(&server),
+            catalog_before,
+            "forbidden stateless mutation changed the public catalog"
+        );
+        assert_eq!(inbound.request_id(), 72);
+        assert_eq!(inbound.transport(), InboundRequestTransport::Memory);
+    }
+
+    #[test]
+    fn srv_01_b_unit_positive() {
+        let server = Server::new("stateless-handler-result", "1.0.0")
+            .tool(DeclinedTool)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 73, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "declined",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            73_i64,
+        );
+
+        let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
+            .expect("handler request with an id must receive a response");
+
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a handler error must convert to CallToolResult rather than a JSON-RPC failure"
+        );
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("caller input was declined")
+        );
+    }
+
+    #[test]
+    fn srv_01_b_unit_planted_negative() {
+        let server = Server::new("stateless-handler-refusal", "1.0.0")
+            .tool(DeclinedTool)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 74, InboundRequestTransport::Memory);
+        let baseline = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "declined",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            74_i64,
+        );
+        let mut planted = baseline.clone();
+        planted
+            .params
+            .as_mut()
+            .and_then(|params| params.as_object_mut())
+            .expect("tools/call test parameters must be an object")
+            .insert("name".to_string(), serde_json::json!("missing-handler"));
+
+        // The handler name is the sole planted dimension. The method, request
+        // identity, and argument object remain the accepted baseline values.
+        assert_eq!(baseline.method, planted.method);
+        assert_eq!(baseline.jsonrpc, planted.jsonrpc);
+        assert_eq!(baseline.id, planted.id);
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("declined")
+        );
+        assert_eq!(
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("name"))
+                .and_then(serde_json::Value::as_str),
+            Some("missing-handler")
+        );
+        assert_eq!(
+            baseline
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments")),
+            planted
+                .params
+                .as_ref()
+                .and_then(|params| params.get("arguments"))
+        );
+        let planted_input_before =
+            serde_json::to_vec(&planted).expect("planted request must serialize");
+        let catalog_before = stateless_public_catalog_snapshot(&server);
+
+        let baseline_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &baseline))
+                .expect("accepted handler baseline must receive a response");
+        assert!(baseline_response.error.is_none());
+        assert_eq!(
+            baseline_response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let planted_response =
+            fastmcp_core::block_on(server.dispatch_stateless(&inbound, &planted))
+                .expect("planted handler request with an id must receive a response");
+        // An unknown tool name is an invalid `name` parameter (-32602) per the
+        // MCP unknown-tool mapping; the method itself exists.
+        assert_eq!(
+            planted_response
+                .error
+                .as_ref()
+                .map(|error| error.code.clone()),
+            Some(McpErrorCode::InvalidParams.into())
+        );
+        assert_eq!(
+            serde_json::to_vec(&planted).expect("planted request remains serializable"),
+            planted_input_before,
+            "typed handler refusal changed caller input"
+        );
+        assert_eq!(
+            stateless_public_catalog_snapshot(&server),
+            catalog_before,
+            "typed handler refusal changed the public catalog"
+        );
     }
 }

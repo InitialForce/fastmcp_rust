@@ -3,7 +3,7 @@ name = "fastmcp-console"
 version.workspace = true
 edition.workspace = true
 description = "Rich console output for FastMCP servers"
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -15,18 +15,21 @@ categories = ["command-line-interface", "development-tools"]
 [dependencies]
 rich_rust = { workspace = true }
 log = { workspace = true, features = ["std"] }
-regex = "1"
-time = { version = "0.3", features = ["formatting", "macros"] }
+regex.workspace = true
+# =0.3.55 (was =0.3.47): rich_rust (shared via beads_rust in downstream
+# workspaces) requires time ^0.3.54 after the 0.3.48 local-offset regressions
+# were fixed upstream; =0.3.47 made the two pins unresolvable in one graph.
+time = { version = "=0.3.55", features = ["formatting", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fastmcp-core = { workspace = true }
-fastmcp-protocol = { workspace = true }
-strip-ansi-escapes = "0.2"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+fastmcp-protocol.workspace = true
+strip-ansi-escapes = "=0.2.1"
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.23"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"
 serde_json = { workspace = true }
 
 [[example]]
@@ -39,6 +42,49 @@ full = ["rich_rust/full"]
 syntax = ["rich_rust/syntax"]
 markdown = ["rich_rust/markdown"]
 json = ["rich_rust/json"]
+# `client`, `handlers` and `tables` render protocol catalogs, so they exist
+# whenever ANY protocol-carrying feature is on. That three-way condition used
+# to be spelled `cfg(any(legacy-2024-11-05, tasks, apps))` at six sites in
+# lib.rs and once more in tests/integration.rs. Naming it does two things:
+# it keeps the six sites from drifting apart, and it makes the condition
+# expressible as `required-features`, which is an AND and therefore cannot
+# represent an `any(..)`. Without a name, tests/integration.rs had no stanza it
+# could carry and compiled to an empty binary that printed `ok. 0 passed`
+# under default features (bd-ufj6r). Do not set this directly; it is implied.
+renderers = []
+legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "renderers"]
+tasks = ["fastmcp-protocol/tasks", "renderers"]
+apps = ["fastmcp-protocol/apps", "renderers"]
+enterprise-auth = []
+oauth-client-credentials = []
+builtin-auth-server = []
+proxy = []
+proxy-legacy = ["proxy", "legacy-2024-11-05"]
+proxy-tasks = ["proxy", "tasks"]
+websocket-experimental = []
+jwt-resource-auth = []
+
+[[example]]
+name = "tables"
+path = "examples/tables.rs"
+required-features = ["legacy-2024-11-05"]
+
+# --- Loud refusal for the feature-gated test target (bd-ufj6r) --------------
+# tests/integration.rs opens with `#![cfg(feature = "renderers")]`. Without
+# this stanza a run whose features do not satisfy that cfg compiled it to an
+# EMPTY BINARY and libtest printed `ok. 0 passed` with exit status 0 — 29 tests
+# vanishing indistinguishably from a real pass. This crate's `default = []`, so
+# that was every `cargo test -p fastmcp-console`. With the stanza such a run
+# excludes the target, and `--test integration` makes cargo refuse and name the
+# missing feature.
+#
+# Note the asymmetry this closes: under a WORKSPACE-wide run, feature
+# unification from fastmcp-server/fastmcp turns `renderers` on and the target
+# did compile, so the per-package and workspace runs silently disagreed.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["renderers"]
 
 [lints]
 workspace = true

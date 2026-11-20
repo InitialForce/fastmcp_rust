@@ -158,13 +158,15 @@ fn render_banner(config: &ConsoleConfig) {
         .resources(0)
         .prompts(0)
         .transport("stdio")
+        .show_capabilities(config.show_capabilities)
         .description("E2E test server for fastmcp-console");
 
     match config.banner_style {
         BannerStyle::Full => banner.render(console()),
-        BannerStyle::Compact | BannerStyle::Minimal => {
+        BannerStyle::Compact => {
             banner.no_logo().render(console());
         }
+        BannerStyle::Minimal => banner.minimal().render(console()),
         BannerStyle::None => {}
     }
 }
@@ -185,7 +187,7 @@ fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
         "ping" => Ok(serde_json::json!({})),
         _ => Err(JsonRpcError {
             code: -32601,
-            message: format!("Method not found: {}", &request.method),
+            message: format!("Method not found: {}", request.method),
         }),
     };
 

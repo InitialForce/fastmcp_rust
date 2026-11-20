@@ -2,7 +2,7 @@
 name = "fastmcp-protocol"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "MCP protocol types and JSON-RPC implementation"
 repository.workspace = true
@@ -12,12 +12,31 @@ documentation = "https://docs.rs/fastmcp-protocol"
 keywords = ["mcp", "json-rpc", "protocol", "schema", "serialization"]
 categories = ["network-programming", "api-bindings"]
 
+[features]
+default = []
+legacy-2024-11-05 = []
+tasks = []
+apps = []
+# Bounded compact-JWS verification primitives. Policy and key discovery stay
+# in their owning server/auth layers.
+jose = ["dep:ring", "dep:zeroize"]
+
 [dependencies]
 fastmcp-core.workspace = true
 base64.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 regex.workspace = true
+ring = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Integration tests link only against this crate plus its dev-dependencies, so
+# the conformance oracle in tests/spec_2026_07_28_oracle.rs needs its own
+# handle on serde_json to read the vendored official example corpus. Already a
+# normal dependency of this crate, so the dependency graph and lockfile are
+# unchanged by declaring it here.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

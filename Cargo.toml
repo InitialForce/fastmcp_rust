@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/fastmcp",
     "crates/fastmcp-core",
@@ -10,81 +10,119 @@ members = [
     "crates/fastmcp-macros",
     "crates/fastmcp-console",
     "crates/fastmcp-cli",
+    # Non-publishable workspace tooling (FND-02 traceability checker).
+    "tools/xtask",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.13.0"
 edition = "2024"
-license = "MIT"
-rust-version = "1.85"
+license-file = "LICENSE"
+# Cargo lower-bound check only; the supported compiler is the dated nightly
+# pinned in rust-toolchain.toml (nightly-2026-08-25 / rustc 1.100.0-nightly).
+rust-version = "1.100"
 repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
 homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
 readme = "README.md"
 
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
-# Runtime (our own)
-asupersync = "0.2"
-rich_rust = "0.2"
+# Runtime (our own). Library surfaces accept caller-owned contexts; process
+# owners install an ambient context only at their top-level runtime boundary.
+# Test-only constructors remain opt-in at the test or facade-lab boundary and
+# must not leak into the workspace production graph.
+# 0.5.0 preserves runtime capability ceilings when caller-owned contexts are
+# installed by server polling. Test-only constructors remain opt-in above.
+# Bounded shutdown migration and product-profile verification: UPGRADE_LOG.md.
+asupersync = { version = "=0.5.0" }
+rich_rust = { version = "=0.2.3" }
+# Safe readiness polling for interruptible Unix child-stdout reads and
+# signal-free process-group existence probes after a managed leader is reaped.
+# The non-Unix std::process pipe path remains explicitly frame-boundary-only.
+rustix = { version = "=1.1.5", default-features = false }
 
 # Serialization (only these)
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
+serde = { version = "=1.0.229", features = ["derive"] }
+# FND-01 ROOT-SERDE-JSON: exact version + arbitrary_precision for protocol numbers
+serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
+serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
-log = "0.4"
+log = { version = "=0.4.34" }
 
 # Opaque cursor encoding for pagination
-base64 = "0.22"
-semver = "1"
-ureq = "3"
+base64 = { version = "=0.23.1" }
+# FND-01 ROOT-SEMVER (facade evidence / future gates; CLI must not depend on this)
+semver = { version = "=1.0.28" }
+# FND-01 ROOT-FLATE2 (facade evidence / supply archive paths)
+flate2 = { version = "=1.1.10" }
 
 # Date/time
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock"] }
 
 # File watching
-notify = "8"
-glob = "0.3"
+notify = { version = "=8.2.0" }
+glob = { version = "=0.3.4" }
 
 # Console output
-console = "0.16"
-
-# Redis (optional, for Docket distributed backend)
-redis = "1"
+console = { version = "=0.16.6" }
 
 # Configuration file parsing
-toml = "1.0"
-dirs = "6"
+toml = { version = "=1.1.8" }
+dirs = { version = "=7.0.0" }
 
-# Cryptographic RNG (for WebSocket masking)
-getrandom = "0.4"
-
-# Cryptography (OAuth PKCE, OIDC signing)
-sha2 = "0.10"
-hmac = "0.12"
+# FND-01 foundation pins (exact feature surfaces)
+url = { version = "=2.5.8", default-features = false, features = ["std"] }
+getrandom = { version = "=0.4.3", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
+hmac = { version = "=0.13.0", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+# FND-08 ephemeral protection, using the frozen FND-01 envelope candidate.
+# Entropy stays in fastmcp-core; no cipher RNG or reduced-round features.
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+# FND-01 ROOT-RING-EVIDENCE / JOSE RS256 (alloc only on the direct edge)
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
+# FND-01 ROOT-PROC-MACRO2-EVIDENCE (facade evidence harness)
+proc-macro2 = { version = "=1.0.107", default-features = false, features = ["span-locations"] }
+# Resolve the public facade (including dependency renames) from procedural
+# macro expansion sites instead of assuming downstream crate names.
+proc-macro-crate = { version = "=3.5.0" }
+# Capability-relative filesystem access.  Keep this surface exact: built-in
+# filesystem resources must traverse and open beneath retained directory
+# handles instead of validating a pathname and reopening it later.
+cap-std = { version = "=4.0.3", default-features = false }
+cap-fs-ext = { version = "=4.0.3", default-features = false, features = ["std"] }
 
 # Regex (JSON Schema `pattern` validation)
-regex = "1"
+regex = { version = "=1.13.1" }
 
 # CLI argument parsing
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap = { version = "=4.6.7", features = ["derive", "env", "wrap_help"] }
 
 # Testing
-trybuild = { version = "1", default-features = false }
+trybuild = { version = "=1.0.122", default-features = false }
 
 # Internal crates
-fastmcp-rust = { version = "0.2.0", path = "crates/fastmcp" }
-fastmcp-core = { version = "0.2.0", path = "crates/fastmcp-core" }
-fastmcp-transport = { version = "0.2.0", path = "crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.2.0", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.2.0", path = "crates/fastmcp-server" }
-fastmcp-client = { version = "0.2.0", path = "crates/fastmcp-client" }
-fastmcp-derive = { version = "0.2.0", path = "crates/fastmcp-macros" }
-fastmcp-console = { version = "0.2.0", path = "crates/fastmcp-console" }
-fastmcp-cli = { version = "0.2.0", path = "crates/fastmcp-cli" }
+fastmcp-rust = { version = "0.13.0", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.13.0", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.13.0", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.13.0", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.13.0", path = "crates/fastmcp-server", default-features = false }
+fastmcp-client = { version = "0.13.0", path = "crates/fastmcp-client", default-features = false }
+fastmcp-derive = { version = "0.13.0", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.13.0", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.13.0", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+unsafe_code = "forbid"
+# Admit the FND-01 bootstrap harness custom cfg only; all other unexpected_cfgs
+# remain fatal under -D warnings.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fnd01_bootstrap)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -111,6 +149,9 @@ collapsible_if = "allow"
 clone_on_copy = "allow"
 match_wildcard_for_single_variants = "allow"
 manual_assert = "allow"
+# `assert!(value.is_empty())` states the tested predicate directly. Rewriting
+# hundreds of tests to construct type-heavy empty comparison values adds noise.
+assert_is_empty = "allow"
 if_not_else = "allow"
 trivially_copy_pass_by_ref = "allow"
 struct_excessive_bools = "allow"

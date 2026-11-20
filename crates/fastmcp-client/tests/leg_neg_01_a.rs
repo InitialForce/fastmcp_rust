@@ -1,0 +1,1024 @@
+//! LEG-NEG-01 A — disposable-process stdio modern-first classification.
+//!
+//! External consumer of the shipped `fastmcp_client` public surface: the
+//! evaluator, the manifest, and the classification entrypoint are all reached as
+//! a downstream crate reaches them, never through `use super::` or a
+//! `#[cfg(test)]` module (PL-3).
+//!
+//! These cases spawn **real child processes**. Each fixture child is a POSIX
+//! shell that appends `spawn:<pid>` and `wire:<first line>` to a per-case trace
+//! file, so child identity, generation count, first-wire bytes, and probe reaping
+//! are observed from the operating system rather than asserted from a mock.
+//!
+//! **Platform qualification:** these two tests are `#[cfg(unix)]`, matching the
+//! existing disposable-process precedent in `crates/fastmcp-client/src/mcp_config.rs`.
+//! On the Linux verification lane they are discovered and run; they are not
+//! ignored, filtered, or feature-disabled. On a non-POSIX host the target would
+//! carry no rows at all, which is a platform qualification and is declared here
+//! rather than left implicit.
+//!
+//! **Cancellation domains:** every case builds its own `Cx::for_request()`.
+//! `Cx::clone` aliases one cancellation domain rather than creating a child, so
+//! sharing a context across cases would let one cancelled case poison every
+//! later case.
+
+#![cfg(unix)]
+
+use std::path::{Path, PathBuf};
+
+use asupersync::Cx;
+use fastmcp_client::{
+    LEG_NEG_01_A_EVALUATOR_MANIFEST_V1, StdioClassificationCase, StdioClassificationRecord,
+    StdioFirstWireSignal, TraceOutcome, case_input_digest, evaluate_stdio_case,
+    leg_neg_01_a_manifest_digest,
+};
+use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
+
+const MODERN_ERA: &str = "2026-07-28";
+const LEGACY_ERA: &str = "2024-11-05";
+/// Planted only. Never selectable.
+const UNSUPPORTED_ERA: &str = "2025-11-25";
+
+/// The JSON-RPC id the shipped client uses for its discovery probe.
+const CORRELATED_ID: &str = "1";
+/// A different id, which makes an otherwise identical refusal uncorrelated.
+const UNCORRELATED_ID: &str = "9";
+
+/// Reserves a unique per-case observation trace.
+fn reserve_trace(case_id: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "fastmcp-leg-neg-01-a-{}-{}-{}.log",
+        case_id,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos()
+    ));
+    std::fs::File::create_new(&path).expect("reserve a unique per-case observation trace");
+    path
+}
+
+/// Builds the fixture child.
+///
+/// The child records its own pid and the exact first MCP line it read, then
+/// answers according to `$2`. Every branch records before it answers, so a
+/// child that spawned always leaves evidence even if it then exits.
+///
+/// `$1` is the trace path, `$2` the behaviour, `$3` the discovery refusal id,
+/// `$4` the advertised legacy protocol version.
+fn fixture_script() -> &'static str {
+    r#"
+printf 'spawn:%s\n' "$$" >> "$1" || exit 90
+IFS= read -r first || exit 91
+printf 'wire:%s\n' "$first" >> "$1" || exit 92
+case "$first" in
+    *'"method":"server/discover"'*) era=modern;;
+    *'"method":"initialize"'*) era=legacy;;
+    *) exit 93;;
+esac
+if [ "$era" = modern ]; then
+    case "$2" in
+        correlated-refusal|uncorrelated-refusal)
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"no discovery"}}\n' "$3"
+            exec sleep 5;;
+        recognized-modern-error)
+            printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"invalid params"}}\n' "$3"
+            exec sleep 5;;
+        modern-result)
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"leg-neg-01-a-peer","version":"1"}}}}'
+            exec sleep 5;;
+        malformed-first-wire)
+            printf '%s\n' 'this is not a JSON-RPC frame'
+            exec sleep 5;;
+        *) exit 94;;
+    esac
+fi
+printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"%s","capabilities":{},"serverInfo":{"name":"leg-neg-01-a-peer","version":"1"}}}\n' "$4"
+IFS= read -r initialized || exit 95
+case "$initialized" in *notifications/initialized*) ;; *) exit 96;; esac
+exec sleep 5
+"#
+}
+
+/// Declares one case bound to a fresh trace, with the fixture child as command.
+fn case(
+    case_id: &str,
+    policy: ProtocolPolicy,
+    signal: StdioFirstWireSignal,
+    behaviour: &str,
+    refusal_id: &str,
+    legacy_version: &str,
+) -> (StdioClassificationCase, PathBuf) {
+    let trace = reserve_trace(case_id);
+    let args = vec![
+        "-c".to_owned(),
+        fixture_script().to_owned(),
+        "leg-neg-01-a".to_owned(),
+        trace.to_str().expect("trace path is UTF-8").to_owned(),
+        behaviour.to_owned(),
+        refusal_id.to_owned(),
+        legacy_version.to_owned(),
+    ];
+    let declared = StdioClassificationCase::new(case_id, policy, signal, "sh", args)
+        .with_trace_path(trace.clone());
+    (declared, trace)
+}
+
+/// Runs one case in its own cancellation domain.
+fn run(declared: &StdioClassificationCase) -> StdioClassificationRecord {
+    // A fresh context per case. `Cx::clone` would alias one cancellation domain.
+    let cx = Cx::for_request();
+    evaluate_stdio_case(&cx, declared)
+}
+
+/// Runs one case whose caller-owned context is already cancelled.
+///
+/// The ONLY difference from [`run`]. Everything the case declares -- policy,
+/// signal, fixture behaviour, refusal id, legacy era -- is held fixed, so the
+/// pair below differs in exactly one variable, which is the shape
+/// AC-LEG-NEG-01-A-PREDICATES requires of every rejected case.
+fn run_cancelled(declared: &StdioClassificationCase) -> StdioClassificationRecord {
+    let cx = Cx::for_request();
+    cx.cancel_with(
+        asupersync::CancelKind::User,
+        Some("leg-neg-01-a cancelled caller"),
+    );
+    evaluate_stdio_case(&cx, declared)
+}
+
+/// Asserts the trace was actually read.
+///
+/// Three-way on purpose: a read trace continues, an unbound trace fails as a
+/// declaration error, and an unreadable trace fails as **inconclusive** rather
+/// than being silently read as "no children spawned".
+fn assert_trace_conclusive(record: &StdioClassificationRecord) {
+    match &record.trace_outcome {
+        TraceOutcome::Read => {}
+        TraceOutcome::NotBound => panic!(
+            "{}: the case declared no observation trace, so child identity is unobservable",
+            record.case_id
+        ),
+        TraceOutcome::Unreadable { reason } => panic!(
+            "{}: the observation trace is INCONCLUSIVE, not empty: {reason}. \
+             An unreadable trace must never be read as 'no children spawned'.",
+            record.case_id
+        ),
+    }
+    assert!(
+        record.unrecognized_trace_records.is_empty(),
+        "{}: the observation trace carried unrecognized records {:?}; a malformed trace \
+         cannot be treated as a clean one",
+        record.case_id,
+        record.unrecognized_trace_records
+    );
+    assert!(
+        !record.child_pids.is_empty(),
+        "{}: at least the disposable probe child must have been spawned",
+        record.case_id
+    );
+}
+
+/// Asserts no credential reached the stdio wire, reading the OBSERVED first-wire bytes.
+///
+/// WHY THIS REPLACED AN ASSERTION ON `credential_boundary`. That field has exactly one
+/// construction site in the whole evaluator --
+/// `leg_neg_stdio.rs:428  credential_boundary: CredentialBoundary::default()` -- and nothing
+/// anywhere increments `mutations` or `attached`. So `assert_eq!(..mutations, 0)` compared a
+/// default-constructed literal against zero and **could not fail whatever the product did**.
+/// Seven such assertions stood in for AC-LEG-NEG-01-A-PREDICATES clause 2's required proof of
+/// "zero credential/cache mutation". The module comment claimed the boundary was "recorded
+/// rather than assumed so negatives can assert on it"; recording `default()` IS assuming.
+///
+/// THE ZERO IS STRUCTURAL, and that is a fact about the type surface rather than a choice:
+///   * the ONLY credential state on `ClientBuilder` is
+///     `http_bearer_credential: Option<BoundBearerCredential>` (builder.rs:221);
+///   * its ONLY two readers are inside `fn http_negotiation`, at builder.rs:829 and :918,
+///     both feeding `HttpConnectionSettings { bearer, .. }`;
+///   * `prepare_stdio_command` touches `args` and nothing else;
+///   * `BoundBearerCredential` occurs nowhere outside `http_auth` / `http_executor`.
+///
+/// There is no path by which a credential reaches a disposable stdio child.
+///
+/// A structural zero still deserves a proof that CAN be wrong, so this asserts the
+/// observable instead of the constant: the first-wire bytes actually recorded by the fixture
+/// children carry no credential-shaped content. If a credential ever reaches a stdio frame
+/// this fires, because it reads the real trace rather than a field nothing writes.
+fn assert_no_credential_on_the_wire(record: &StdioClassificationRecord) {
+    for (index, line) in record.first_wire.iter().enumerate() {
+        let lowered = line.to_ascii_lowercase();
+        for marker in [
+            "authorization",
+            "bearer ",
+            "\"token\"",
+            "x-api-key",
+            "proxy-authorization",
+        ] {
+            assert!(
+                !lowered.contains(marker),
+                "{}: first-wire line {index} carries credential-shaped content {marker:?}; \
+                 stdio must never attach or mutate a credential. Observed: {line}",
+                record.case_id
+            );
+        }
+    }
+}
+
+/// Asserts the cache half of AC-LEG-NEG-01-A-PREDICATES clause 2 on a denied
+/// case: zero cache mutation.
+///
+/// WHY THERE IS NOTHING TO READ. The credential half at least had a field to
+/// assert on, vacuous though it was. The cache half has none:
+/// `StdioClassificationRecord` models NO CACHE BOUNDARY AT ALL, and
+/// `grep -i cache leg_neg_stdio.rs` returns nothing. So a reader looking for
+/// the required proof finds neither an assertion nor a field, and might
+/// reasonably conclude clause 2 is inexpressible here. It is not.
+///
+/// THE ZERO IS STRUCTURAL, and in a stronger form than the credential one --
+/// there is no object to mutate rather than no path to it:
+///   * `FinalResultCache` is a PLAIN OWNED FIELD on `Client`
+///     (`lib.rs:14120  final_result_cache: FinalResultCache`), constructed by
+///     `FinalResultCache::default()`. It sits behind no `Arc`, `static`,
+///     `OnceCell`, `Mutex` or `RwLock` -- I searched for shared-ownership
+///     wrappers specifically, because per-client versus shared IS the whole
+///     question. So a cache lives and dies with its `Client`.
+///   * On a denied case `Client::stdio_with_protocol_plan_with_cx` returns
+///     `Err` and yields no `Client`. `try_connect_auto` has exactly three
+///     terminal shapes -- `Connected`, `Fallback` (the frozen ELIGIBLE
+///     signal), and `Err` -- and `StdioConnectionAttempt::Fallback` has
+///     exactly ONE construction site (`builder.rs:1819`), gated on the
+///     eligible signal. Ineligible therefore cannot reach `Fallback`; it is
+///     `Err`.
+///   * The Auto probe DOES build a transient client inside the builder, so
+///     "no client exists" is too strong. But that transient drops there,
+///     taking its per-client cache with it, and nothing shared survives it.
+///
+/// There is no cache that outlives a denied stdio classification.
+///
+/// A structural zero still deserves a proof that CAN be wrong, so this
+/// asserts the observable that the argument rests on: that NO CLIENT ESCAPED.
+/// If the product ever returned a live client from a denied path, a cache
+/// would exist, `connected` would be true, and this fires. That is the
+/// falsifiable half; the reasoning above is why it suffices.
+fn assert_no_cache_escaped(record: &StdioClassificationRecord) {
+    assert!(
+        !record.connected,
+        "{}: a denied case must yield no live client -- a returned client owns \
+         a FinalResultCache, which is exactly the cache mutation clause 2 forbids",
+        record.case_id
+    );
+    assert_eq!(
+        record.selected_era, None,
+        "{}: a denied case must select no era",
+        record.case_id
+    );
+}
+
+/// Asserts no child beyond the disposable probe was ever started.
+fn assert_no_legacy_child(record: &StdioClassificationRecord) {
+    assert_trace_conclusive(record);
+    assert_eq!(
+        record.legacy_child_count(),
+        0,
+        "{}: legacy_child_count must be 0, observed pids {:?}",
+        record.case_id,
+        record.child_pids
+    );
+    assert_eq!(
+        record.child_generation_count(),
+        1,
+        "{}: exactly one disposable child may exist",
+        record.case_id
+    );
+    assert!(
+        !record.probe_reaped(),
+        "{}: no fresh child means no probe-reap transition",
+        record.case_id
+    );
+    // The credential requirement is still named here; the proof now reads the observed wire
+    // instead of a `default()`-constructed field that no code path writes.
+    assert_no_credential_on_the_wire(record);
+}
+
+/// Asserts that NO child was started at all -- not even the disposable probe.
+///
+/// Deliberately not [`assert_no_legacy_child`], which requires at least the
+/// probe to exist and would reject this record as a declaration error.
+///
+/// THE ZERO HERE IS OBSERVED, NOT ASSUMED. `reserve_trace` creates the trace
+/// file with `File::create_new` BEFORE the case runs, so the file is readable
+/// whether or not a child ever appends to it. `TraceOutcome::Read` with no
+/// `spawn:` records is therefore a genuine observed absence, not the
+/// `Unreadable` inconclusiveness that [`assert_trace_conclusive`] exists to
+/// reject. Without that pre-creation this assertion would be unsound.
+fn assert_no_child_at_all(record: &StdioClassificationRecord) {
+    match &record.trace_outcome {
+        TraceOutcome::Read => {}
+        TraceOutcome::NotBound => panic!(
+            "{}: the case declared no observation trace, so child identity is unobservable",
+            record.case_id
+        ),
+        TraceOutcome::Unreadable { reason } => panic!(
+            "{}: the observation trace is INCONCLUSIVE, not empty: {reason}. \
+             An unreadable trace must never be read as 'no children spawned'.",
+            record.case_id
+        ),
+    }
+    assert!(
+        record.unrecognized_trace_records.is_empty(),
+        "{}: the observation trace carried unrecognized records {:?}",
+        record.case_id,
+        record.unrecognized_trace_records
+    );
+    assert!(
+        record.child_pids.is_empty(),
+        "{}: a cancelled caller must not start ANY child, observed pids {:?}",
+        record.case_id,
+        record.child_pids
+    );
+    assert_eq!(
+        record.child_generation_count(),
+        0,
+        "{}: zero generations",
+        record.case_id
+    );
+    assert_eq!(
+        record.legacy_child_count(),
+        0,
+        "{}: zero legacy children",
+        record.case_id
+    );
+    // The credential requirement is still named here; the proof now reads the observed wire
+    // instead of a `default()`-constructed field that no code path writes.
+    assert_no_credential_on_the_wire(record);
+}
+
+/// Asserts the first wire line carries the frozen marker.
+fn assert_first_wire(record: &StdioClassificationRecord, index: usize, marker: &str) {
+    let line = record.first_wire.get(index).unwrap_or_else(|| {
+        panic!(
+            "{}: no first-wire record at index {index}; observed {:?}",
+            record.case_id, record.first_wire
+        )
+    });
+    assert!(
+        line.contains(marker),
+        "{}: first-wire line {index} must carry {marker}, observed {line}",
+        record.case_id
+    );
+}
+
+fn cleanup(trace: &Path) {
+    // Best effort; a retained trace never changes an assertion.
+    let _ = std::fs::remove_file(trace);
+}
+
+#[test]
+fn leg_neg_01_a_positive() {
+    // -----------------------------------------------------------------
+    // The immutable manifest.
+    // -----------------------------------------------------------------
+    let manifest = LEG_NEG_01_A_EVALUATOR_MANIFEST_V1;
+    assert!(manifest.ends_with('\n'), "the manifest is LF-terminated");
+    assert!(!manifest.contains('\r'), "the manifest is LF-canonical");
+    let digest = leg_neg_01_a_manifest_digest();
+    assert_eq!(
+        digest.as_bytes().len(),
+        32,
+        "the manifest digest is a SHA-256"
+    );
+
+    let policy_cases: Vec<&str> = manifest
+        .lines()
+        .filter(|line| line.starts_with("policy-case "))
+        .collect();
+    assert!(
+        policy_cases.len() >= 3,
+        "the manifest declares at least three policy cases, found {}",
+        policy_cases.len()
+    );
+    for policy in ["policy=Auto", "policy=ModernOnly", "policy=LegacyOnly"] {
+        assert!(
+            policy_cases.iter().any(|line| line.contains(policy)),
+            "the manifest must cover {policy}"
+        );
+    }
+    assert!(
+        policy_cases
+            .iter()
+            .filter(|l| l.contains("eligible=true"))
+            .count()
+            >= 1,
+        "the manifest declares at least one eligible case"
+    );
+    assert!(
+        policy_cases
+            .iter()
+            .filter(|l| l.contains("eligible=false"))
+            .count()
+            >= 1,
+        "the manifest declares at least one ineligible case"
+    );
+    assert!(
+        manifest.contains("supported-eras 2026-07-28,2024-11-05"),
+        "exactly the two supported eras are frozen"
+    );
+    assert!(
+        !manifest.contains(UNSUPPORTED_ERA),
+        "the unsupported era is never a manifest input"
+    );
+
+    // -----------------------------------------------------------------
+    // Auto + valid modern discovery result selects 2026-07-28.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "auto-modern-selected",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::ModernDiscoveryResult,
+        "modern-result",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let modern = run(&declared);
+    assert!(modern.connected, "a valid modern result must connect");
+    assert_eq!(modern.selected_era, Some(ProtocolEra::Modern2026));
+    assert_eq!(modern.protocol_version.as_deref(), Some(MODERN_ERA));
+    assert_eq!(modern.transport, "stdio");
+    assert_eq!(modern.policy, ProtocolPolicy::Auto);
+    assert_first_wire(&modern, 0, "\"method\":\"server/discover\"");
+    assert_no_legacy_child(&modern);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // Auto + correlated MethodNotFound: reap the probe, start ONE fresh
+    // child whose first MCP request is exact 2024-11-05 initialize.
+    // -----------------------------------------------------------------
+    let (eligible_case, eligible_trace) = case(
+        "auto-eligible-correlated-refusal",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let eligible = run(&eligible_case);
+    assert_trace_conclusive(&eligible);
+    assert!(
+        eligible.connected,
+        "the eligible refusal must reach a client"
+    );
+    assert_eq!(eligible.selected_era, Some(ProtocolEra::Legacy2024));
+    assert_eq!(eligible.protocol_version.as_deref(), Some(LEGACY_ERA));
+    assert_eq!(
+        eligible.child_generation_count(),
+        2,
+        "one disposable probe plus exactly one fresh legacy child"
+    );
+    assert_eq!(eligible.legacy_child_count(), 1);
+    assert!(
+        eligible.probe_reaped(),
+        "the fresh child must be a distinct process from the reaped probe, observed {:?}",
+        eligible.child_pids
+    );
+    assert_first_wire(&eligible, 0, "\"method\":\"server/discover\"");
+    assert_first_wire(&eligible, 1, "\"method\":\"initialize\"");
+    assert_first_wire(&eligible, 1, LEGACY_ERA);
+    assert!(
+        !eligible.first_wire[1].contains(MODERN_ERA),
+        "the fresh child's first request must not carry modern metadata"
+    );
+    assert_no_credential_on_the_wire(&eligible);
+
+    // -----------------------------------------------------------------
+    // The one-variable pair: the SAME refusal with a different response id
+    // is uncorrelated and must not start a second child.
+    // -----------------------------------------------------------------
+    let (ineligible_case, ineligible_trace) = case(
+        "auto-ineligible-uncorrelated-refusal",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::UncorrelatedDiscoveryRefusal,
+        "uncorrelated-refusal",
+        UNCORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let ineligible = run(&ineligible_case);
+    // Covers clause 2's cache half as well as the live-client one; see
+    // `assert_no_cache_escaped` for why no-client-returned is the cache proof.
+    assert_no_cache_escaped(&ineligible);
+    assert_first_wire(&ineligible, 0, "\"method\":\"server/discover\"");
+    assert_no_legacy_child(&ineligible);
+    assert_no_credential_on_the_wire(&ineligible);
+
+    // The pair differs in exactly one declared field.
+    assert_eq!(eligible_case.policy(), ineligible_case.policy());
+    assert_eq!(eligible_case.command(), ineligible_case.command());
+    assert_ne!(eligible_case.signal(), ineligible_case.signal());
+    assert_ne!(
+        case_input_digest(&eligible_case).as_bytes(),
+        case_input_digest(&ineligible_case).as_bytes(),
+        "paired input digests must differ"
+    );
+    assert!(eligible_case.expects_fallback());
+    assert!(!ineligible_case.expects_fallback());
+    cleanup(&eligible_trace);
+    cleanup(&ineligible_trace);
+
+    // -----------------------------------------------------------------
+    // A recognized modern error is proof of the modern era, never a
+    // downgrade signal.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "auto-ineligible-recognized-modern-error",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::RecognizedModernError,
+        "recognized-modern-error",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let recognized = run(&declared);
+    assert!(
+        !recognized.connected,
+        "a recognized modern error must not produce a live client"
+    );
+    assert_eq!(recognized.selected_era, None);
+    assert_no_legacy_child(&recognized);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // ModernOnly never enters fallback, even on the eligible signal.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "modern-only-never-falls-back",
+        ProtocolPolicy::ModernOnly,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let modern_only = run(&declared);
+    assert!(
+        !modern_only.connected,
+        "ModernOnly must not fall back on the otherwise-eligible signal"
+    );
+    assert_eq!(modern_only.selected_era, None);
+    assert_eq!(modern_only.policy, ProtocolPolicy::ModernOnly);
+    assert_first_wire(&modern_only, 0, "\"method\":\"server/discover\"");
+    assert_no_legacy_child(&modern_only);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // LegacyOnly never probes: its very first wire is exact-2024 initialize.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "legacy-only-never-probes",
+        ProtocolPolicy::LegacyOnly,
+        StdioFirstWireSignal::NoModernProbe,
+        "unused",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let legacy_only = run(&declared);
+    assert!(
+        legacy_only.connected,
+        "LegacyOnly must complete its lifecycle"
+    );
+    assert_eq!(legacy_only.selected_era, Some(ProtocolEra::Legacy2024));
+    assert_eq!(legacy_only.protocol_version.as_deref(), Some(LEGACY_ERA));
+    assert_first_wire(&legacy_only, 0, "\"method\":\"initialize\"");
+    assert!(
+        !legacy_only.first_wire[0].contains("server/discover"),
+        "LegacyOnly must never emit a modern discovery probe"
+    );
+    assert_no_legacy_child(&legacy_only);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // A malformed first wire is not a refusal. The shipped rule quoted by
+    // this evaluator's manifest is "only a correlated JSON-RPC discovery
+    // refusal or Unix-observable clean first-probe timeout authorizes a
+    // second spawn", and bytes that do not parse as a JSON-RPC response are
+    // neither. An unparseable frame proves nothing about the peer's era, so
+    // reading it as a downgrade signal would be a classification the peer
+    // never made.
+    //
+    // This is the AC-LEG-NEG-01-A-PREDICATES "malformed" condition, which
+    // had no representable signal before this case existed.
+    // -----------------------------------------------------------------
+    let (declared, trace) = case(
+        "auto-ineligible-malformed-first-wire",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::MalformedFirstWire,
+        "malformed-first-wire",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let malformed = run(&declared);
+    assert_eq!(malformed.policy, ProtocolPolicy::Auto);
+    assert_eq!(malformed.signal, StdioFirstWireSignal::MalformedFirstWire);
+    assert_first_wire(&malformed, 0, "\"method\":\"server/discover\"");
+    assert_eq!(
+        malformed.selected_era, None,
+        "an unparseable first wire selects no era"
+    );
+    assert_eq!(
+        malformed.protocol_version, None,
+        "an unparseable first wire yields no protocol version"
+    );
+    assert!(
+        !StdioFirstWireSignal::MalformedFirstWire.is_fallback_eligible(),
+        "a malformed frame is not one of the two authorizing signals"
+    );
+    assert_no_legacy_child(&malformed);
+    cleanup(&trace);
+
+    // -----------------------------------------------------------------
+    // Auto + correlated refusal + a CANCELLED caller: the one signal that
+    // DOES authorize a legacy child starts nothing at all.
+    //
+    // This is the AC-LEG-NEG-01-A-PREDICATES "cancellation" condition, and
+    // it needs NO `StdioFirstWireSignal` variant. That absence is the
+    // evidence, not an omission: cancellation is not something the first
+    // wire SAID. It is a property of the caller's `Cx`, enforced by
+    // `admit_auto_legacy_fallback` at both legacy-spawn sites and by a
+    // checkpoint at the head of `try_connect_with_protocol_plan`.
+    //
+    // ONE VARIABLE. Identical to `auto-eligible-correlated-refusal` above --
+    // same policy, same signal, same fixture behaviour, same refusal id,
+    // same legacy era -- differing only in that the caller's context is
+    // cancelled. That case reaches two generations and one legacy child;
+    // this one reaches zero of each, which is what makes the zero
+    // attributable to cancellation rather than to a fixture that never works.
+    // -----------------------------------------------------------------
+    let (cancelled_case, cancelled_trace) = case(
+        "auto-cancelled-caller",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let cancelled = run_cancelled(&cancelled_case);
+    assert_eq!(cancelled.policy, ProtocolPolicy::Auto);
+    assert_eq!(
+        cancelled.signal,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "the declared signal is held fixed; only the caller's context differs"
+    );
+    assert!(
+        !cancelled.connected,
+        "a cancelled caller must not reach a client"
+    );
+    assert_eq!(
+        cancelled.selected_era, None,
+        "a cancelled caller selects no era"
+    );
+    assert_eq!(
+        cancelled.protocol_version, None,
+        "a cancelled caller negotiates no protocol version"
+    );
+    assert!(
+        cancelled.failure.is_some(),
+        "a cancelled caller must record a typed refusal rather than failing silently"
+    );
+    assert!(
+        cancelled.first_wire.is_empty(),
+        "no child ran, so no first wire can have been observed; got {:?}",
+        cancelled.first_wire
+    );
+    assert!(
+        !cancelled.probe_reaped(),
+        "no probe existed, so no probe-reap transition can have occurred"
+    );
+    assert_no_child_at_all(&cancelled);
+    cleanup(&cancelled_trace);
+
+    // The cancelled case above cannot tell which guard refused it. This can.
+    assert_fallback_guard_is_wired();
+}
+
+/// Structural proof that the Auto downgrade boundary still calls its guard.
+///
+/// WHY THIS IS NOT AN OBSERVATIONAL TEST, WHICH IS THE WHOLE POINT.
+/// `admit_auto_legacy_fallback` is `cx.checkpoint().map_err(|_| request_cancelled())`.
+/// The head of `try_connect_with_protocol_plan` is
+/// `if cx.checkpoint().is_err() { return Err(request_cancelled()) }`.
+/// Same predicate, same typed error. On a cancelled caller the two are
+/// OBSERVATIONALLY IDENTICAL, so no assertion over the public result can tell
+/// which one refused. Delete both calls below and `auto-cancelled-caller` above
+/// still passes, because the earlier checkpoint produces the same outcome.
+///
+/// That is why the recorded remedy - "write a test through the path" - cannot
+/// work here, and why the honest instrument is structural. ug2w5 named this
+/// instrument itself for the post-selection condition; it is the right one for
+/// the cancellation wiring too.
+///
+/// MUTATION BEHAVIOUR, which is what makes this a real check: removing either
+/// call site drops the count to one and fails. Moving one out of its function
+/// fails the enclosing-function assertion. Neither mutation is detectable from
+/// the outside.
+fn assert_fallback_guard_is_wired() {
+    let builder = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builder.rs");
+    let source = std::fs::read_to_string(&builder)
+        .unwrap_or_else(|error| panic!("the shipped builder source must be readable: {error}"));
+
+    let mut enclosing = Vec::new();
+    let mut current = "<none>";
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() <= 4 {
+            if let Some(rest) = trimmed
+                .strip_prefix("pub fn ")
+                .or_else(|| trimmed.strip_prefix("fn "))
+                .or_else(|| trimmed.strip_prefix("pub async fn "))
+                .or_else(|| trimmed.strip_prefix("async fn "))
+            {
+                current = rest.split(['(', '<']).next().unwrap_or("<none>");
+            }
+        }
+        if trimmed.starts_with("crate::admit_auto_legacy_fallback(cx)?;") {
+            enclosing.push(current);
+        }
+    }
+
+    assert_eq!(
+        enclosing.len(),
+        2,
+        "the Auto downgrade boundary must call admit_auto_legacy_fallback at exactly its two \
+         legacy-spawn sites; found {enclosing:?}. A removed call is invisible to every \
+         observational case in this file, so this count is the only thing guarding it."
+    );
+    assert!(
+        enclosing.contains(&"try_connect_yielding"),
+        "one guarded spawn site must be in try_connect_yielding; found {enclosing:?}"
+    );
+    assert!(
+        enclosing.contains(&"try_connect_auto"),
+        "one guarded spawn site must be in try_connect_auto; found {enclosing:?}"
+    );
+}
+
+#[test]
+fn leg_neg_01_a_planted_negative() {
+    // Baseline: the accepted eligible case, unchanged.
+    let (baseline_case, baseline_trace) = case(
+        "auto-eligible-correlated-refusal",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let baseline = run(&baseline_case);
+    assert!(baseline.connected);
+    assert_eq!(baseline.selected_era, Some(ProtocolEra::Legacy2024));
+    assert_eq!(baseline.protocol_version.as_deref(), Some(LEGACY_ERA));
+    assert_eq!(baseline.child_generation_count(), 2);
+    cleanup(&baseline_trace);
+
+    // Planted: exactly one changed era field. The fresh child advertises the
+    // unsupported 2025-11-25 instead of exact 2024-11-05. Policy, signal,
+    // command, refusal id and call sequence are all unchanged.
+    let (planted_case, planted_trace) = case(
+        "auto-eligible-correlated-refusal",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        UNSUPPORTED_ERA,
+    );
+    assert_eq!(planted_case.policy(), baseline_case.policy());
+    assert_eq!(planted_case.signal(), baseline_case.signal());
+    assert_eq!(planted_case.command(), baseline_case.command());
+
+    let planted = run(&planted_case);
+    assert_trace_conclusive(&planted);
+
+    // The unsupported era reaches the denial boundary and selects nothing.
+    assert!(
+        !planted.connected,
+        "2025-11-25 must never produce a live client"
+    );
+    assert_eq!(
+        planted.selected_era, None,
+        "an unsupported era selects neither 2026-07-28 nor exact 2024-11-05"
+    );
+    assert_eq!(planted.protocol_version, None);
+    assert_ne!(planted.selected_era, baseline.selected_era);
+
+    // Everything else about the run is preserved: the probe still ran, the
+    // fallback child was still started by the same eligible signal, and the
+    // probe was still reaped into a distinct process.
+    assert_eq!(
+        planted.child_generation_count(),
+        baseline.child_generation_count(),
+        "the eligible signal is unchanged, so the child generation count is unchanged"
+    );
+    assert_eq!(planted.legacy_child_count(), baseline.legacy_child_count());
+    assert!(planted.probe_reaped());
+    assert_first_wire(&planted, 0, "\"method\":\"server/discover\"");
+    assert_first_wire(&planted, 1, "\"method\":\"initialize\"");
+    assert_first_wire(&planted, 1, LEGACY_ERA);
+
+    // The client never echoes the unsupported era on the wire; it appears only
+    // in the peer's rejected response.
+    for (index, line) in planted.first_wire.iter().enumerate() {
+        assert!(
+            !line.contains(UNSUPPORTED_ERA),
+            "the client must never emit {UNSUPPORTED_ERA} on wire line {index}: {line}"
+        );
+    }
+
+    // Zero credential movement on the denied path, proved against the observed wire.
+    // NOTE: the "zero CACHE mutation" half of clause 2 is NOT asserted here and cannot be --
+    // `StdioClassificationRecord` models no cache boundary at all (`grep -i cache` over
+    // leg_neg_stdio.rs returns nothing). That gap is tracked separately; it is inexpressible
+    // in this evaluator rather than merely untested, and a comment claiming otherwise is
+    // what stood here before.
+    assert_no_credential_on_the_wire(&planted);
+    assert_eq!(planted.policy, baseline.policy);
+    assert_eq!(planted.transport, baseline.transport);
+    assert_eq!(planted.signal, baseline.signal);
+    cleanup(&planted_trace);
+
+    // The baseline is freshly reaccepted after the planted denial, proving the
+    // refusal left no retained state behind it.
+    let (reaccept_case, reaccept_trace) = case(
+        "auto-eligible-correlated-refusal",
+        ProtocolPolicy::Auto,
+        StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+        "correlated-refusal",
+        CORRELATED_ID,
+        LEGACY_ERA,
+    );
+    let reaccepted = run(&reaccept_case);
+    assert!(
+        reaccepted.connected,
+        "the baseline must be freshly reaccepted after the planted denial"
+    );
+    assert_eq!(reaccepted.selected_era, baseline.selected_era);
+    assert_eq!(reaccepted.protocol_version, baseline.protocol_version);
+    assert_eq!(
+        reaccepted.child_generation_count(),
+        baseline.child_generation_count()
+    );
+    assert!(reaccepted.probe_reaped());
+    cleanup(&reaccept_trace);
+}
+
+/// The frozen eligibility expectation, shared by the V3 positive and the V4 planted
+/// negative so that the two arms differ in exactly ONE dimension: a single flipped
+/// verdict. Each variant is named as a literal, so a rename or removal is a compile
+/// error here and not a silently shrinking table.
+fn stdio_first_wire_eligibility_table() -> [(StdioFirstWireSignal, &'static str, bool); 7] {
+    [
+        (
+            StdioFirstWireSignal::ModernDiscoveryResult,
+            "ModernDiscoveryResult",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::CorrelatedDiscoveryRefusal,
+            "CorrelatedDiscoveryRefusal",
+            true,
+        ),
+        (
+            StdioFirstWireSignal::UncorrelatedDiscoveryRefusal,
+            "UncorrelatedDiscoveryRefusal",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::RecognizedModernError,
+            "RecognizedModernError",
+            false,
+        ),
+        (StdioFirstWireSignal::NoModernProbe, "NoModernProbe", false),
+        (
+            StdioFirstWireSignal::UnsupportedEraAdvertised,
+            "UnsupportedEraAdvertised",
+            false,
+        ),
+        (
+            StdioFirstWireSignal::MalformedFirstWire,
+            "MalformedFirstWire",
+            false,
+        ),
+    ]
+}
+
+/// The assertion itself, called by BOTH arms with the same code path. The positive
+/// hands it the frozen table; the planted negative hands it a copy with one verdict
+/// flipped. Nothing else differs between them.
+fn assert_eligibility_matches(table: &[(StdioFirstWireSignal, &'static str, bool)]) {
+    for (signal, name, want) in table {
+        let got = signal.is_fallback_eligible();
+        assert_eq!(
+            got, *want,
+            "StdioFirstWireSignal::{name} fallback eligibility changed: expected {want}, got {got}"
+        );
+    }
+}
+
+/// bd-exhaustive-fallback-eligibility-vko6j V3: every variant's fallback-eligibility
+/// verdict is asserted by name.
+///
+/// The two guards see different failures and neither sees the other's.
+/// `is_fallback_eligible` is an exhaustive `match`, so rustc refuses to compile a NEW
+/// variant until someone states its verdict — but a wrong verdict inside a
+/// correctly-shaped arm compiles clean. That is what this catches. Adding a variant is a
+/// compile error; changing one's answer is a test failure.
+///
+/// Scope: this pins the verdicts of one predicate. It says nothing about
+/// `ProtocolPolicy::Auto` handling, nothing about any other `matches!` in the crate, and
+/// it grants no capability credit.
+#[test]
+fn stdio_first_wire_signal_fallback_eligibility_is_pinned_per_variant() {
+    let expected = stdio_first_wire_eligibility_table();
+    assert_eligibility_matches(&expected);
+
+    // Counted from the FUNCTION, not from the table: a table that agreed with itself
+    // would prove nothing, and two verdicts flipped in opposite directions would
+    // otherwise cancel.
+    let eligible = expected
+        .iter()
+        .filter(|(signal, _, _)| signal.is_fallback_eligible())
+        .count();
+    assert_eq!(
+        eligible, 1,
+        "exactly one signal may authorize a fallback; the function reports {eligible}"
+    );
+
+    // The rows must name seven DISTINCT variants. Without this a duplicated row would
+    // silently reduce coverage while the length still read 7.
+    let mut tokens: Vec<&str> = expected
+        .iter()
+        .map(|(signal, _, _)| signal.token())
+        .collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    assert_eq!(
+        tokens.len(),
+        7,
+        "the table must cover seven distinct variants, found {}",
+        tokens.len()
+    );
+}
+
+/// bd-exhaustive-fallback-eligibility-vko6j V4: the planted negative for the test above.
+///
+/// One variable, one dimension. This hands `assert_eligibility_matches` the SAME frozen
+/// table with exactly one expected verdict inverted, and requires that the assertion
+/// REFUSE and name the variant it objected to. Without this arm, a table test that
+/// asserted nothing at all would produce output indistinguishable from the positive's.
+#[test]
+fn stdio_first_wire_signal_flipped_verdict_is_refused_by_name() {
+    let accepted = stdio_first_wire_eligibility_table();
+
+    // ARM 0 — the unmutated table must pass, or the refusal below proves nothing about
+    // the flip rather than about the checker.
+    assert_eligibility_matches(&accepted);
+
+    // The one variable: invert the eligible variant's expected verdict, nothing else.
+    let mut flipped = stdio_first_wire_eligibility_table();
+    let target = 1;
+    assert_eq!(
+        flipped[target].1, "CorrelatedDiscoveryRefusal",
+        "the flip must land on the one eligible variant"
+    );
+    flipped[target].2 = !flipped[target].2;
+
+    let differing = accepted
+        .iter()
+        .zip(flipped.iter())
+        .filter(|(a, b)| a.2 != b.2)
+        .count();
+    assert_eq!(
+        differing, 1,
+        "exactly one row may differ between the two arms, found {differing}"
+    );
+
+    // Capture the refusal. The default hook is silenced only for this call so the
+    // expected panic does not read as a real failure in the run log.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eligibility_matches(&flipped);
+    }));
+    std::panic::set_hook(previous);
+
+    let payload = outcome.expect_err(
+        "a flipped verdict MUST be refused; an assertion that cannot fail has established nothing",
+    );
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    assert!(
+        message.contains("CorrelatedDiscoveryRefusal"),
+        "the refusal must NAME the variant it objected to; got: {message}"
+    );
+
+    // The accepted table is re-checked last and must still pass, so the negative arm is
+    // shown to have changed nothing outside its one flipped value.
+    assert_eligibility_matches(&accepted);
+}

@@ -1,0 +1,1851 @@
+//! Client-local caching for cacheable MCP 2026-07-28 complete results.
+//!
+//! The cache deliberately accepts an already-canonical request projection as
+//! opaque input. Canonicalization remains a protocol-layer concern; this
+//! module only appends the client-local partition and invalidation generation
+//! needed to decide whether a retained complete result is fresh.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use fastmcp_protocol::{CacheScope, CacheTtl, CoreResult, FinalCoreResult, ServerNotification};
+
+/// Default maximum number of retained final complete results per client.
+pub const DEFAULT_FINAL_CACHE_CAPACITY: usize = 128;
+/// Absolute maximum number of retained final complete results per client.
+pub const MAX_FINAL_CACHE_CAPACITY: usize = 10_000;
+/// Default aggregate encoded-byte budget for one client's final-result cache.
+pub const DEFAULT_FINAL_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Absolute aggregate encoded-byte budget for one client's final-result cache.
+pub const MAX_FINAL_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Opaque client-local partition for a final cache entry.
+///
+/// A caller must include the access-token instance discriminator whenever it
+/// uses one cache across multiple credentials. The stdio [`crate::Client`]
+/// keeps one cache per connection, so its default partition never crosses a
+/// connection boundary.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CachePartitionKey(String);
+
+impl CachePartitionKey {
+    /// Creates a partition from a caller-owned opaque discriminator.
+    #[must_use]
+    pub fn new(discriminator: impl Into<String>) -> Self {
+        Self(discriminator.into())
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// The result set whose generation controls a cached complete result.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum FinalCacheResultSet {
+    /// Final server discovery data.
+    ServerDiscovery,
+    /// `tools/list` pages.
+    Tools,
+    /// `resources/list` pages.
+    Resources,
+    /// `resources/templates/list` pages.
+    ResourceTemplates,
+    /// `prompts/list` pages.
+    Prompts,
+    /// One exact `resources/read` URI.
+    Resource(String),
+}
+
+/// The complete client-side identity for one cacheable final request.
+///
+/// `semantic_projection` must be produced by the shared protocol cache-key
+/// projection when that adapter is available. This cache intentionally never
+/// parses, normalizes, or infers semantics from it. An absent cursor and an
+/// empty cursor are distinct identities.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct FinalCacheKey {
+    endpoint_configuration: String,
+    protocol_version: String,
+    normalized_capabilities: String,
+    extension_settings: String,
+    method: String,
+    semantic_projection: String,
+    cursor: Option<String>,
+    policy_revision: u64,
+    extension_revision: u64,
+    representation_policy_revision: u64,
+    limits_policy_revision: u64,
+    partition: CachePartitionKey,
+    result_set: FinalCacheResultSet,
+}
+
+impl FinalCacheKey {
+    /// Creates a complete final cache identity from already-canonical inputs.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        endpoint_configuration: impl Into<String>,
+        protocol_version: impl Into<String>,
+        normalized_capabilities: impl Into<String>,
+        extension_settings: impl Into<String>,
+        method: impl Into<String>,
+        semantic_projection: impl Into<String>,
+        cursor: Option<String>,
+        policy_revision: u64,
+        extension_revision: u64,
+        representation_policy_revision: u64,
+        limits_policy_revision: u64,
+        partition: CachePartitionKey,
+        result_set: FinalCacheResultSet,
+    ) -> Self {
+        Self {
+            endpoint_configuration: endpoint_configuration.into(),
+            protocol_version: protocol_version.into(),
+            normalized_capabilities: normalized_capabilities.into(),
+            extension_settings: extension_settings.into(),
+            method: method.into(),
+            semantic_projection: semantic_projection.into(),
+            cursor,
+            policy_revision,
+            extension_revision,
+            representation_policy_revision,
+            limits_policy_revision,
+            partition,
+            result_set,
+        }
+    }
+
+    /// Returns the result set invalidated with this entry.
+    #[must_use]
+    pub const fn result_set(&self) -> &FinalCacheResultSet {
+        &self.result_set
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let result_set_bytes = match &self.result_set {
+            FinalCacheResultSet::ServerDiscovery
+            | FinalCacheResultSet::Tools
+            | FinalCacheResultSet::Resources
+            | FinalCacheResultSet::ResourceTemplates
+            | FinalCacheResultSet::Prompts => 1,
+            FinalCacheResultSet::Resource(uri) => 1usize.saturating_add(uri.len()),
+        };
+        self.endpoint_configuration
+            .len()
+            .saturating_add(self.protocol_version.len())
+            .saturating_add(self.normalized_capabilities.len())
+            .saturating_add(self.extension_settings.len())
+            .saturating_add(self.method.len())
+            .saturating_add(self.semantic_projection.len())
+            .saturating_add(self.cursor.as_ref().map_or(0, String::len))
+            .saturating_add(self.partition.estimated_bytes())
+            .saturating_add(result_set_bytes)
+            .saturating_add(std::mem::size_of::<u64>() * 4)
+    }
+}
+
+/// A result-set-scoped generation captured before a request is sent.
+///
+/// The lifecycle epoch also fences requests that were already in flight when
+/// the cache was cleared or its enabled state changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalCacheGeneration {
+    epoch: u64,
+    revision: u64,
+    result_set: FinalCacheGenerationSet,
+}
+
+/// Why a cache lookup did not return a fresh result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalCacheMiss {
+    /// The caller disabled caching.
+    Disabled,
+    /// No entry exists for the exact key.
+    Absent,
+    /// The entry reached its per-page TTL.
+    Stale,
+    /// A notification advanced the result-set generation.
+    Invalidated,
+}
+
+/// Result of looking up a final complete result.
+#[derive(Clone, Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public synchronous lookup preserves direct CoreResult ownership; boxing would only add an allocation and degrade the returned API"
+)]
+pub enum FinalCacheLookup {
+    /// A complete validated result that remains fresh.
+    Fresh(CoreResult),
+    /// The caller must fetch a result before it can continue.
+    Miss(FinalCacheMiss),
+}
+
+/// Internal page provenance used to keep one flattened list within one
+/// result-set generation and scope.
+#[derive(Clone, Debug)]
+pub(crate) struct FinalCachePage {
+    pub(crate) result: CoreResult,
+    pub(crate) generation: FinalCacheGeneration,
+    pub(crate) scope: CacheScope,
+}
+
+/// Internal cache lookup including page provenance.
+#[derive(Clone, Debug)]
+pub(crate) enum FinalCachePageLookup {
+    Fresh(Box<FinalCachePage>),
+    Miss(FinalCacheMiss),
+}
+
+/// Result of attempting to retain a fetched result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalCacheInsert {
+    /// The complete result was retained in the local credential partition.
+    Stored,
+    /// The result had no final complete cache hints or was otherwise ineligible.
+    NotCacheable,
+    /// A zero TTL makes the result immediately stale.
+    ImmediatelyStale,
+    /// An invalidation won while the request was in flight.
+    InvalidatedDuringFetch,
+    /// The monotonic expiry could not be represented.
+    ExpiryOutOfRange,
+    /// The encoded result and key exceed the configured cache byte budget.
+    Oversized,
+}
+
+/// Bounded, client-local cache counters with no key or result labels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FinalCacheStats {
+    /// Fresh complete results returned from the cache.
+    pub hits: u64,
+    /// Lookups that did not return a fresh result.
+    pub misses: u64,
+    /// Entries rejected because their TTL expired.
+    pub stale: u64,
+    /// Complete results retained after a fetch.
+    pub fills: u64,
+    /// Notification-driven result-set invalidations.
+    pub invalidations: u64,
+    /// Entries evicted because the bounded cache was full.
+    pub evictions: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FinalCacheEntry {
+    // Keep the exact decoded result. `CacheableResult<T>` wraps a
+    // `CompleteResult<T>`, so it cannot honestly wrap an already-composed
+    // `CoreResult` without changing the result shape.
+    result: CoreResult,
+    scope: CacheScope,
+    // Cache toggles fence requests, not already-committed content. Retained
+    // entries keep their result-set revision and original expiry; lookup
+    // attaches the current lifecycle epoch to each returned page snapshot.
+    result_set_revision: u64,
+    receipt: Instant,
+    expires_at: Instant,
+    encoded_bytes: usize,
+}
+
+/// Fixed-cardinality generation classes. A resource update conservatively
+/// advances the shared resource-read class so distinct peer URIs cannot grow
+/// an unbounded generation map.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FinalCacheGenerationSet {
+    ServerDiscovery,
+    Tools,
+    Resources,
+    ResourceTemplates,
+    Prompts,
+    Resource,
+}
+
+impl From<&FinalCacheResultSet> for FinalCacheGenerationSet {
+    fn from(result_set: &FinalCacheResultSet) -> Self {
+        match result_set {
+            FinalCacheResultSet::ServerDiscovery => Self::ServerDiscovery,
+            FinalCacheResultSet::Tools => Self::Tools,
+            FinalCacheResultSet::Resources => Self::Resources,
+            FinalCacheResultSet::ResourceTemplates => Self::ResourceTemplates,
+            FinalCacheResultSet::Prompts => Self::Prompts,
+            FinalCacheResultSet::Resource(_) => Self::Resource,
+        }
+    }
+}
+
+/// A bounded cache of exact final complete results.
+///
+/// Peer `public` hints are retained as data but do not weaken the supplied
+/// [`CachePartitionKey`]. Cross-principal reuse requires a separately
+/// revisioned trust policy and is intentionally not inferred from peer data.
+#[derive(Debug)]
+pub struct FinalResultCache {
+    enabled: bool,
+    capacity: usize,
+    max_bytes: usize,
+    retained_bytes: usize,
+    entries: HashMap<FinalCacheKey, FinalCacheEntry>,
+    generations: HashMap<FinalCacheGenerationSet, u64>,
+    epoch: u64,
+    epoch_exhausted: bool,
+    stats: FinalCacheStats,
+}
+
+impl FinalResultCache {
+    /// Creates an enabled cache with at least one retained-entry slot.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_FINAL_CACHE_MAX_BYTES)
+    }
+
+    /// Creates an enabled cache with independently bounded entry and byte
+    /// budgets. Values above the published hard ceilings are clamped.
+    #[must_use]
+    pub fn with_limits(capacity: usize, max_bytes: usize) -> Self {
+        Self {
+            enabled: true,
+            capacity: capacity.clamp(1, MAX_FINAL_CACHE_CAPACITY),
+            max_bytes: max_bytes.clamp(1, MAX_FINAL_CACHE_MAX_BYTES),
+            retained_bytes: 0,
+            entries: HashMap::new(),
+            generations: HashMap::new(),
+            epoch: 0,
+            epoch_exhausted: false,
+            stats: FinalCacheStats::default(),
+        }
+    }
+
+    /// Returns whether lookups and fills are enabled.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Enables or disables cache use without discarding retained entries.
+    ///
+    /// A change fences outstanding fetches, including fetches started while
+    /// disabled. Retained entries remain subject to their original TTL and
+    /// notification-driven invalidation; disabling does not pause expiry.
+    /// Repeating the current setting is a no-op. Use [`Self::clear`] to discard
+    /// entries explicitly. Exhausting the lifecycle epoch discards entries and
+    /// permanently disables caching rather than reusing a request token.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled && self.advance_epoch() {
+            self.enabled = enabled;
+        }
+    }
+
+    /// Returns bounded aggregate cache counters.
+    #[must_use]
+    pub const fn stats(&self) -> FinalCacheStats {
+        self.stats
+    }
+
+    /// Removes every retained entry and invalidates every outstanding fetch.
+    ///
+    /// Configuration and counters are preserved. If the lifecycle epoch is
+    /// exhausted, caching is permanently disabled rather than reusing a token.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+        self.advance_epoch();
+    }
+
+    /// Fences requests and previously returned page snapshots without
+    /// invalidating committed content. Overflow is terminal, including when
+    /// it occurs while re-enabling a disabled cache.
+    fn advance_epoch(&mut self) -> bool {
+        if self.epoch_exhausted {
+            return false;
+        }
+        if let Some(epoch) = self.epoch.checked_add(1) {
+            self.epoch = epoch;
+            true
+        } else {
+            self.entries.clear();
+            self.retained_bytes = 0;
+            self.epoch_exhausted = true;
+            self.enabled = false;
+            false
+        }
+    }
+
+    /// Captures the result-set generation before a request begins.
+    #[must_use]
+    pub fn begin_fetch(&self, result_set: &FinalCacheResultSet) -> FinalCacheGeneration {
+        FinalCacheGeneration {
+            epoch: self.epoch,
+            revision: self.generation(result_set),
+            result_set: FinalCacheGenerationSet::from(result_set),
+        }
+    }
+
+    /// Looks up one complete result at the supplied monotonic instant.
+    pub fn lookup_at(&mut self, key: &FinalCacheKey, now: Instant) -> FinalCacheLookup {
+        match self.lookup_page_at(key, now) {
+            FinalCachePageLookup::Fresh(page) => FinalCacheLookup::Fresh(page.result),
+            FinalCachePageLookup::Miss(miss) => FinalCacheLookup::Miss(miss),
+        }
+    }
+
+    /// Looks up one page while retaining its generation and scope for a
+    /// caller that is assembling a full cursor-following list.
+    pub(crate) fn lookup_page_at(
+        &mut self,
+        key: &FinalCacheKey,
+        now: Instant,
+    ) -> FinalCachePageLookup {
+        if !self.enabled {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            return FinalCachePageLookup::Miss(FinalCacheMiss::Disabled);
+        }
+
+        let generation = self.begin_fetch(key.result_set());
+        let Some(entry) = self.entries.get(key) else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            return FinalCachePageLookup::Miss(FinalCacheMiss::Absent);
+        };
+        let entry_revision = entry.result_set_revision;
+        let expires_at = entry.expires_at;
+
+        let miss = if entry_revision != generation.revision {
+            Some(FinalCacheMiss::Invalidated)
+        } else if now >= expires_at {
+            Some(FinalCacheMiss::Stale)
+        } else {
+            None
+        };
+
+        if let Some(miss) = miss {
+            if let Some(removed) = self.entries.remove(key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.encoded_bytes);
+            }
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            if miss == FinalCacheMiss::Stale {
+                self.stats.stale = self.stats.stale.saturating_add(1);
+            }
+            return FinalCachePageLookup::Miss(miss);
+        }
+
+        // Do not clone a potentially large result only to discard it on a miss.
+        let result = entry.result.clone();
+        let scope = entry.scope;
+        self.stats.hits = self.stats.hits.saturating_add(1);
+        FinalCachePageLookup::Fresh(Box::new(FinalCachePage {
+            result,
+            generation,
+            scope,
+        }))
+    }
+
+    /// Looks up one complete result using the current monotonic instant.
+    pub fn lookup(&mut self, key: &FinalCacheKey) -> FinalCacheLookup {
+        self.lookup_at(key, Instant::now())
+    }
+
+    /// Retains a fetched result only when its captured generation is current.
+    ///
+    /// A current, non-cacheable result supersedes any retained result for the
+    /// exact key. In particular, input-required and zero-TTL responses must not
+    /// leave an earlier complete result available as a later cache hit. This
+    /// does not invalidate other keys or advance the captured generation.
+    /// Invalidated fetches and failed TTL/size admission leave entries intact.
+    pub fn insert_if_current_at(
+        &mut self,
+        key: FinalCacheKey,
+        captured_generation: FinalCacheGeneration,
+        result: CoreResult,
+        receipt: Instant,
+    ) -> FinalCacheInsert {
+        if !self.enabled || captured_generation != self.begin_fetch(key.result_set()) {
+            return FinalCacheInsert::InvalidatedDuringFetch;
+        }
+
+        let Some((ttl, scope)) = final_cache_hints(&result) else {
+            if let Some(previous) = self.entries.remove(&key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+            }
+            return FinalCacheInsert::NotCacheable;
+        };
+        let ttl_ms = match ttl.try_as_millis() {
+            Ok(ttl_ms) => ttl_ms,
+            Err(_) => return FinalCacheInsert::ExpiryOutOfRange,
+        };
+        if ttl_ms == 0 {
+            if let Some(previous) = self.entries.remove(&key) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+            }
+            return FinalCacheInsert::ImmediatelyStale;
+        }
+        let Some(expires_at) = receipt.checked_add(Duration::from_millis(ttl_ms)) else {
+            return FinalCacheInsert::ExpiryOutOfRange;
+        };
+
+        let encoded_bytes = match result.encode() {
+            Ok(encoded) => key.estimated_bytes().saturating_add(encoded.len()),
+            Err(_) => return FinalCacheInsert::Oversized,
+        };
+        if encoded_bytes > self.max_bytes {
+            return FinalCacheInsert::Oversized;
+        }
+
+        if let Some(previous) = self.entries.remove(&key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.encoded_bytes);
+        }
+        while self.entries.len() >= self.capacity
+            || self.retained_bytes > self.max_bytes.saturating_sub(encoded_bytes)
+        {
+            if !self.evict_oldest() {
+                return FinalCacheInsert::Oversized;
+            }
+        }
+        self.entries.insert(
+            key,
+            FinalCacheEntry {
+                result,
+                scope,
+                result_set_revision: captured_generation.revision,
+                receipt,
+                expires_at,
+                encoded_bytes,
+            },
+        );
+        self.retained_bytes = self.retained_bytes.saturating_add(encoded_bytes);
+        self.stats.fills = self.stats.fills.saturating_add(1);
+        FinalCacheInsert::Stored
+    }
+
+    /// Retains a fetched result using the current monotonic instant.
+    pub fn insert_if_current(
+        &mut self,
+        key: FinalCacheKey,
+        captured_generation: FinalCacheGeneration,
+        result: CoreResult,
+    ) -> FinalCacheInsert {
+        self.insert_if_current_at(key, captured_generation, result, Instant::now())
+    }
+
+    /// Advances a result-set generation before removing its previous entries.
+    pub fn invalidate_result_set(&mut self, result_set: &FinalCacheResultSet) {
+        let generation_set = FinalCacheGenerationSet::from(result_set);
+        let current = self.generations.get(&generation_set).copied().unwrap_or(0);
+        let Some(generation) = current.checked_add(1) else {
+            // Reusing a saturated revision would admit a pre-invalidation fill.
+            // Rotate the lifecycle epoch before restarting the bounded counters.
+            self.clear();
+            self.generations.clear();
+            self.stats.invalidations = self.stats.invalidations.saturating_add(1);
+            return;
+        };
+        self.generations.insert(generation_set, generation);
+        match result_set {
+            // Resource-update generations are intentionally shared and
+            // fixed-cardinality, so retire every resource-read entry rather
+            // than retaining immediately-invalid stale bytes for other URIs.
+            FinalCacheResultSet::Resource(_) => self
+                .entries
+                .retain(|key, _| !matches!(key.result_set(), FinalCacheResultSet::Resource(_))),
+            _ => self.entries.retain(|key, _| key.result_set() != result_set),
+        }
+        self.recount_retained_bytes();
+        self.stats.invalidations = self.stats.invalidations.saturating_add(1);
+    }
+
+    /// Invalidates cacheable result sets selected by a final server notification.
+    pub fn invalidate_notification(&mut self, notification: &ServerNotification) {
+        match notification {
+            ServerNotification::ToolsListChanged(_) => {
+                self.invalidate_result_set(&FinalCacheResultSet::Tools);
+            }
+            ServerNotification::ResourcesListChanged(_) => {
+                self.invalidate_result_set(&FinalCacheResultSet::Resources);
+                self.invalidate_result_set(&FinalCacheResultSet::ResourceTemplates);
+                // Catalog visibility changed. Individual resources/read
+                // entries can no longer be trusted, including session-local
+                // disable_resource mutations that publish list_changed rather
+                // than resources/updated.
+                self.invalidate_result_set(&FinalCacheResultSet::Resource(String::new()));
+            }
+            ServerNotification::PromptsListChanged(_) => {
+                self.invalidate_result_set(&FinalCacheResultSet::Prompts);
+            }
+            ServerNotification::ResourceUpdated(params) => {
+                self.invalidate_result_set(&FinalCacheResultSet::Resource(
+                    params.uri.as_str().to_owned(),
+                ));
+            }
+            ServerNotification::Cancelled(_)
+            | ServerNotification::Progress(_)
+            | ServerNotification::Message(_)
+            | ServerNotification::SubscriptionsAcknowledged(_) => {}
+        }
+    }
+
+    fn generation(&self, result_set: &FinalCacheResultSet) -> u64 {
+        self.generations
+            .get(&FinalCacheGenerationSet::from(result_set))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(oldest) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.receipt)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        if let Some(removed) = self.entries.remove(&oldest) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed.encoded_bytes);
+        }
+        self.stats.evictions = self.stats.evictions.saturating_add(1);
+        true
+    }
+
+    fn recount_retained_bytes(&mut self) {
+        self.retained_bytes = self.entries.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.encoded_bytes)
+        });
+    }
+}
+
+impl Default for FinalResultCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_FINAL_CACHE_CAPACITY)
+    }
+}
+
+pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheScope)> {
+    let CoreResult::Final(result) = result else {
+        return None;
+    };
+    match result {
+        FinalCoreResult::Discover(result) => {
+            let hints = result.cache_hints();
+            Some((
+                hints.ttl_ms().clone(),
+                if hints.is_public() {
+                    CacheScope::Public
+                } else {
+                    CacheScope::Private
+                },
+            ))
+        }
+        FinalCoreResult::ToolsList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourcesList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourceTemplatesList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::ResourcesRead { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::PromptsList { result, .. } => {
+            Some((result.payload.ttl_ms.clone(), result.payload.cache_scope))
+        }
+        FinalCoreResult::Completion { .. }
+        | FinalCoreResult::ToolsCall { .. }
+        | FinalCoreResult::ToolsCallInputRequired { .. }
+        | FinalCoreResult::ResourcesReadInputRequired { .. }
+        | FinalCoreResult::PromptsGet { .. }
+        | FinalCoreResult::PromptsGetInputRequired { .. }
+        | FinalCoreResult::SubscriptionsListen { .. } => None,
+        #[cfg(feature = "tasks")]
+        FinalCoreResult::ToolsCallTask { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use fastmcp_protocol::common_types::OpenMetadata;
+    use fastmcp_protocol::{CoreRequest, FinalCoreRequest, FinalListParams};
+
+    use super::*;
+
+    fn key_with_revisions(
+        partition: &str,
+        cursor: Option<&str>,
+        policy_revision: u64,
+        extension_revision: u64,
+        representation_policy_revision: u64,
+        limits_policy_revision: u64,
+    ) -> FinalCacheKey {
+        FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "tools/list",
+            "{\"includeTags\":null,\"excludeTags\":null}",
+            cursor.map(ToOwned::to_owned),
+            policy_revision,
+            extension_revision,
+            representation_policy_revision,
+            limits_policy_revision,
+            CachePartitionKey::new(partition),
+            FinalCacheResultSet::Tools,
+        )
+    }
+
+    fn key(partition: &str, cursor: Option<&str>) -> FinalCacheKey {
+        key_with_revisions(partition, cursor, 1, 1, 1, 1)
+    }
+
+    fn tools_list_request() -> CoreRequest {
+        CoreRequest::Final(FinalCoreRequest::ToolsList(FinalListParams {
+            meta: OpenMetadata::default(),
+            cursor: None,
+            include_tags: None,
+            exclude_tags: None,
+        }))
+    }
+
+    fn tools_result_with_ttl(ttl_ms: &str, scope: &str, extra: Option<&str>) -> CoreResult {
+        let suffix = extra.map_or_else(String::new, |extra| format!(",{extra}"));
+        tools_list_request()
+            .decode_result(&format!(
+                r#"{{"resultType":"complete","tools":[],"ttlMs":{ttl_ms},"cacheScope":"{scope}"{suffix}}}"#
+            ))
+            .expect("the cache fixture is an admitted final complete result")
+    }
+
+    fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
+        tools_result_with_ttl(&ttl_ms.to_string(), scope, extra)
+    }
+
+    #[test]
+    fn final_catalog_hints_enter_the_cache_as_typed_cacheable_results() {
+        let catalog = tools_result(73, "public", None);
+        assert_eq!(
+            final_cache_hints(&catalog),
+            Some((CacheTtl::milliseconds(73), CacheScope::Public)),
+            "a final catalog ttlMs/cacheScope pair becomes one typed cache hint"
+        );
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, catalog),
+            FinalCacheInsert::Stored,
+            "the typed cache hint owns the retained final result"
+        );
+        assert!(matches!(cache.lookup(&key), FinalCacheLookup::Fresh(_)));
+
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"file:///input-required.txt\"")
+                    .expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let input_required = request
+            .decode_result(
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"ttlMs":73,"cacheScope":"public"}"#,
+            )
+            .expect("input-required fixture decodes with inert cache lookalikes");
+        assert_eq!(
+            final_cache_hints(&input_required),
+            None,
+            "changing only complete to input_required keeps cache lookalikes inert"
+        );
+    }
+
+    fn notification(method: &str, params: Option<serde_json::Value>) -> ServerNotification {
+        ServerNotification::decode(&fastmcp_protocol::JsonRpcRequest::notification(
+            method, params,
+        ))
+        .expect("the cache fixture is an admitted final server notification")
+    }
+
+    #[test]
+    fn ttl_is_per_page_and_never_returns_stale_as_fresh() {
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", Some("opaque-page-2"));
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                key.clone(),
+                generation,
+                tools_result(20, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup_at(&key, receipt + Duration::from_millis(19)),
+            FinalCacheLookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.lookup_at(&key, receipt + Duration::from_millis(20)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+        assert_eq!(cache.stats().stale, 1);
+    }
+
+    #[test]
+    fn zero_ttl_and_input_required_never_create_fresh_entries() {
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, tools_result(0, "private", None)),
+            FinalCacheInsert::ImmediatelyStale
+        );
+
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"file:///input-required.txt\"")
+                    .expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let input_required = request
+            .decode_result(
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"ttlMs":99,"cacheScope":"public"}"#,
+            )
+            .expect("inert cache-like extras remain a typed input-required result");
+        let input_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"file:///input-required.txt\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("file:///input-required.txt".to_owned()),
+        );
+        let generation = cache.begin_fetch(input_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(input_key, generation, input_required),
+            FinalCacheInsert::NotCacheable
+        );
+    }
+
+    #[test]
+    fn revalidation_with_zero_ttl_retires_the_previously_fresh_result() {
+        // The two cases differ only in the new TTL. The old entry is still
+        // fresh in both, so a miss cannot be explained by its natural expiry.
+        for ttl in [0, 1] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let generation = cache.begin_fetch(cache_key.result_set());
+            let result = tools_result(ttl, "private", Some(r#""x-retained":"replacement""#));
+            let expected = result.encode().expect("replacement result encodes");
+            let inserted =
+                cache.insert_if_current_at(cache_key.clone(), generation, result, receipt);
+            assert_eq!(cache.begin_fetch(cache_key.result_set()), generation);
+            if ttl == 0 {
+                assert_eq!(inserted, FinalCacheInsert::ImmediatelyStale);
+                assert!(matches!(
+                    cache.lookup_at(&cache_key, receipt),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+                assert_eq!(cache.retained_bytes, 0);
+                assert_eq!(cache.stats().fills, 1);
+            } else {
+                assert_eq!(inserted, FinalCacheInsert::Stored);
+                let FinalCacheLookup::Fresh(fresh) = cache.lookup_at(&cache_key, receipt) else {
+                    panic!("positive-TTL replacement must remain usable");
+                };
+                assert_eq!(fresh.encode().expect("fresh result encodes"), expected);
+                assert!(matches!(
+                    cache.lookup_at(&cache_key, receipt + Duration::from_millis(1)),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+                ));
+                assert_eq!(cache.stats().fills, 2);
+            }
+            assert_eq!(cache.stats().evictions, 0);
+        }
+    }
+
+    #[test]
+    fn zero_ttl_revalidation_preserves_other_partitions_pages_and_generations() {
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let keys = [
+            key("credential-a", None),
+            key("credential-b", None),
+            key("credential-a", Some("page-2")),
+        ];
+        let generation = cache.begin_fetch(keys[0].result_set());
+        for cache_key in &keys {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+        let retained = cache.retained_bytes;
+        let removed = cache.entries[&keys[0]].encoded_bytes;
+        let stats = cache.stats();
+        // Repeating the retirement must not subtract the same bytes twice.
+        for _ in 0..2 {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    keys[0].clone(),
+                    generation,
+                    tools_result(0, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::ImmediatelyStale
+            );
+            assert_eq!(cache.retained_bytes, retained - removed);
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!(cache.stats(), stats);
+            assert_eq!(cache.begin_fetch(keys[0].result_set()), generation);
+        }
+        assert!(matches!(
+            cache.lookup_at(&keys[0], receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        for cache_key in &keys[1..] {
+            assert!(matches!(
+                cache.lookup_at(cache_key, receipt + Duration::from_millis(99)),
+                FinalCacheLookup::Fresh(_)
+            ));
+            assert!(matches!(
+                cache.lookup_at(cache_key, receipt + Duration::from_millis(100)),
+                FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+            ));
+        }
+        assert_eq!(cache.retained_bytes, 0);
+        // The exact key remains reusable without a cache-wide reset.
+        assert_eq!(
+            cache.insert_if_current_at(
+                keys[0].clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+    }
+
+    #[test]
+    fn obsolete_or_disabled_zero_ttl_revalidation_cannot_remove_a_retained_result() {
+        for disabled in [false, true] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let captured = cache.begin_fetch(cache_key.result_set());
+            if disabled {
+                cache.set_enabled(false);
+            } else {
+                cache.clear();
+                let current = cache.begin_fetch(cache_key.result_set());
+                assert_eq!(
+                    cache.insert_if_current_at(
+                        cache_key.clone(),
+                        current,
+                        tools_result(100, "private", None),
+                        receipt,
+                    ),
+                    FinalCacheInsert::Stored
+                );
+            }
+            let attempted_generation = if disabled {
+                // A current generation still confers no fill/retirement right
+                // while the cache is disabled.
+                cache.begin_fetch(cache_key.result_set())
+            } else {
+                captured
+            };
+            let retained = cache.retained_bytes;
+            let stats = cache.stats();
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    attempted_generation,
+                    tools_result(0, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.stats(), stats);
+            cache.set_enabled(true);
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+        }
+    }
+
+    fn resource_revalidation_fixture() -> (FinalCacheKey, CoreResult, CoreResult) {
+        let cache_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"info://server\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("info://server".to_owned()),
+        );
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"info://server\"").expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let complete = request
+            .decode_result(
+                r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("complete resource result is admitted");
+        let input_required = request
+            .decode_result(
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("input-required result retains inert cache lookalikes");
+        (cache_key, complete, input_required)
+    }
+
+    #[test]
+    fn input_required_revalidation_retires_complete_content_and_allows_later_refill() {
+        let (cache_key, complete, input_required) = resource_revalidation_fixture();
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, complete.clone(), receipt),
+            FinalCacheInsert::Stored
+        );
+        let stats = cache.stats();
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, input_required, receipt),
+            FinalCacheInsert::NotCacheable
+        );
+        assert_eq!(cache.stats(), stats);
+        assert_eq!(cache.retained_bytes, 0);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), generation);
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), generation, complete, receipt),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn obsolete_input_required_revalidation_cannot_remove_newer_complete_content() {
+        let (cache_key, complete, input_required) = resource_revalidation_fixture();
+        let mut cache = FinalResultCache::default();
+        let receipt = Instant::now();
+        let obsolete = cache.begin_fetch(cache_key.result_set());
+        cache.invalidate_result_set(cache_key.result_set());
+        let current = cache.begin_fetch(cache_key.result_set());
+        let expected = complete.encode().expect("complete result encodes");
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), current, complete, receipt),
+            FinalCacheInsert::Stored
+        );
+        let retained = cache.retained_bytes;
+        let stats = cache.stats();
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), obsolete, input_required, receipt),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert_eq!(cache.retained_bytes, retained);
+        assert_eq!(cache.stats(), stats);
+        let FinalCacheLookup::Fresh(fresh) = cache.lookup_at(&cache_key, receipt) else {
+            panic!("an obsolete response cannot retire a current result");
+        };
+        assert_eq!(fresh.encode().expect("fresh result encodes"), expected);
+    }
+
+    #[test]
+    fn huge_and_fractional_peer_ttls_leave_existing_entry_unchanged() {
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                key.clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let before = cache.stats();
+        let retained_before = cache.retained_bytes;
+
+        let huge = tools_result_with_ttl("18446744073709551616", "private", None);
+        assert_eq!(
+            final_cache_hints(&huge)
+                .expect("complete result retains cache hints")
+                .0
+                .as_str(),
+            "18446744073709551616",
+            "the peer TTL remains lossless until runtime expiry conversion"
+        );
+        assert_eq!(
+            cache.insert_if_current_at(key.clone(), generation, huge, receipt),
+            FinalCacheInsert::ExpiryOutOfRange
+        );
+        assert_eq!(cache.stats(), before);
+        assert!(cache.entries.contains_key(&key));
+        assert_eq!(cache.retained_bytes, retained_before);
+
+        let fractional = tools_list_request().decode_result(
+            r#"{"resultType":"complete","tools":[],"ttlMs":18446744073709551616.5,"cacheScope":"private"}"#,
+        );
+        assert!(
+            fractional.is_err(),
+            "changing only ttlMs to a fraction is rejected"
+        );
+        assert_eq!(cache.stats(), before);
+        assert!(cache.entries.contains_key(&key));
+        assert_eq!(cache.retained_bytes, retained_before);
+    }
+
+    #[test]
+    fn public_peer_hint_stays_in_the_local_credential_partition() {
+        let mut cache = FinalResultCache::default();
+        let private_key = key("credential-a", None);
+        let generation = cache.begin_fetch(private_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(
+                private_key.clone(),
+                generation,
+                tools_result(100, "public", None),
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup(&private_key),
+            FinalCacheLookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.lookup(&key("credential-b", None)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+    }
+
+    #[test]
+    fn policy_revisions_partition_the_complete_result_identity() {
+        let mut cache = FinalResultCache::default();
+        let baseline = key_with_revisions("credential-a", None, 1, 1, 1, 1);
+        let generation = cache.begin_fetch(baseline.result_set());
+        assert_eq!(
+            cache.insert_if_current(
+                baseline.clone(),
+                generation,
+                tools_result(100, "private", None),
+            ),
+            FinalCacheInsert::Stored
+        );
+
+        for revisions in [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)] {
+            assert!(matches!(
+                cache.lookup(&key_with_revisions(
+                    "credential-a",
+                    None,
+                    revisions.0,
+                    revisions.1,
+                    revisions.2,
+                    revisions.3,
+                )),
+                FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+            ));
+        }
+    }
+
+    #[test]
+    fn notifications_advance_generation_before_late_fetch_can_fill() {
+        let mut cache = FinalResultCache::default();
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        cache.invalidate_notification(&notification("notifications/tools/list_changed", None));
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, tools_result(100, "private", None)),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert!(matches!(
+            cache.lookup(&key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+    }
+
+    #[test]
+    fn resource_update_invalidates_only_the_exact_resource_and_replays_unknown_members() {
+        let mut cache = FinalResultCache::default();
+        let resource_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"file:///changed.txt\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("file:///changed.txt".to_owned()),
+        );
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"file:///changed.txt\"").expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let result = request
+            .decode_result(
+                r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private","x-retained":9007199254740993123456789}"#,
+            )
+            .expect("complete resource result with an unknown number is admitted");
+        let expected = result.encode().expect("complete result re-encodes");
+        let generation = cache.begin_fetch(resource_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(resource_key.clone(), generation, result),
+            FinalCacheInsert::Stored
+        );
+        let FinalCacheLookup::Fresh(replayed) = cache.lookup(&resource_key) else {
+            panic!("fresh cached resource result expected");
+        };
+        assert_eq!(
+            replayed.encode().expect("cached result re-encodes"),
+            expected
+        );
+
+        cache.invalidate_notification(&notification(
+            "notifications/resources/updated",
+            Some(serde_json::json!({"uri": "file:///changed.txt"})),
+        ));
+        assert!(matches!(
+            cache.lookup(&resource_key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+    }
+
+    #[test]
+    fn resources_list_changed_invalidates_cached_resource_reads() {
+        let mut cache = FinalResultCache::default();
+        let resource_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"info://server\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("info://server".to_owned()),
+        );
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"info://server\"").expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let result = request
+            .decode_result(
+                r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("complete resource result is admitted");
+        let generation = cache.begin_fetch(resource_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(resource_key.clone(), generation, result),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup(&resource_key),
+            FinalCacheLookup::Fresh(_)
+        ));
+
+        cache.invalidate_notification(&notification("notifications/resources/list_changed", None));
+        assert!(matches!(
+            cache.lookup(&resource_key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+    }
+
+    #[test]
+    fn resource_update_generations_are_fixed_cardinality() {
+        let mut cache = FinalResultCache::default();
+        for index in 0..1_024 {
+            cache.invalidate_notification(&notification(
+                "notifications/resources/updated",
+                Some(serde_json::json!({"uri": format!("file:///changed-{index}.txt")})),
+            ));
+        }
+
+        assert_eq!(
+            cache.generations.len(),
+            1,
+            "distinct resource URIs share one bounded resource generation"
+        );
+    }
+
+    #[test]
+    fn byte_budget_rejects_oversized_complete_result_without_eviction_loop() {
+        let mut cache = FinalResultCache::with_limits(2, 96);
+        let key = key("credential-a", None);
+        let generation = cache.begin_fetch(key.result_set());
+        let result = tools_result(
+            100,
+            "private",
+            Some(r#""padding":"this exceeds the byte budget""#),
+        );
+
+        assert_eq!(
+            cache.insert_if_current(key.clone(), generation, result),
+            FinalCacheInsert::Oversized
+        );
+        assert!(matches!(
+            cache.lookup(&key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.retained_bytes, 0);
+    }
+
+    #[test]
+    fn clear_fences_fetches_even_when_no_entries_were_retained() {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let sets = [
+            FinalCacheResultSet::ServerDiscovery,
+            FinalCacheResultSet::Tools,
+            FinalCacheResultSet::Resources,
+            FinalCacheResultSet::ResourceTemplates,
+            FinalCacheResultSet::Prompts,
+            FinalCacheResultSet::Resource("file:///pending.txt".to_owned()),
+        ];
+        let before: Vec<_> = sets.iter().map(|set| cache.begin_fetch(set)).collect();
+        let stats = cache.stats();
+        cache.clear();
+        for (set, captured) in sets.iter().zip(before) {
+            assert_ne!(cache.begin_fetch(set), captured);
+        }
+        let old = FinalCacheGeneration {
+            epoch: 0,
+            revision: 0,
+            result_set: FinalCacheGenerationSet::Tools,
+        };
+        assert_eq!(
+            cache.insert_if_current(cache_key.clone(), old, tools_result(100, "private", None)),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert_eq!(cache.stats(), stats);
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.entries.is_empty());
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(
+                cache_key.clone(),
+                current,
+                tools_result(100, "private", None)
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup(&cache_key),
+            FinalCacheLookup::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn disable_and_reenable_fence_both_prior_and_disabled_fetches() {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let receipt = Instant::now();
+        let before_disable = cache.begin_fetch(cache_key.result_set());
+        let original = tools_result(100, "private", Some(r#""x-retained":"original""#));
+        let expected = original.encode().expect("original result encodes");
+        assert_eq!(
+            cache.insert_if_current_at(cache_key.clone(), before_disable, original, receipt),
+            FinalCacheInsert::Stored
+        );
+        let retained_before = cache.retained_bytes;
+        let stats_before = cache.stats();
+        cache.set_enabled(false);
+        assert_eq!(cache.retained_bytes, retained_before);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.stats(), stats_before);
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Disabled)
+        ));
+        let while_disabled = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                while_disabled,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        cache.set_enabled(true);
+        for captured in [before_disable, while_disabled] {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    captured,
+                    tools_result(100, "private", Some(r#""x-retained":"late""#)),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+        }
+        assert_eq!(cache.retained_bytes, retained_before);
+        let FinalCacheLookup::Fresh(retained) = cache.lookup_at(&cache_key, receipt) else {
+            panic!("re-enabling must make the original entry available");
+        };
+        assert_eq!(
+            retained.encode().expect("retained result encodes"),
+            expected
+        );
+        assert_eq!(
+            cache.stats().fills,
+            1,
+            "late fills did not mutate the cache"
+        );
+
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                current,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        cache.set_enabled(true);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), current);
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Fresh(_)
+        ));
+    }
+
+    // These checks use explicit receipt/lookup instants rather than sleeps, so
+    // scheduler load cannot consume the short TTLs in the fixtures.
+    fn retained_cache_toggle_fixture() -> (FinalResultCache, FinalCacheKey, Instant) {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let receipt = Instant::now();
+        let generation = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        (cache, cache_key, receipt)
+    }
+
+    #[test]
+    fn cache_toggle_preserves_original_ttl_and_byte_accounting() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        let retained = cache.retained_bytes;
+        let stats = cache.stats();
+        for _ in 0..3 {
+            cache.set_enabled(false);
+            cache.set_enabled(true);
+            assert_eq!(cache.retained_bytes, retained);
+            assert_eq!(cache.stats(), stats);
+            let entry = cache.entries.get(&cache_key).expect("retained entry");
+            assert_eq!(entry.receipt, receipt);
+            assert_eq!(entry.expires_at, receipt + Duration::from_millis(100));
+        }
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt + Duration::from_millis(99)),
+            FinalCacheLookup::Fresh(_)
+        ));
+        // Change only the lookup instant to the original expiration boundary.
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt + Duration::from_millis(100)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.stats().stale, 1);
+        assert_eq!(cache.stats().fills, 1);
+    }
+
+    #[test]
+    fn cache_toggle_does_not_restore_notification_invalidated_content() {
+        // Both cases take the same disable/enable path. Only the presence of
+        // a catalog invalidation while disabled differs.
+        for invalidate in [false, true] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            cache.set_enabled(false);
+            let disabled_generation = cache.begin_fetch(cache_key.result_set());
+            if invalidate {
+                cache.invalidate_notification(&notification(
+                    "notifications/tools/list_changed",
+                    None,
+                ));
+            }
+            cache.set_enabled(true);
+            let lookup = cache.lookup_at(&cache_key, receipt);
+            if invalidate {
+                assert!(matches!(
+                    lookup,
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+                assert_eq!(cache.retained_bytes, 0);
+            } else {
+                assert!(matches!(lookup, FinalCacheLookup::Fresh(_)));
+                assert!(cache.retained_bytes > 0);
+            }
+            assert_eq!(cache.stats().invalidations, u64::from(invalidate));
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    disabled_generation,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+            let current = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key,
+                    current,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+    }
+
+    #[test]
+    fn cache_toggle_returns_current_page_epoch_without_resetting_revision() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        cache.invalidate_result_set(cache_key.result_set());
+        let revision_one = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(revision_one.revision, 1);
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                revision_one,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let FinalCachePageLookup::Fresh(before) = cache.lookup_page_at(&cache_key, receipt) else {
+            panic!("first page is fresh");
+        };
+        cache.set_enabled(false);
+        let disabled = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(false);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), disabled);
+        cache.set_enabled(true);
+        let FinalCachePageLookup::Fresh(after) = cache.lookup_page_at(&cache_key, receipt) else {
+            panic!("retained page is fresh after re-enabling");
+        };
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(after.generation, current);
+        assert_ne!(after.generation, before.generation);
+        assert_eq!(after.generation.revision, before.generation.revision);
+        assert_eq!(after.generation.result_set, before.generation.result_set);
+        assert_eq!(after.scope, before.scope);
+        assert_eq!(
+            after.result.encode().expect("retained page encodes"),
+            before.result.encode().expect("original page encodes")
+        );
+        // Old pagination snapshots must not become current fill authority.
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key.clone(),
+                before.generation,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        cache.set_enabled(true);
+        assert_eq!(cache.begin_fetch(cache_key.result_set()), current);
+    }
+
+    #[test]
+    fn cache_toggle_preserves_credential_cursor_and_policy_partitions() {
+        for scope in ["private", "public"] {
+            let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+            let generation = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, scope, None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+            cache.set_enabled(false);
+            cache.set_enabled(true);
+            for different_key in [
+                key("credential-b", None),
+                key("credential-a", Some("")),
+                key_with_revisions("credential-a", None, 2, 1, 1, 1),
+            ] {
+                assert!(matches!(
+                    cache.lookup_at(&different_key, receipt),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+                ));
+            }
+            assert!(matches!(
+                cache.lookup_at(&cache_key, receipt),
+                FinalCacheLookup::Fresh(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn cache_clear_while_disabled_removes_content_and_fences_every_old_fetch() {
+        let (mut cache, cache_key, receipt) = retained_cache_toggle_fixture();
+        let before_disable = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(false);
+        let before_clear = cache.begin_fetch(cache_key.result_set());
+        cache.clear();
+        assert!(!cache.is_enabled());
+        let after_clear = cache.begin_fetch(cache_key.result_set());
+        cache.set_enabled(true);
+        assert!(cache.is_enabled());
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        for captured in [before_disable, before_clear, after_clear] {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    captured,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::InvalidatedDuringFetch
+            );
+        }
+        assert!(matches!(
+            cache.lookup_at(&cache_key, receipt),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                cache_key,
+                current,
+                tools_result(100, "private", None),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+    }
+
+    #[test]
+    fn cache_toggle_exhaustion_clears_entries_and_cannot_reuse_tokens() {
+        for initial_epoch in [u64::MAX - 1, u64::MAX] {
+            let mut cache = FinalResultCache::default();
+            cache.epoch = initial_epoch;
+            let cache_key = key("credential-a", None);
+            let receipt = Instant::now();
+            let old = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    old,
+                    tools_result(100, "private", None),
+                    receipt,
+                ),
+                FinalCacheInsert::Stored
+            );
+            cache.set_enabled(false);
+            if initial_epoch == u64::MAX - 1 {
+                assert!(!cache.epoch_exhausted);
+                assert!(cache.entries.contains_key(&cache_key));
+            }
+            let disabled = cache.begin_fetch(cache_key.result_set());
+            cache.set_enabled(true);
+            assert!(cache.epoch_exhausted);
+            assert!(!cache.is_enabled());
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.retained_bytes, 0);
+            for captured in [old, disabled] {
+                assert_eq!(
+                    cache.insert_if_current_at(
+                        cache_key.clone(),
+                        captured,
+                        tools_result(100, "private", None),
+                        receipt,
+                    ),
+                    FinalCacheInsert::InvalidatedDuringFetch
+                );
+            }
+            for enabled in [false, true, true] {
+                cache.set_enabled(enabled);
+                assert!(!cache.is_enabled());
+                assert_eq!(cache.epoch, u64::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_toggle_keeps_capacity_and_original_eviction_order() {
+        let mut cache = FinalResultCache::new(2);
+        let receipt = Instant::now();
+        let keys = [
+            key("credential-a", None),
+            key("credential-a", Some("page-2")),
+            key("credential-a", Some("page-3")),
+        ];
+        for (cache_key, offset_ms) in keys.iter().take(2).zip(0u64..2) {
+            let generation = cache.begin_fetch(cache_key.result_set());
+            assert_eq!(
+                cache.insert_if_current_at(
+                    cache_key.clone(),
+                    generation,
+                    tools_result(100, "private", None),
+                    receipt + Duration::from_millis(offset_ms),
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+        let retained = cache.retained_bytes;
+        cache.set_enabled(false);
+        cache.set_enabled(true);
+        assert_eq!(cache.retained_bytes, retained);
+        let generation = cache.begin_fetch(keys[2].result_set());
+        assert_eq!(
+            cache.insert_if_current_at(
+                keys[2].clone(),
+                generation,
+                tools_result(100, "private", None),
+                receipt + Duration::from_millis(2),
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.stats().fills, 3);
+        assert_eq!(cache.stats().evictions, 1);
+        assert!(!cache.entries.contains_key(&keys[0]));
+        assert!(cache.entries.contains_key(&keys[1]));
+        assert!(cache.entries.contains_key(&keys[2]));
+        let retained_after = cache.retained_bytes;
+        cache.recount_retained_bytes();
+        assert_eq!(cache.retained_bytes, retained_after);
+        assert!(cache.retained_bytes <= cache.max_bytes);
+    }
+
+    #[test]
+    fn generation_token_cannot_be_reused_for_another_result_set() {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        let wrong_set = cache.begin_fetch(&FinalCacheResultSet::Prompts);
+        assert_eq!(
+            cache.insert_if_current(
+                cache_key.clone(),
+                wrong_set,
+                tools_result(100, "private", None),
+            ),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        let right_set = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(cache_key, right_set, tools_result(100, "private", None)),
+            FinalCacheInsert::Stored
+        );
+    }
+
+    #[test]
+    fn saturated_result_set_revision_rotates_epoch_without_accepting_old_fills() {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        cache
+            .generations
+            .insert(FinalCacheGenerationSet::Tools, u64::MAX);
+        let old = cache.begin_fetch(cache_key.result_set());
+        cache.invalidate_result_set(cache_key.result_set());
+        assert!(cache.is_enabled());
+        assert_eq!(
+            cache.insert_if_current(cache_key.clone(), old, tools_result(100, "private", None)),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        let current = cache.begin_fetch(cache_key.result_set());
+        assert_ne!(old, current);
+        assert_eq!(
+            cache.insert_if_current(cache_key, current, tools_result(100, "private", None)),
+            FinalCacheInsert::Stored
+        );
+        assert_eq!(cache.stats().invalidations, 1);
+    }
+
+    #[test]
+    fn exhausted_lifecycle_epoch_cannot_be_reenabled_or_reuse_tokens() {
+        let mut cache = FinalResultCache::default();
+        let cache_key = key("credential-a", None);
+        cache.epoch = u64::MAX;
+        let old = cache.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(cache_key.clone(), old, tools_result(100, "private", None)),
+            FinalCacheInsert::Stored
+        );
+        cache.clear();
+        cache.set_enabled(true);
+        assert!(!cache.is_enabled());
+        assert_eq!(cache.retained_bytes, 0);
+        assert!(cache.entries.is_empty());
+        assert_eq!(
+            cache.insert_if_current(cache_key.clone(), old, tools_result(100, "private", None)),
+            FinalCacheInsert::InvalidatedDuringFetch
+        );
+        assert!(matches!(
+            cache.lookup(&cache_key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Disabled)
+        ));
+    }
+}

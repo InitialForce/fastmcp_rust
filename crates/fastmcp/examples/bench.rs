@@ -1,7 +1,7 @@
 //! FastMCP Performance Benchmarks
 //!
 //! Simple benchmarks using std::time::Instant to measure performance characteristics.
-//! Run with: `cargo run --example bench --release`
+//! Run with: `cargo run -p fastmcp-rust --example bench --release`
 //!
 //! Measurements:
 //! - Server creation time
@@ -9,10 +9,11 @@
 //! - Protocol message encoding/decoding
 //! - Handler invocation overhead
 //!
-//! Note: For accurate results, always run with --release flag.
+//! Note: Use `--release` for representative optimized local measurements.
 
 use std::time::{Duration, Instant};
 
+use fastmcp_rust::modern::ServerBuilder;
 use fastmcp_rust::prelude::*;
 
 // ============================================================================
@@ -109,7 +110,7 @@ fn bench_server_creation() {
 
     // Minimal server
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0").build();
+    let _server = ServerBuilder::new("bench", "1.0.0").build();
     let minimal = start.elapsed();
     println!(
         "Minimal server (no handlers):      {}",
@@ -118,7 +119,7 @@ fn bench_server_creation() {
 
     // Server with one tool
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0").tool(Noop).build();
+    let _server = ServerBuilder::new("bench", "1.0.0").tool(Noop).build();
     let one_tool = start.elapsed();
     println!(
         "Server with 1 tool:                {}",
@@ -127,7 +128,7 @@ fn bench_server_creation() {
 
     // Server with multiple handlers
     let start = Instant::now();
-    let _server = Server::new("bench", "1.0.0")
+    let _server = ServerBuilder::new("bench", "1.0.0")
         .tool(Noop)
         .tool(BenchEcho)
         .tool(JsonRoundtrip)
@@ -142,7 +143,7 @@ fn bench_server_creation() {
 
     // Stress test: many tools (simulated by repeated registration)
     let start = Instant::now();
-    let mut builder = Server::new("bench", "1.0.0");
+    let mut builder = ServerBuilder::new("bench", "1.0.0");
     for _ in 0..100 {
         builder = builder.tool(Noop);
     }
@@ -484,7 +485,7 @@ fn main() {
     println!("==============================");
     println!();
     println!("Note: Run with --release for accurate results!");
-    println!("      cargo run --example bench --release");
+    println!("      cargo run -p fastmcp-rust --example bench --release");
 
     bench_server_creation();
     bench_json_serialization();

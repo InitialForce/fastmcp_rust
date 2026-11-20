@@ -24,242 +24,250 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
+          toolchain: nightly-2026-08-25
 
-      - name: Setup sibling path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - name: Setup sibling path dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          if (!(Test-Path ..\\asupersync)) {
-            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
-          }
-          if (!(Test-Path ..\\rich_rust)) {
-            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
-          }
-
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.os }}
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --all-features --verbose
+      # FND-01: redis/JWT optional features removed from the default graph;
+      # Redis Tasks remains a later optional work package (TASKR-01).
+      - name: Run default-feature tests
+        run: cargo test --locked --workspace --all-targets --verbose
 
-      - name: Run doc tests
-        run: cargo test --workspace --doc --all-features
+      - name: Run all-feature tests
+        run: cargo test --locked --workspace --all-targets --all-features --verbose
+
+      - name: Prove revived facade E2E binaries reached libtest completion
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          status=0
+          transcript="$(cargo test --locked -p fastmcp-rust \
+            --features testing-lab,legacy-2024-11-05,tasks,proxy \
+            --test e2e_protocol --test e2e_workflow 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+
+          result_for() {
+            local target="$1"
+            printf '%s\n' "$transcript" | awk -v target="$target" '
+              $0 ~ "Running .*" target { active = 1; next }
+              # Consume the entire pipe: early exit can SIGPIPE printf and
+              # reject a valid long transcript under pipefail.
+              active && /^test result: / && !reported { print; reported = 1 }
+            '
+          }
+
+          protocol_result="$(result_for e2e_protocol)"
+          workflow_result="$(result_for e2e_workflow)"
+          case "$protocol_result" in
+            "test result: ok. 163 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'e2e_protocol did not complete its exact 163-test inventory: %s\n' "$protocol_result" >&2; exit 1 ;;
+          esac
+          # Original 79, the worker-stage deadline test, and two public retention tests.
+          case "$workflow_result" in
+            "test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'e2e_workflow did not complete its exact 82-test inventory: %s\n' "$workflow_result" >&2; exit 1 ;;
+          esac
+
+      - name: Prove the shipped CLI and echo server compose under every policy
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          cargo build --locked -p fastmcp-rust \
+            --features legacy-2024-11-05,tasks \
+            --bin echo_server
+          status=0
+          transcript="$(FASTMCP_ECHO_SERVER_BIN="$PWD/target/debug/echo_server" \
+            cargo test --locked -p fastmcp-cli \
+            --features tasks,e2e-fixture \
+            --test e2e_test \
+            -- --include-ignored 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+          result="$(printf '%s\n' "$transcript" | awk '/^test result: / { print; exit }')"
+          case "$result" in
+            "test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"*) ;;
+            *) printf 'CLI E2E proof did not complete its exact 41-test inventory: %s\n' "$result" >&2; exit 1 ;;
+          esac
+
+      - name: Compile renamed facade-only macro consumer
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          status=0
+          transcript="$(cargo test --locked -p fastmcp-rust --test trybuild_tests \
+            renamed_facade_only_consumer_compiles_every_macro_family \
+            -- --exact 2>&1)" || status=$?
+          printf '%s\n' "$transcript"
+          test "$status" -eq 0
+          printf '%s\n' "$transcript" | grep -Fx \
+            'test renamed_facade_only_consumer_compiles_every_macro_family ... ok'
+          result="$(printf '%s\n' "$transcript" | awk '/^test result: / { result = $0 } END { print result }')"
+          case "$result" in
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"*) ;;
+            *) printf 'Renamed facade consumer did not complete its one-test inventory: %s\n' "$result" >&2; exit 1 ;;
+          esac
+
+      - name: Run default-feature doc tests
+        run: cargo test --locked --workspace --doc
+
+      - name: Run all-feature doc tests
+        run: cargo test --locked --workspace --doc --all-features
 
       - name: Upload test trace artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: test-traces-${{ matrix.os }}
           path: |
             crates/**/test_traces/**/*.json
             crates/**/test_traces/**/*.txt
           if-no-files-found: ignore
+          retention-days: 7
 
   check:
     name: Check (all targets)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
+          toolchain: nightly-2026-08-25
 
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Check all targets
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --workspace --all-targets --all-features
 
   coverage:
     name: Coverage (llvm-cov)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-08-25
           components: llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.8.7
+          checksum: true
+          fallback: none
 
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --workspace \
+          set -euo pipefail
+          cargo llvm-cov --locked --all-features --workspace \
             --lcov --output-path lcov.info \
             --fail-under-lines 80
 
       - name: Generate coverage summary JSON
+        # `cargo llvm-cov report` reuses the profraw data already on disk
+        # from the previous step, so we don't re-run the test suite.  The
+        # old `--no-run --no-clean` combo is no longer accepted (cargo-llvm-cov
+        # rejects both flags together as of recent releases).
         run: |
-          cargo llvm-cov --all-features --workspace \
-            --json --summary-only --output-path coverage-summary.json \
-            --no-run --no-clean
+          set -euo pipefail
+          cargo llvm-cov report --json --summary-only \
+            --output-path coverage-summary.json
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-reports
           path: |
             lcov.info
             coverage-summary.json
+          if-no-files-found: error
+          retention-days: 7
 
   security:
     name: Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - uses: dtolnay/rust-toolchain@nightly
+          toolchain: nightly-2026-08-25
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
+          checksum: true
+          fallback: none
 
       - name: Run security audit
-        run: cargo audit || true  # Don't fail CI on advisories in deps
+        # These are unmaintained notices, not vulnerabilities: bincode and
+        # yaml-rust are owned by rich_rust -> syntect, while rustls-pemfile is
+        # owned by asupersync TLS. Remove each exception as soon as that owner
+        # moves off the package. Vulnerability advisories are never ignored.
+        # Yanked chacha20 0.10.1 remains non-fatal until FND-01's exact TCB
+        # source evidence is deliberately rebound; vulnerabilities still fail.
+        run: cargo audit --deny unmaintained --deny unsound --ignore RUSTSEC-2025-0141 --ignore RUSTSEC-2025-0134 --ignore RUSTSEC-2024-0320
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test, check]
+    needs: [lint, test, check, security]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -273,133 +281,67 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
-
-      - name: Setup sibling path dependencies (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - name: Setup sibling path dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $repo = (Get-Location).Path
-          if (!(Test-Path ..\\asupersync)) {
-            New-Item -ItemType Junction -Path ..\\asupersync -Target (Join-Path $repo "deps\\asupersync") | Out-Null
-          }
-          if (!(Test-Path ..\\rich_rust)) {
-            New-Item -ItemType Junction -Path ..\\rich_rust -Target (Join-Path $repo "deps\\rich_rust") | Out-Null
-          }
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-08-25
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: release-${{ matrix.target }}
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --workspace --target "${{ matrix.target }}"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: fastmcp-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/fastmcp*
             !target/${{ matrix.target }}/release/*.d
-          if-no-files-found: ignore
+          if-no-files-found: error
+          retention-days: 7
 
   docs:
     name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
+          toolchain: nightly-2026-08-25
 
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
-
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Build documentation
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: Minimum Rust Version
+    name: Pinned Nightly Contract
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: Dicklesworthstone/asupersync
-          path: deps/asupersync
+          persist-credentials: false
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
+      # FND-01: exact dated nightly is the compiler contract (not floating nightly).
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          repository: Dicklesworthstone/rich_rust
-          path: deps/rich_rust
+          toolchain: nightly-2026-08-25
 
-      - name: Setup sibling path dependencies
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/deps/asupersync" ../asupersync
-          ln -sfn "$GITHUB_WORKSPACE/deps/rich_rust" ../rich_rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      # Using nightly since edition 2024 requires it
-      - uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            deps/asupersync -> deps/asupersync/target
-            deps/rich_rust -> deps/rich_rust/target
-
-      - name: Check MSRV
-        run: cargo check --all-targets
+      - name: Check with pinned toolchain
+        run: cargo check --locked --workspace --all-targets

@@ -10,24 +10,103 @@
 //! - Resource template listing
 //! - Client info propagation
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::task::Poll;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use fastmcp_protocol::Tool;
+use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
+use fastmcp_rust::modern::{MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES};
+use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    McpContext, McpResult, PromptMessage, ResourceContent, ResourceTemplate, Role, Server,
-    ToolHandler, prompt, resource, tool,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CacheScope, CacheTtl,
+    CanonicalHttpUrl, ClientHttpConnectionError, ClientProtocolPlan, CompleteResult, ContentBlock,
+    CoreResult, CoreResultDiscriminatorPolicy, Cx, DecodedResult, FinalCallToolResult,
+    FinalCoreResult, FinalGetPromptResult, FinalPromptMessage, FinalReadResourceResult,
+    FinalResourceReadCacheHintProvenance, FinalTask, FinalTaskInputRequests,
+    FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
+    FinalToolOutcome, HttpServerShutdown, Implementation, InMemoryFinalTaskStore,
+    InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
+    MrtrCompletedInputs, MrtrInputRequest, MrtrInputRequests, Outcome, Prompt, PromptHandler,
+    PromptMessage, ProtocolPolicy, RequestId, Resource, ResourceContent, ResourceHandler,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Role, SseLimits, ToolHandler, Transport, auto,
+    decode_peer_result, legacy_2024, modern, prompt, resource, tool,
 };
+use fastmcp_server::Server;
 use serde_json::json;
+
+#[cfg(feature = "proxy")]
+struct FacadeProxyBoundaryBackend;
+
+#[cfg(feature = "proxy")]
+impl fastmcp_rust::ProxyBackend for FacadeProxyBoundaryBackend {
+    fn list_tools(&mut self) -> McpResult<Vec<fastmcp_rust::Tool>> {
+        Ok(Vec::new())
+    }
+
+    fn list_resources(&mut self) -> McpResult<Vec<fastmcp_rust::Resource>> {
+        Ok(Vec::new())
+    }
+
+    fn list_resource_templates(&mut self) -> McpResult<Vec<fastmcp_rust::ResourceTemplate>> {
+        Ok(Vec::new())
+    }
+
+    fn list_prompts(&mut self) -> McpResult<Vec<fastmcp_rust::Prompt>> {
+        Ok(Vec::new())
+    }
+
+    fn call_tool(
+        &mut self,
+        _name: &str,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<fastmcp_rust::Content>> {
+        Ok(Vec::new())
+    }
+
+    fn call_tool_with_progress(
+        &mut self,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _on_progress: fastmcp_rust::ProxyProgressCallback<'_>,
+    ) -> McpResult<Vec<fastmcp_rust::Content>> {
+        Ok(Vec::new())
+    }
+
+    fn read_resource(&mut self, _uri: &str) -> McpResult<Vec<ResourceContent>> {
+        Ok(Vec::new())
+    }
+
+    fn get_prompt(
+        &mut self,
+        _name: &str,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(Vec::new())
+    }
+}
 
 // ============================================================================
 // Shared handler implementations (macro-based)
 // ============================================================================
 
 /// Echoes back the input.
-#[tool(name = "echo", version = "1.0.0", annotations(read_only, idempotent))]
+#[tool(
+    name = "echo",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Echoes back the input",
+    version = "1.0.0",
+    annotations(read_only, idempotent)
+)]
 fn echo_tool(_ctx: &McpContext, message: String) -> String {
     message
 }
@@ -71,6 +150,9 @@ fn status(_ctx: &McpContext) -> String {
 #[resource(
     uri = "file:///README.md",
     name = "README",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Project README file",
     mime_type = "text/markdown",
     version = "1.0.0",
     tags = ["docs"]
@@ -105,19 +187,87 @@ fn system_prompt_handler() -> Vec<PromptMessage> {
 // Helper: build full workflow server
 // ============================================================================
 
-struct ThreadJoins(Vec<JoinHandle<()>>);
+const MEMORY_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
+/// Caps a runtime-backed fixture's whole lifetime without changing the
+/// existing two-second teardown and cancellation settlement checks.
+const MEMORY_SERVER_LIFETIME_CAP: Duration = Duration::from_secs(30);
+/// How long an overrunning worker is watched before its failure is reported,
+/// only to say whether it finished late or was stuck. It widens no bound.
+const WORKER_OVERRUN_CLASSIFICATION_GRACE: Duration = Duration::from_secs(10);
+
+/// Owns memory-transport server threads until their paired clients close.
+///
+/// Declare this before the client owners so normal and unwinding drops close
+/// the client transports before this bounded settlement runs. A server that
+/// does not stop within the bound fails its own test with a diagnostic; it
+/// never aborts the process, which would destroy every other test's result.
+/// The late thread is detached, not joined, because joining it could block
+/// forever, and a stuck memory-transport server affects only its own pair.
+struct ThreadJoins(Vec<JoinHandle<()>>, Option<WorkerProgress>);
 
 impl ThreadJoins {
     fn new(handles: Vec<JoinHandle<()>>) -> Self {
-        Self(handles)
+        Self(handles, None)
+    }
+
+    fn with_worker_progress(progress: WorkerProgress) -> Self {
+        Self(Vec::new(), Some(progress))
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.0.push(handle);
     }
 }
 
 impl Drop for ThreadJoins {
     fn drop(&mut self) {
-        for handle in self.0.drain(..) {
-            assert!(handle.join().is_ok(), "server thread panicked");
+        let started = self
+            .1
+            .as_ref()
+            .map_or_else(Instant::now, |progress| progress.advance("server teardown"));
+        let deadline = started + MEMORY_SERVER_TEARDOWN_BOUND;
+        while self.0.iter().any(|handle| !handle.is_finished()) {
+            if Instant::now() >= deadline {
+                self.0.clear();
+                fail_fixture(&format!(
+                    "memory-transport server teardown exceeded its bounded settlement window in {:?}",
+                    thread::current().name()
+                ));
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
+        // Join every handle before deciding; `any` would stop joining at the
+        // first panic and leave the remaining threads unjoined.
+        let panicked = self
+            .0
+            .drain(..)
+            .map(|handle| handle.join().is_err())
+            .collect::<Vec<_>>()
+            .contains(&true);
+        if panicked {
+            fail_fixture(&format!(
+                "memory-transport server thread panicked during settlement in {:?}",
+                thread::current().name()
+            ));
+            return;
+        }
+        if let Some(progress) = &self.1 {
+            progress.advance("worker return");
+        }
+    }
+}
+
+/// Fails the current test with `diagnostic`, or only reports it when the test
+/// is already unwinding, since a second panic would abort the whole process.
+fn fail_fixture(diagnostic: &str) {
+    if std::thread::panicking() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "{diagnostic} (while already panicking)"
+        );
+    } else {
+        panic!("{diagnostic}");
     }
 }
 
@@ -126,6 +276,269 @@ where
     T: Send + 'static,
 {
     std::thread::spawn(f)
+}
+
+fn spawn_runtime_server<T>(server: Server, transport: T, owner: &'static str) -> JoinHandle<()>
+where
+    T: Transport + Send + 'static,
+{
+    spawn_thread(move || {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("workflow E2E server reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("workflow E2E server runtime builds");
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("workflow E2E runtime installs an ambient Cx");
+            match cx.spawn_blocking(move |pump_cx| {
+                let result = server.run_transport_returning_with_cx(&pump_cx, transport);
+                let _ = result_tx.send(result);
+            }) {
+                Ok(_pump) => {
+                    let deadline = cx.now().saturating_add_nanos(
+                        u64::try_from(MEMORY_SERVER_LIFETIME_CAP.as_nanos())
+                            .expect("workflow E2E server bound fits in nanoseconds"),
+                    );
+                    loop {
+                        match result_rx.try_recv() {
+                            Ok(result) => {
+                                result.unwrap_or_else(|error| panic!("{owner}: {error}"));
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                panic!("{owner}: server exited without reporting its result")
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
+                                if asupersync::time::timeout_at(
+                                    deadline,
+                                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    panic!("{owner}: server did not settle within its bound")
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => panic!("{owner}: server runtime admission failed: {error}"),
+            }
+        });
+    })
+}
+
+struct WorkerStage {
+    started: Instant,
+    name: &'static str,
+    expired: Option<&'static str>,
+}
+
+impl WorkerStage {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            // The clock starts before the worker thread exists, so this first
+            // stage covers thread spawn and server runtime startup. Workers
+            // advance to "client initialization" when the RPC itself begins.
+            name: "worker startup",
+            expired: None,
+        }
+    }
+
+    fn check(&mut self, now: Instant) -> Option<&'static str> {
+        if now.saturating_duration_since(self.started) >= MEMORY_SERVER_TEARDOWN_BOUND {
+            self.expired.get_or_insert(self.name);
+        }
+        self.expired
+    }
+
+    fn advance(&mut self, now: Instant, name: &'static str) {
+        // A late return must not erase an overrun between supervisor polls.
+        self.check(now);
+        self.started = now;
+        self.name = name;
+    }
+}
+
+#[derive(Clone)]
+struct WorkerProgress(Arc<std::sync::Mutex<WorkerStage>>);
+
+impl WorkerProgress {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(WorkerStage::new(
+            Instant::now(),
+        ))))
+    }
+
+    fn advance(&self, name: &'static str) -> Instant {
+        let mut stage = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        stage.advance(now, name);
+        now
+    }
+
+    fn expired(&self, finished: bool, observed_at: Instant) -> Option<&'static str> {
+        let mut stage = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if finished {
+            stage.expired
+        } else {
+            stage.check(observed_at)
+        }
+    }
+}
+
+/// Retains every concurrent test worker until all of them have crossed a
+/// bounded stage and joined teardown. Only real RPC completions advance a
+/// worker's stage; waiting never refreshes its deadline. If one worker panics,
+/// the remaining owners still settle before that first panic is resumed.
+struct WorkerJoins<T>(Vec<(JoinHandle<T>, WorkerProgress)>);
+
+impl<T> WorkerJoins<T> {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn push(&mut self, handle: JoinHandle<T>, progress: WorkerProgress) {
+        self.0.push((handle, progress));
+    }
+
+    /// Waits for every worker. A stage overrun is returned as a diagnostic,
+    /// never an abort, so one stalled worker cannot hide the rest of the
+    /// target's results. The overrunning worker gets a grace period only to
+    /// classify the overrun as late or stuck; a late finish still fails,
+    /// because the stage bound is the assertion.
+    fn wait(&self, owner: &str) -> Result<(), String> {
+        loop {
+            let mut all_finished = true;
+            for (index, (handle, progress)) in self.0.iter().enumerate() {
+                // Sample time before completion, so descheduling after the
+                // completion read cannot expire a worker that has since exited.
+                let observed_at = Instant::now();
+                let finished = handle.is_finished();
+                if let Some(stage) = progress.expired(finished, observed_at) {
+                    let grace_end = observed_at + WORKER_OVERRUN_CLASSIFICATION_GRACE;
+                    while !handle.is_finished() && Instant::now() < grace_end {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    let outcome = if handle.is_finished() {
+                        format!(
+                            "it finished {:?} after the overrun was observed",
+                            observed_at.elapsed()
+                        )
+                    } else {
+                        format!(
+                            "it was still running {WORKER_OVERRUN_CLASSIFICATION_GRACE:?} later (stuck)"
+                        )
+                    };
+                    return Err(format!(
+                        "{owner} {index} exceeded its bounded {stage} stage in {:?}; {outcome}",
+                        thread::current().name()
+                    ));
+                }
+                all_finished &= finished;
+            }
+            if all_finished {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Fails the test for an overrun after detaching every worker, since a
+    /// stuck worker cannot be joined without blocking forever.
+    fn fail_detached(&mut self, diagnostic: &str) {
+        self.0.clear();
+        fail_fixture(diagnostic);
+    }
+
+    fn join_all(mut self, owner: &str) -> Vec<T> {
+        if let Err(diagnostic) = self.wait(owner) {
+            self.fail_detached(&diagnostic);
+        }
+        let mut values = Vec::with_capacity(self.0.len());
+        let mut first_panic = None;
+        for (handle, _) in self.0.drain(..) {
+            match handle.join() {
+                Ok(value) => values.push(value),
+                Err(payload) if first_panic.is_none() => first_panic = Some(payload),
+                Err(_) => {}
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+        values
+    }
+}
+
+impl<T> Drop for WorkerJoins<T> {
+    fn drop(&mut self) {
+        if let Err(diagnostic) = self.wait("concurrent E2E worker") {
+            self.fail_detached(&diagnostic);
+            return;
+        }
+        let mut first_panic = None;
+        for (handle, _) in self.0.drain(..) {
+            match handle.join() {
+                Ok(_) => {}
+                Err(payload) if first_panic.is_none() => first_panic = Some(payload),
+                Err(_) => {}
+            }
+        }
+        if !std::thread::panicking() {
+            if let Some(payload) = first_panic {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_stage_deadlines_preserve_progress_and_latch_late_completion() {
+    let start = Instant::now();
+    for slow_rpc in [false, true] {
+        let mut stage = WorkerStage::new(start);
+        stage.advance(start + Duration::from_secs(1), "RPC");
+        let completion = start
+            + if slow_rpc {
+                Duration::from_millis(3_001)
+            } else {
+                Duration::from_secs(2)
+            };
+        // Only the RPC duration changes. No supervisor poll sees its return.
+        stage.advance(completion, "server teardown");
+        stage.advance(completion + Duration::from_secs(1), "worker return");
+        assert_eq!(stage.expired, slow_rpc.then_some("RPC"));
+        let progress = WorkerProgress(Arc::new(std::sync::Mutex::new(stage)));
+        assert_eq!(
+            progress.expired(true, completion + Duration::from_secs(100)),
+            slow_rpc.then_some("RPC"),
+            "finished workers retain stage failures but do not acquire new timeouts"
+        );
+        let mut stage = progress.0.lock().unwrap();
+        // The healthy workload exceeds two seconds in aggregate. Repeated
+        // observer checks do not extend its final stage or clear a prior fault.
+        assert_eq!(
+            stage.check(completion + Duration::from_millis(1_500)),
+            slow_rpc.then_some("RPC")
+        );
+        assert_eq!(
+            stage.check(completion + Duration::from_secs(3)),
+            Some(if slow_rpc { "RPC" } else { "worker return" })
+        );
+    }
 }
 
 struct TestHarness {
@@ -176,7 +589,10 @@ fn setup_workflow_server() -> TestHarness {
         .resource(StatusResource)
         .resource(ReadmeResource)
         .resource_template(ResourceTemplate {
-            uri_template: "file:///{path}".to_string(),
+            // A modern exact resource may not be shadowed by a template, and
+            // this server registers the exact `file:///README.md`. Namespace
+            // the template so it admits without colliding.
+            uri_template: "file:///files/{path}".to_string(),
             name: "File Path".to_string(),
             description: Some("Access files by path".to_string()),
             mime_type: None,
@@ -188,11 +604,584 @@ fn setup_workflow_server() -> TestHarness {
         .prompt(SystemPromptHandlerPrompt)
         .build();
 
-    let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
+}
+
+const CALLER_OWNED_LIFECYCLE_TOOL: &str = "caller_owned_lifecycle_tool";
+
+/// A real handler whose call count makes era admission observable before any
+/// handler state can be mutated.
+struct CallerOwnedLifecycleTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for CallerOwnedLifecycleTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: CALLER_OWNED_LIFECYCLE_TOOL.to_owned(),
+            description: Some("counts caller-owned lifecycle test calls".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![Content::text("caller-owned lifecycle call")])
+    }
+}
+
+fn lifecycle_modern_opening(id: i64) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest::new(
+        "server/discover",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        id,
+    ))
+}
+
+fn lifecycle_legacy_opening(id: i64) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest::new(
+        "initialize",
+        Some(json!({
+            "protocolVersion": legacy_2024::PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "caller-owned-lifecycle-peer", "version": "1.0.0"},
+        })),
+        id,
+    ))
+}
+
+fn lifecycle_tool_request(id: i64, modern_era: bool) -> JsonRpcMessage {
+    let mut params = json!({
+        "name": CALLER_OWNED_LIFECYCLE_TOOL,
+        "arguments": {},
+    });
+    if modern_era {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+    }
+    JsonRpcMessage::Request(JsonRpcRequest::new("tools/call", Some(params), id))
+}
+
+fn lifecycle_response(
+    peer: &mut fastmcp_rust::memory::MemoryTransport,
+    cx: &Cx,
+    id: i64,
+    description: &str,
+) -> JsonRpcResponse {
+    let JsonRpcMessage::Response(response) = peer
+        .recv(cx)
+        .unwrap_or_else(|error| panic!("{description}: peer did not receive a response: {error}"))
+    else {
+        panic!("{description}: peer received a request instead of a response");
+    };
+    assert_eq!(response.id, Some(id.into()), "{description}: response id");
+    response
+}
+
+/// Couples a live peer with its worker so assertions cannot detach the worker
+/// on an unwind path. The peer is dropped before `ThreadJoins`, which makes
+/// EOF available before its bounded settlement runs.
+struct LifecycleThreadHarness {
+    peer: Option<fastmcp_rust::memory::MemoryTransport>,
+    joins: ThreadJoins,
+    outcome: mpsc::Receiver<McpResult<()>>,
+    controller_cx: Cx,
+}
+
+impl LifecycleThreadHarness {
+    fn spawn<F>(runner: F) -> Self
+    where
+        F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+    {
+        let (peer, server_transport) = fastmcp_rust::memory::create_memory_transport_pair();
+        let (outcome_tx, outcome) = mpsc::channel();
+        let (controller_cx_tx, controller_cx_rx) = mpsc::sync_channel(1);
+        let handle = spawn_thread(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("lifecycle E2E server reactor initializes"),
+                )
+                .blocking_threads(4, 64)
+                .build()
+                .expect("lifecycle E2E server runtime builds");
+            let (pump_done_tx, pump_done_rx) = mpsc::sync_channel(1);
+
+            runtime.block_on(async move {
+                let runtime_cx =
+                    Cx::current().expect("lifecycle E2E runtime installs an ambient Cx");
+                let admission_tx = controller_cx_tx.clone();
+                let outcome_tx = outcome_tx.clone();
+                let admission = runtime_cx.spawn_blocking(move |pump_cx| {
+                    let _ = admission_tx.send(Ok(pump_cx.clone()));
+                    let result = runner(&pump_cx, server_transport);
+                    // This must be unbounded: an assertion can unwind before
+                    // it observes the result, and the worker must still be
+                    // able to exit so the RAII join guard can settle it.
+                    let _ = outcome_tx.send(result);
+                    let _ = pump_done_tx.send(());
+                });
+                if let Err(error) = admission {
+                    let _ = controller_cx_tx.send(Err(error.to_string()));
+                    panic!("lifecycle E2E server runtime admission failed: {error}");
+                }
+
+                let deadline = runtime_cx.now().saturating_add_nanos(
+                    u64::try_from(MEMORY_SERVER_LIFETIME_CAP.as_nanos())
+                        .expect("lifecycle E2E server bound fits in nanoseconds"),
+                );
+                loop {
+                    match pump_done_rx.try_recv() {
+                        Ok(()) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            panic!("lifecycle E2E server exited without reporting completion")
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if asupersync::time::timeout_at(
+                                deadline,
+                                asupersync::time::sleep(runtime_cx.now(), Duration::from_millis(1)),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                panic!("lifecycle E2E server did not settle within its bound")
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let controller_cx = controller_cx_rx
+            .recv()
+            .unwrap_or_else(|error| panic!("lifecycle E2E server did not publish its Cx: {error}"))
+            .unwrap_or_else(|error| panic!("lifecycle E2E server admission failed: {error}"));
+        Self {
+            peer: Some(peer),
+            joins: ThreadJoins::new(vec![handle]),
+            outcome,
+            controller_cx,
+        }
+    }
+
+    fn spawn_detached<F>(cx: &Cx, runner: F) -> Self
+    where
+        F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+    {
+        let (peer, server_transport) = fastmcp_rust::memory::create_memory_transport_pair();
+        // This must be unbounded: an assertion can unwind before it observes
+        // the result, and the worker must still be able to exit so the RAII
+        // join guard can settle it instead of waiting on a blocked send.
+        let (outcome_tx, outcome) = mpsc::channel();
+        let server_cx = cx.clone();
+        let handle = spawn_thread(move || {
+            let _ = outcome_tx.send(runner(&server_cx, server_transport));
+        });
+        Self {
+            peer: Some(peer),
+            joins: ThreadJoins::new(vec![handle]),
+            outcome,
+            controller_cx: cx.clone(),
+        }
+    }
+
+    fn controller_cx(&self) -> Cx {
+        self.controller_cx.clone()
+    }
+
+    fn peer_mut(&mut self) -> &mut fastmcp_rust::memory::MemoryTransport {
+        self.peer
+            .as_mut()
+            .expect("lifecycle peer must remain owned")
+    }
+
+    /// Closes the peer first (EOF), then waits for the server's bounded
+    /// outcome. Use when the server is expected to still be serving.
+    fn close_peer_and_settle(mut self, owner: &str) -> McpResult<()> {
+        self.peer.take();
+        self.settle(owner)
+    }
+
+    fn settle(mut self, owner: &str) -> McpResult<()> {
+        let outcome = self
+            .outcome
+            .recv_timeout(MEMORY_SERVER_TEARDOWN_BOUND)
+            .unwrap_or_else(|error| panic!("{owner} did not report a bounded result: {error}"));
+        self.peer.take();
+        drop(self);
+        outcome
+    }
+}
+
+impl Drop for LifecycleThreadHarness {
+    fn drop(&mut self) {
+        // Fields then drop in declaration order: peer (closed) before joins.
+        self.peer.take();
+    }
+}
+
+fn assert_lifecycle_opening(
+    peer: &mut fastmcp_rust::memory::MemoryTransport,
+    cx: &Cx,
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+) {
+    peer.send(cx, &opening)
+        .unwrap_or_else(|error| panic!("{facade}: send era-correct opening: {error}"));
+    let opening_response = lifecycle_response(peer, cx, 1, "era-correct opening response");
+    assert!(
+        opening_response.error.is_none(),
+        "{facade}: era-correct opening must succeed: {opening_response:?}"
+    );
+    let opening_result = opening_response
+        .result
+        .as_ref()
+        .expect("era-correct opening must carry a result");
+    if opening_is_modern {
+        assert_eq!(opening_result["resultType"], json!("complete"));
+        assert_eq!(
+            opening_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!(server_name),
+            "{facade}: final discovery must identify its facade server"
+        );
+    } else {
+        assert_eq!(
+            opening_result["protocolVersion"],
+            json!(legacy_2024::PROTOCOL_VERSION),
+            "{facade}: exact-2024 initialize response must pin 2024-11-05"
+        );
+    }
+}
+
+fn assert_live_facade_era_admission<F>(
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+    calls: Arc<AtomicUsize>,
+    runner: F,
+) where
+    F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+{
+    let mut harness = LifecycleThreadHarness::spawn(runner);
+    let cx = harness.controller_cx();
+
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        facade,
+        server_name,
+        opening,
+        opening_is_modern,
+    );
+
+    if !opening_is_modern {
+        harness
+            .peer_mut()
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+            )
+            .unwrap_or_else(|error| panic!("{facade}: send exact-2024 initialized: {error}"));
+    }
+
+    // RH-5: the accepted request and the refused request below have the same
+    // id, method, tool name, and arguments. Only the prohibited era metadata
+    // changes, so the counter is an unchanged-state proof of early refusal.
+    harness
+        .peer_mut()
+        .send(&cx, &lifecycle_tool_request(2, opening_is_modern))
+        .unwrap_or_else(|error| panic!("{facade}: send era-correct tool request: {error}"));
+    let accepted = lifecycle_response(harness.peer_mut(), &cx, 2, "era-correct tool response");
+    assert!(
+        accepted.error.is_none(),
+        "{facade}: era-correct tool request must reach the handler: {accepted:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "{facade}: era-correct tool request must mutate the real handler exactly once"
+    );
+    let expected_result_type = opening_is_modern.then(|| json!("complete"));
+    assert_eq!(
+        accepted
+            .result
+            .as_ref()
+            .and_then(|result| result.get("resultType")),
+        expected_result_type.as_ref(),
+        "{facade}: successful tool response must retain its era-specific framing"
+    );
+
+    harness
+        .peer_mut()
+        .send(&cx, &lifecycle_tool_request(2, !opening_is_modern))
+        .unwrap_or_else(|error| panic!("{facade}: send opposite-era tool request: {error}"));
+    let refused = lifecycle_response(harness.peer_mut(), &cx, 2, "opposite-era refusal response");
+    let error = refused
+        .error
+        .as_ref()
+        .expect("opposite-era request must receive a JSON-RPC refusal");
+    if opening_is_modern {
+        // MCP 2026-07-28 admits every request on its own `_meta` (SEP-2575):
+        // a request missing the required protocol version is invalid params,
+        // answered statelessly, and never ends the connection.
+        assert_eq!(
+            error.code.as_i32(),
+            Some(McpErrorCode::InvalidParams.into()),
+            "{facade}: a modern connection answers a request without `_meta` with -32602"
+        );
+    } else {
+        assert_eq!(
+            error.code.as_i32(),
+            Some(McpErrorCode::InvalidRequest.into())
+        );
+        assert_eq!(
+            error.message,
+            "Request does not match the connection's negotiated MCP protocol era"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "{facade}: opposite-era refusal must not mutate the handler"
+    );
+    if opening_is_modern {
+        // The same connection still serves the next era-correct request.
+        harness
+            .peer_mut()
+            .send(&cx, &lifecycle_tool_request(3, true))
+            .unwrap_or_else(|error| panic!("{facade}: send post-refusal tool request: {error}"));
+        let resumed = lifecycle_response(harness.peer_mut(), &cx, 3, "post-refusal tool response");
+        assert!(
+            resumed.error.is_none(),
+            "{facade}: a refused modern request must not end the connection: {resumed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        harness
+            .close_peer_and_settle("caller-owned facade modern refusal")
+            .unwrap_or_else(|error| {
+                panic!("{facade}: modern connection must settle cleanly at EOF: {error:?}")
+            });
+    } else {
+        let outcome = harness.settle("caller-owned facade era refusal");
+        assert!(
+            outcome.is_err(),
+            "{facade}: opposite-era refusal must terminate the exact-2024 connection"
+        );
+    }
+}
+
+fn assert_live_facade_cancellation<F>(
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+    runner: F,
+) where
+    F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+{
+    let mut harness = LifecycleThreadHarness::spawn(runner);
+    let cx = harness.controller_cx();
+
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        facade,
+        server_name,
+        opening,
+        opening_is_modern,
+    );
+    if !opening_is_modern {
+        harness
+            .peer_mut()
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+            )
+            .unwrap_or_else(|error| panic!("{facade}: send exact-2024 initialized: {error}"));
+    }
+
+    // Keep the peer open through cancellation settlement: the completed
+    // worker must have observed this exact caller Cx rather than peer EOF.
+    cx.set_cancel_requested(true);
+    assert!(
+        cx.is_cancel_requested(),
+        "{facade}: cancellation must be requested on the caller-owned Cx"
+    );
+    let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
+    while !harness.joins.0[0].is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "{facade}: caller-owned cancellation exceeded its bounded settlement window"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let outcome = harness.settle("caller-owned facade cancellation");
+    outcome.unwrap_or_else(|error| {
+        panic!("{facade}: cancellation of the supplied Cx must settle cleanly: {error}")
+    });
+}
+
+#[test]
+fn public_facade_servers_forward_caller_owned_structured_lifecycles() {
+    // These function-item references prove the terminal, caller-owned stdio
+    // entry point remains available from every policy-pinned facade. The
+    // returning transport checks below are the runtime proof because they can
+    // settle without terminating the test process.
+    let _ = auto::Server::run_stdio_with_cx;
+    let _ = modern::Server::run_stdio_with_cx;
+    let _ = legacy_2024::Server::run_stdio_with_cx;
+
+    let auto_calls = Arc::new(AtomicUsize::new(0));
+    let auto_handler_calls = Arc::clone(&auto_calls);
+    assert_live_facade_era_admission(
+        "Auto facade",
+        "facade-auto-lifecycle",
+        lifecycle_modern_opening(1),
+        true,
+        auto_calls,
+        move |cx, transport| {
+            auto::server_builder("facade-auto-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: auto_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "Auto facade",
+        "facade-auto-cancellation",
+        lifecycle_modern_opening(1),
+        true,
+        |cx, transport| {
+            auto::server_builder("facade-auto-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+
+    let modern_calls = Arc::new(AtomicUsize::new(0));
+    let modern_handler_calls = Arc::clone(&modern_calls);
+    assert_live_facade_era_admission(
+        "modern facade",
+        "facade-modern-lifecycle",
+        lifecycle_modern_opening(1),
+        true,
+        modern_calls,
+        move |cx, transport| {
+            modern::server_builder("facade-modern-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: modern_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "modern facade",
+        "facade-modern-cancellation",
+        lifecycle_modern_opening(1),
+        true,
+        |cx, transport| {
+            modern::server_builder("facade-modern-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let legacy_handler_calls = Arc::clone(&legacy_calls);
+    assert_live_facade_era_admission(
+        "exact-2024 facade",
+        "facade-legacy-lifecycle",
+        lifecycle_legacy_opening(1),
+        false,
+        legacy_calls,
+        move |cx, transport| {
+            legacy_2024::server_builder("facade-legacy-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: legacy_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "exact-2024 facade",
+        "facade-legacy-cancellation",
+        lifecycle_legacy_opening(1),
+        false,
+        |cx, transport| {
+            legacy_2024::server_builder("facade-legacy-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn public_facade_proxy_builders_preserve_pinned_eras() {
+    // Compile-proof every advertised proxy registration path from each public
+    // builder. The runtime checks below exercise the policy boundaries before
+    // the unbound fixture backend can be consulted.
+    let _ = auto::ServerBuilder::proxy;
+    let _ = auto::ServerBuilder::as_proxy;
+    let _ = auto::ServerBuilder::as_proxy_raw;
+    let _ = auto::ServerBuilder::proxy_typed;
+    let _ = auto::ServerBuilder::as_proxy_typed;
+    let _ = modern::ServerBuilder::proxy;
+    let _ = modern::ServerBuilder::as_proxy;
+    let _ = modern::ServerBuilder::as_proxy_raw;
+    let _ = modern::ServerBuilder::proxy_typed;
+    let _ = modern::ServerBuilder::as_proxy_typed;
+    let _ = legacy_2024::ServerBuilder::proxy;
+    let _ = legacy_2024::ServerBuilder::as_proxy;
+    let _ = legacy_2024::ServerBuilder::as_proxy_raw;
+    let _ = legacy_2024::ServerBuilder::proxy_typed;
+    let _ = legacy_2024::ServerBuilder::as_proxy_typed;
+
+    let legacy_catalog = fastmcp_rust::ProxyCatalog {
+        tool_catalog_era: Some(fastmcp_rust::ProtocolEra::Legacy2024),
+        ..Default::default()
+    };
+    assert!(
+        modern::server_builder("facade-modern-proxy", "1.0.0")
+            .proxy(
+                fastmcp_rust::ProxyClient::from_backend(FacadeProxyBoundaryBackend),
+                legacy_catalog,
+            )
+            .is_err()
+    );
+
+    let final_catalog = fastmcp_rust::ProxyCatalog {
+        tool_catalog_era: Some(fastmcp_rust::ProtocolEra::Modern2026),
+        ..Default::default()
+    };
+    assert!(
+        legacy_2024::server_builder("facade-legacy-proxy", "1.0.0")
+            .proxy(
+                fastmcp_rust::ProxyClient::from_backend(FacadeProxyBoundaryBackend),
+                final_catalog,
+            )
+            .is_err()
+    );
 }
 
 // ============================================================================
@@ -230,25 +1219,25 @@ fn workflow_complete_lifecycle() {
         .call_tool("echo", json!({"message": "workflow test"}))
         .unwrap();
     assert!(
-        matches!(echo_result.first(), Some(Content::Text { .. })),
+        matches!(echo_result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = echo_result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = echo_result.first() else {
         return;
     };
     assert_eq!(text, "workflow test");
 
     let status = client.read_resource("app://status").unwrap();
-    let status_json: serde_json::Value =
-        serde_json::from_str(status[0].text.as_ref().unwrap()).unwrap();
+    let text = require_legacy_text(&status[0], "app://status");
+    let status_json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(status_json["status"], "healthy");
 
     let mut args = HashMap::new();
     args.insert("topic".to_string(), "MCP protocol".to_string());
     let help = client.get_prompt("help", args).unwrap();
+    let LegacyPromptMessage { content, .. } = &help[0];
     assert!(
-        help[0]
-            .content
+        content
             .as_text()
             .is_some_and(|t| t.contains("MCP protocol"))
     );
@@ -303,10 +1292,10 @@ fn workflow_error_recovery_continues_after_tool_error() {
         .call_tool("fail_on_demand", json!({"fail": false}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "Success");
@@ -322,10 +1311,10 @@ fn workflow_error_recovery_continues_after_tool_error() {
         .call_tool("echo", json!({"message": "still alive"}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "still alive");
@@ -375,10 +1364,10 @@ fn workflow_unknown_tool_doesnt_break_session() {
         .call_tool("echo", json!({"message": "after"}))
         .unwrap();
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "after");
@@ -399,7 +1388,8 @@ fn workflow_unknown_resource_doesnt_break_session() {
 
     // Read a valid resource again (should still work)
     let content = client.read_resource("file:///README.md").unwrap();
-    assert!(content[0].text.as_ref().unwrap().contains("Test Project"));
+    let text = require_legacy_text(&content[0], "file:///README.md");
+    assert!(text.contains("Test Project"));
 }
 
 // ============================================================================
@@ -418,10 +1408,10 @@ fn workflow_sequential_clients_same_server() {
             .call_tool("echo", json!({"message": format!("client-{i}")}))
             .unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("client-{i}"));
@@ -432,35 +1422,34 @@ fn workflow_sequential_clients_same_server() {
 
 #[test]
 fn workflow_two_independent_servers() {
+    // Raw client transports must also close before server settlement on unwind.
+    let mut server_joins = ThreadJoins::new(Vec::new());
+
     // Server A: tools only
     let (builder_a, client_a_transport, server_a_transport) = TestServer::builder()
         .with_name("server-a")
         .build_server_builder();
     let server_a = builder_a.tool(EchoTool).build();
-    let handle_a = spawn_thread(move || {
-        server_a.run_transport_returning(server_a_transport);
-    });
+    let handle_a = spawn_runtime_server(server_a, server_a_transport, "server A loop");
+    server_joins.push(handle_a);
 
     // Server B: resources only
     let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
         .with_name("server-b")
         .build_server_builder();
     let server_b = builder_b.resource(StatusResource).build();
-    let handle_b = spawn_thread(move || {
-        server_b.run_transport_returning(server_b_transport);
-    });
-
-    let _joins = ThreadJoins::new(vec![handle_a, handle_b]);
+    let handle_b = spawn_runtime_server(server_b, server_b_transport, "server B loop");
+    server_joins.push(handle_b);
 
     // Client A
-    let mut client_a = TestClient::new(client_a_transport);
+    let mut client_a = TestClient::new(client_a_transport, Cx::for_testing());
     let init_a = client_a.initialize().unwrap();
     assert_eq!(init_a.server_info.name, "server-a");
     assert!(init_a.capabilities.tools.is_some());
     assert!(init_a.capabilities.resources.is_none());
 
     // Client B
-    let mut client_b = TestClient::new(client_b_transport);
+    let mut client_b = TestClient::new(client_b_transport, Cx::for_testing());
     let init_b = client_b.initialize().unwrap();
     assert_eq!(init_b.server_info.name, "server-b");
     assert!(init_b.capabilities.tools.is_none());
@@ -471,10 +1460,10 @@ fn workflow_two_independent_servers() {
         .call_tool("echo", json!({"message": "from A"}))
         .unwrap();
     assert!(
-        matches!(echo.first(), Some(Content::Text { .. })),
+        matches!(echo.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = echo.first() else {
+    let Some(LegacyContent::Text { text, .. }) = echo.first() else {
         return;
     };
     assert_eq!(text, "from A");
@@ -509,15 +1498,15 @@ fn workflow_get_prompt_without_arguments() {
 
     let messages = client.get_prompt("system_prompt", HashMap::new()).unwrap();
     assert_eq!(messages.len(), 1);
-    assert!(matches!(messages[0].role, Role::Assistant));
-    let Some(first) = messages.first() else {
+    let Some(LegacyPromptMessage { role, content, .. }) = messages.first() else {
         return;
     };
+    assert!(matches!(*role, Role::Assistant));
     assert!(
-        matches!(&first.content, Content::Text { .. }),
+        matches!(content, LegacyContent::Text { .. }),
         "expected text content"
     );
-    let Content::Text { text } = &first.content else {
+    let LegacyContent::Text { text, .. } = content else {
         return;
     };
     assert!(text.contains("helpful assistant"));
@@ -537,10 +1526,10 @@ fn workflow_many_sequential_tool_calls() {
         let msg = format!("message-{i}");
         let result = client.call_tool("echo", json!({"message": msg})).unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &msg);
@@ -559,10 +1548,10 @@ fn workflow_interleaved_list_and_call() {
 
         let result = client.call_tool("counter", json!({"value": 42})).unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, "42");
@@ -587,12 +1576,10 @@ fn workflow_server_name_and_version() {
         .build_server_builder();
 
     let server = builder.tool(EchoTool).build();
-    let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     let init = client.initialize().unwrap();
 
     assert_eq!(init.server_info.name, "custom-name");
@@ -605,12 +1592,10 @@ fn workflow_capabilities_match_handlers() {
         TestServer::builder().build_server_builder();
 
     let server = builder.tool(EchoTool).resource(StatusResource).build();
-    let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     let init = client.initialize().unwrap();
 
     // Has tools and resources, but NOT prompts
@@ -629,13 +1614,11 @@ fn workflow_custom_client_info_accepted() {
         TestServer::builder().build_server_builder();
 
     let server = builder.tool(EchoTool).build();
-    let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
-    });
+    let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client =
-        TestClient::new(client_transport).with_client_info("my-custom-client", "5.0.0");
+    let mut client = TestClient::new(client_transport, Cx::for_testing())
+        .with_client_info("my-custom-client", "5.0.0");
 
     // Should initialize successfully with custom client info
     let init = client.initialize().unwrap();
@@ -708,14 +1691,14 @@ fn workflow_prompt_arguments_preserved() {
 // Content type helper for assertions
 // ============================================================================
 
-trait ContentExt {
+trait LegacyContentExt {
     fn as_text(&self) -> Option<&str>;
 }
 
-impl ContentExt for Content {
+impl LegacyContentExt for LegacyContent {
     fn as_text(&self) -> Option<&str> {
         match self {
-            Content::Text { text } => Some(text),
+            LegacyContent::Text { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -725,657 +1708,2176 @@ impl ContentExt for Content {
 // Background Tasks E2E Tests (bd-og1)
 // ============================================================================
 
-use fastmcp_rust::TaskManager;
+// ============================================================================
+// Final Tasks public-facade HTTP E2E tests
+// ============================================================================
 
-/// Helper: build a server with background task support.
-fn setup_task_server() -> TestHarness {
-    let (builder, client_transport, server_transport) = TestServer::builder()
-        .with_name("task-test-server")
-        .with_version("1.0.0")
-        .build_server_builder();
+/// Per-operation and teardown budget. Every individual client request, the
+/// readiness handshake, and the settle path must complete within this, so it
+/// is the bound that actually asserts responsiveness.
+const FINAL_TASKS_E2E_BOUND: Duration = Duration::from_secs(2);
+const FINAL_TASKS_HTTP_RESPONSE_MAX_BYTES: usize = 1 << 20;
+/// Whole-lifetime cap on the fixture's server task. This is an anti-hang
+/// guard, not a latency assertion: it must exceed the total duration of the
+/// longest test that drives this fixture (a full Tasks create/poll/
+/// input-required/resume/cancel sequence over HTTP), or the server is killed
+/// mid-test and every in-flight request fails as cancelled. It was 4s, which
+/// the lifecycle test legitimately exceeds; the per-operation bound above is
+/// what keeps the test honest about responsiveness.
+const FINAL_TASKS_SERVER_BOUND: Duration = Duration::from_secs(120);
 
-    // Create task manager and register handlers
-    let task_manager = TaskManager::new();
-
-    // Register a simple counter task that completes quickly
-    task_manager.register_handler("quick_task", |_cx, params| async move {
-        let value = params.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
-        Ok(serde_json::json!({"result": value * 2}))
-    });
-
-    // Register a long-running task that can report progress
-    task_manager.register_handler("progress_task", |_cx, params| async move {
-        let steps = params.get("steps").and_then(|v| v.as_i64()).unwrap_or(3) as usize;
-        // Simulate work by returning after "steps" iterations
-        Ok(serde_json::json!({"completed_steps": steps}))
-    });
-
-    // Register a task that fails
-    task_manager.register_handler("failing_task", |_cx, _params| async move {
-        Err(fastmcp_rust::McpError::internal_error(
-            "Task intentionally failed",
-        ))
-    });
-
-    let server = builder
-        .tool(EchoTool)
-        .with_task_manager(task_manager.into_shared())
-        .build();
-
-    let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
-    });
-
-    TestHarness::new(TestClient::new(client_transport), handle)
+fn final_tasks_runtime_block_on<F: Future>(future: F) -> F::Output {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("final Tasks E2E runtime builds")
+        .block_on(future)
 }
 
-#[test]
-fn workflow_task_submit_and_get() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Verify server has task capability
-    let caps = client.server_capabilities().unwrap();
-    assert!(caps.tasks.is_some(), "Server should have tasks capability");
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({
-                "taskType": "quick_task",
-                "params": {"value": 21}
-            }),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-    assert!(
-        task_id.starts_with("task-"),
-        "Task ID should have correct prefix"
-    );
-
-    // Get task info
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let task_info = &get_result["task"];
-    assert_eq!(task_info["id"], task_id);
-    assert_eq!(task_info["taskType"], "quick_task");
-
-    // Give the task time to complete
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Get again and check for completion
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let status = get_result["task"]["status"].as_str().unwrap();
-    // Task should be completed or still running
-    assert!(
-        status == "completed" || status == "running" || status == "pending",
-        "Unexpected status: {status}"
-    );
+fn final_tasks_runtime_block_on_bounded<F: Future>(cx: &Cx, future: F) -> F::Output {
+    final_tasks_runtime_block_on(async {
+        asupersync::time::timeout(cx.now(), FINAL_TASKS_E2E_BOUND, future)
+            .await
+            .expect("final Tasks public HTTP operation stays within its bound")
+    })
 }
 
-#[test]
-fn workflow_task_list_with_filtering() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
+struct FinalTasksHttpFixture {
+    address: SocketAddr,
+    shutdown: mpsc::SyncSender<()>,
+    finished: mpsc::Receiver<Result<(), String>>,
+    join: Option<JoinHandle<()>>,
+}
 
-    // Submit multiple tasks
-    let _task1 = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 1}}),
+/// Retains the spawned final-Tasks server until readiness has succeeded and
+/// ownership can move into the fixture returned to the test.
+struct FinalTasksHttpStartupGuard {
+    shutdown: Option<mpsc::SyncSender<()>>,
+    finished: Option<mpsc::Receiver<Result<(), String>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl FinalTasksHttpStartupGuard {
+    fn into_parts(
+        mut self,
+    ) -> (
+        mpsc::SyncSender<()>,
+        mpsc::Receiver<Result<(), String>>,
+        Option<JoinHandle<()>>,
+    ) {
+        (
+            self.shutdown
+                .take()
+                .expect("startup guard retains shutdown"),
+            self.finished
+                .take()
+                .expect("startup guard retains completion"),
+            self.join.take(),
         )
-        .unwrap();
+    }
 
-    let _task2 = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 2}}),
+    fn resume_thread_panic_if_finished(&mut self) {
+        let Some(handle) = self.join.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self
+            .join
+            .take()
+            .expect("finished startup thread retains its join handle");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl Drop for FinalTasksHttpStartupGuard {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        let Some(shutdown) = self.shutdown.as_ref() else {
+            return;
+        };
+        let Some(finished) = self.finished.as_ref() else {
+            return;
+        };
+        let settlement = settle_final_tasks_http_server(shutdown, finished, &mut self.join);
+        if settlement.is_err() && self.join.is_some() {
+            // Fail this test and detach the thread, as FinalTasksHttpFixture's
+            // drop does; aborting would destroy every other test's result.
+            self.join = None;
+            fail_fixture(
+                "final Tasks HTTP server startup left a live unjoinable thread after bounded settlement",
+            );
+        }
+    }
+}
+
+impl FinalTasksHttpFixture {
+    fn spawn(server: auto::Server, runner: AuthorizedTaskServiceRunner) -> Self {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        // Teardown deliberately cancels the server context, which makes the
+        // lifetime `timeout` below resolve as an error. Without this flag the
+        // fixture reported every intended shutdown as "exceeded its deadline",
+        // failing teardown on a perfectly healthy run. A real deadline breach
+        // (no shutdown requested) still reports the deadline error.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let shutdown_observed = Arc::clone(&shutdown_requested);
+        let join = Some(thread::spawn(move || {
+            let (task_done_tx, task_done_rx) = mpsc::channel();
+            let (server_cx_tx, server_cx_rx) = mpsc::sync_channel(1);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("final Tasks E2E server reactor initializes"),
+                )
+                .blocking_threads(4, 64)
+                .build()
+                .expect("final Tasks E2E server runtime builds");
+            runtime
+                    .handle()
+                    .try_spawn_with_cx(move |cx| async move {
+                        let _ = server_cx_tx.send(cx.clone());
+                        let mut service = Box::pin(runner.run(&cx));
+                        let service_ready = std::future::poll_fn(|task_context| {
+                            match service.as_mut().poll(task_context) {
+                                Poll::Pending => Poll::Ready(Ok(())),
+                                Poll::Ready(Ok(())) => Poll::Ready(Err(
+                                    "final Tasks service stopped before HTTP startup".to_owned(),
+                                )),
+                                Poll::Ready(Err(error)) => Poll::Ready(Err(format!(
+                                    "final Tasks service failed before HTTP startup: {error}"
+                                ))),
+                            }
+                        })
+                        .await;
+                        if let Err(error) = service_ready {
+                            let _ = ready_tx.send(Err(error.clone()));
+                            let _ = finished_tx.send(Err(error));
+                            let _ = task_done_tx.send(());
+                            return;
+                        }
+                        let outcome =
+                            asupersync::time::timeout(cx.now(), FINAL_TASKS_SERVER_BOUND, async {
+                                let bound = server.bind_http(&cx, "127.0.0.1:0").await.map_err(
+                                    |error| format!("final Tasks E2E bind failed: {error}"),
+                                )?;
+                                let address = bound.local_addr().map_err(|error| {
+                                    format!("final Tasks E2E address failed: {error}")
+                                })?;
+                                ready_tx.send(Ok(address)).map_err(|_| {
+                                    "final Tasks E2E startup receiver went away".to_owned()
+                                })?;
+                                let mut serving = Box::pin(bound.serve(&cx));
+                                let mut service_stopped = false;
+                                std::future::poll_fn(|task_context| {
+                                    if !service_stopped {
+                                        match service.as_mut().poll(task_context) {
+                                            Poll::Ready(Ok(())) if cx.checkpoint().is_ok() => {
+                                                return Poll::Ready(Err(
+                                                    "final Tasks service stopped while HTTP server remained live"
+                                                        .to_owned(),
+                                                ));
+                                            }
+                                            Poll::Ready(Err(error)) if cx.checkpoint().is_ok() => {
+                                                return Poll::Ready(Err(format!(
+                                                    "final Tasks service failed while HTTP server remained live: {error}"
+                                                )));
+                                            }
+                                            Poll::Ready(_) => service_stopped = true,
+                                            Poll::Pending => {}
+                                        }
+                                    }
+                                    match serving.as_mut().poll(task_context) {
+                                        Poll::Ready(Ok(HttpServerShutdown::Quiescent)) => {
+                                            Poll::Ready(Ok(()))
+                                        }
+                                        Poll::Ready(Ok(HttpServerShutdown::Nonquiescent(
+                                            mut shutdown,
+                                        ))) => Poll::Ready(Err(format!(
+                                            "final Tasks E2E server stopped nonquiescently: {:?}",
+                                            shutdown.poll_settlement()
+                                        ))),
+                                        Poll::Ready(Err(error)) => Poll::Ready(Err(format!(
+                                            "final Tasks E2E server stopped: {error}"
+                                        ))),
+                                        Poll::Pending => Poll::Pending,
+                                    }
+                                })
+                                .await
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                if shutdown_observed.load(Ordering::SeqCst) {
+                                    // The fixture cancelled this context on
+                                    // purpose; that is a clean stop, not a
+                                    // deadline breach.
+                                    Ok(())
+                                } else {
+                                    Err("final Tasks E2E server exceeded its deadline".to_owned())
+                                }
+                            });
+                        let _ = finished_tx.send(outcome);
+                        let _ = task_done_tx.send(());
+                    })
+                    .expect("final Tasks E2E server task is admitted");
+            runtime.block_on(async move {
+                let mut server_cx = None;
+                loop {
+                    if let Ok(cx) = server_cx_rx.try_recv() {
+                        server_cx = Some(cx);
+                    }
+                    match shutdown_rx.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                            if let Some(cx) = server_cx.as_ref() {
+                                shutdown_requested.store(true, Ordering::SeqCst);
+                                cx.cancel_with(
+                                    asupersync::CancelKind::User,
+                                    Some("final Tasks E2E fixture shutdown"),
+                                );
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                    if task_done_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let cx = Cx::current().expect("server runtime installs an ambient Cx");
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            });
+        }));
+        let mut startup = FinalTasksHttpStartupGuard {
+            shutdown: Some(shutdown_tx),
+            finished: Some(finished_rx),
+            join,
+        };
+        let address = match ready_rx.recv_timeout(FINAL_TASKS_E2E_BOUND) {
+            Ok(Ok(address)) => address,
+            Ok(Err(error)) => panic!("final Tasks E2E server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("final Tasks E2E server startup readiness channel disconnected")
+            }
+            Err(error) => panic!("final Tasks E2E server startup exceeded its bound: {error}"),
+        };
+        let (shutdown, finished, join) = startup.into_parts();
+        Self {
+            address,
+            shutdown,
+            finished,
+            join,
+        }
+    }
+
+    fn plan(&self, policy: ProtocolPolicy) -> ClientProtocolPlan {
+        let modern = CanonicalHttpUrl::parse(&format!("http://{}/mcp", self.address))
+            .expect("final Tasks modern endpoint is canonical");
+        let legacy_sse = CanonicalHttpUrl::parse(&format!("http://{}/sse", self.address))
+            .expect("final Tasks legacy SSE endpoint is canonical");
+        let legacy_message = CanonicalHttpUrl::parse(&format!("http://{}/messages", self.address))
+            .expect("final Tasks legacy message endpoint is canonical");
+        ClientProtocolPlan::http(
+            policy,
+            (!matches!(policy, ProtocolPolicy::LegacyOnly)).then_some(modern),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_sse),
+            (!matches!(policy, ProtocolPolicy::ModernOnly)).then_some(legacy_message),
+            "final-tasks-e2e-credential".to_owned(),
+            "final-tasks-e2e-security".to_owned(),
+            "final-tasks-e2e-native-h1".to_owned(),
+            1,
+            1,
+            0,
         )
-        .unwrap();
+        .expect("final Tasks HTTP plan is valid")
+    }
 
-    // List all tasks
-    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
+    fn shutdown(mut self) {
+        settle_final_tasks_http_server(&self.shutdown, &self.finished, &mut self.join)
+            .unwrap_or_else(|error| panic!("final Tasks E2E server teardown failed: {error}"));
+    }
+}
 
-    let tasks = list_result["tasks"].as_array().unwrap();
-    assert!(tasks.len() >= 2, "Should have at least 2 tasks");
+impl Drop for FinalTasksHttpFixture {
+    fn drop(&mut self) {
+        if self.join.is_none() {
+            return;
+        }
+        if let Err(error) =
+            settle_final_tasks_http_server(&self.shutdown, &self.finished, &mut self.join)
+        {
+            // A fixture teardown failure must fail its own test, never abort
+            // the harness: `std::process::abort()` here destroyed the original
+            // panic message and every other test's result in the same binary.
+            assert!(
+                std::thread::panicking(),
+                "final Tasks HTTP server fixture drop failed: {error}"
+            );
+            eprintln!(
+                "final Tasks HTTP server fixture drop failed while already panicking: {error}"
+            );
+        }
+    }
+}
 
-    // Wait for tasks to complete
-    std::thread::sleep(std::time::Duration::from_millis(200));
+fn settle_final_tasks_http_server(
+    shutdown: &mpsc::SyncSender<()>,
+    finished: &mpsc::Receiver<Result<(), String>>,
+    join: &mut Option<JoinHandle<()>>,
+) -> Result<(), String> {
+    match shutdown.try_send(()) {
+        Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}
+    }
+    let outcome = finished
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .map_err(|error| format!("final Tasks E2E server teardown exceeded its bound: {error}"));
+    let join_result = join_final_tasks_thread(join);
+    let outcome = outcome?;
+    outcome.map_err(|error| format!("final Tasks E2E server teardown failed: {error}"))?;
+    join_result
+}
 
-    // List completed tasks
-    let completed_result = client
-        .send_raw_request("tasks/list", json!({"status": "completed"}))
-        .unwrap();
-
-    let completed_tasks = completed_result["tasks"].as_array().unwrap();
-    for task in completed_tasks {
-        assert_eq!(task["status"], "completed");
+fn join_final_tasks_thread(join: &mut Option<JoinHandle<()>>) -> Result<(), String> {
+    let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+    loop {
+        let Some(handle) = join.as_ref() else {
+            return Ok(());
+        };
+        if handle.is_finished() {
+            return join
+                .take()
+                .expect("completed final Tasks server retains its join handle")
+                .join()
+                .map_err(|_| "final Tasks E2E server thread panicked".to_owned());
+        }
+        if Instant::now() >= deadline {
+            return Err("final Tasks E2E server reported completion but did not exit".to_owned());
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
 #[test]
-fn workflow_task_cancellation() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "progress_task", "params": {"steps": 100}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Cancel the task immediately
-    let cancel_result = client
-        .send_raw_request(
-            "tasks/cancel",
-            json!({"id": task_id, "reason": "User requested cancellation"}),
-        )
-        .unwrap();
-
-    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
-
-    // Verify task is cancelled
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let status = get_result["task"]["status"].as_str().unwrap();
-    assert_eq!(status, "cancelled", "Task should be cancelled");
-
-    // Verify error message is set
-    let error = get_result["task"]["error"].as_str();
-    assert!(error.is_some(), "Cancelled task should have error message");
-}
-
-#[test]
-fn workflow_task_failure_handling() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for task to fail
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Get task and verify failure
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let task = &get_result["task"];
-    let status = task["status"].as_str().unwrap();
-
-    // Task should be failed (or still running if it hasn't finished)
-    if status == "failed" {
-        assert!(
-            task["error"].as_str().is_some(),
-            "Failed task should have error message"
-        );
-    }
-}
-
-#[test]
-fn workflow_task_unknown_type_rejected() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Try to submit unknown task type
-    let result = client.send_raw_request(
-        "tasks/submit",
-        json!({"taskType": "nonexistent_task", "params": {}}),
-    );
-
-    assert!(result.is_err(), "Unknown task type should be rejected");
-}
-
-#[test]
-fn workflow_task_get_nonexistent() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Try to get a task that doesn't exist
-    let result = client.send_raw_request("tasks/get", json!({"id": "task-nonexistent"}));
-
-    assert!(result.is_err(), "Getting nonexistent task should fail");
-}
-
-#[test]
-fn workflow_task_cancel_already_completed() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a quick task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 5}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Verify it's completed
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    if get_result["task"]["status"] == "completed" {
-        // Try to cancel completed task (should fail)
-        let cancel_result = client.send_raw_request("tasks/cancel", json!({"id": task_id}));
-
-        assert!(
-            cancel_result.is_err(),
-            "Cancelling completed task should fail"
-        );
-    }
-}
-
-#[test]
-fn workflow_task_result_available_after_completion() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 42}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Get task with result
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    if get_result["task"]["status"] == "completed" {
-        // Result should be available
-        let result = &get_result["result"];
-        assert!(
-            result.is_object(),
-            "Result should be present for completed task"
-        );
-        assert!(result["success"].as_bool().unwrap_or(false));
-
-        // Check the data
-        let data = &result["data"];
-        assert_eq!(data["result"], 84, "42 * 2 = 84");
-    }
-}
-
-#[test]
-fn workflow_task_session_continues_after_task_error() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let _fail_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    // Wait for it to fail
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Session should still be functional - submit another task
-    let success_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 10}}),
-        )
-        .unwrap();
-
-    assert!(
-        success_result["task"]["id"].as_str().is_some(),
-        "Should be able to submit new tasks after failure"
-    );
-
-    // Regular tool calls should also still work
-    let echo_result = client
-        .call_tool("echo", json!({"message": "still working"}))
-        .unwrap();
-
-    assert!(
-        matches!(echo_result.first(), Some(Content::Text { .. })),
-        "expected text content"
-    );
-    let Some(Content::Text { text }) = echo_result.first() else {
-        return;
+fn workflow_final_tasks_startup_guard_preserves_planted_startup_error() {
+    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let startup = FinalTasksHttpStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(move || {
+            shutdown_rx
+                .recv()
+                .expect("startup guard requests bounded shutdown");
+            let _ = finished_tx.send(Err("planted startup failure".to_owned()));
+        })),
     };
-    assert_eq!(text, "still working");
-}
 
-#[test]
-fn workflow_task_capabilities_advertised() {
-    let mut client = setup_task_server();
-    let init_result = client.initialize().unwrap();
-
-    // Verify task capabilities
-    let tasks_cap = init_result.capabilities.tasks;
-    assert!(
-        tasks_cap.is_some(),
-        "Server should advertise tasks capability"
-    );
-}
-
-#[test]
-fn workflow_task_multiple_sequential() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit tasks sequentially and track their IDs
-    let mut task_ids = Vec::new();
-    for i in 0..5 {
-        let result = client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": "quick_task", "params": {"value": i}}),
-            )
-            .unwrap();
-
-        let task_id = result["task"]["id"].as_str().unwrap().to_string();
-        task_ids.push(task_id);
-    }
-
-    // All task IDs should be unique
-    let unique_ids: std::collections::HashSet<_> = task_ids.iter().collect();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _startup = startup;
+        panic!("original startup diagnostic");
+    }))
+    .expect_err("the enclosing startup failure must propagate");
     assert_eq!(
-        unique_ids.len(),
-        task_ids.len(),
-        "All task IDs should be unique"
+        *panic
+            .downcast::<&str>()
+            .expect("the original startup diagnostic is retained"),
+        "original startup diagnostic"
     );
+}
 
-    // Wait for all to complete
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    // Verify all are either completed or in a valid state
-    for task_id in &task_ids {
-        let result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
-
-        let status = result["task"]["status"].as_str().unwrap();
+#[test]
+fn workflow_final_tasks_startup_guard_resumes_planted_pre_readiness_panic() {
+    let (shutdown_tx, _shutdown_rx) = mpsc::sync_channel::<()>(1);
+    let (_finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let mut startup = FinalTasksHttpStartupGuard {
+        shutdown: Some(shutdown_tx),
+        finished: Some(finished_rx),
+        join: Some(thread::spawn(|| panic!("planted pre-readiness panic"))),
+    };
+    let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+    while !startup
+        .join
+        .as_ref()
+        .expect("startup guard retains the spawned thread")
+        .is_finished()
+    {
         assert!(
-            matches!(status, "pending" | "running" | "completed"),
-            "Task {task_id} has unexpected status: {status}"
+            Instant::now() < deadline,
+            "the planted pre-readiness panic finishes within the bound"
         );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        startup.resume_thread_panic_if_finished();
+    }))
+    .expect_err("the original pre-readiness panic must be resumed");
+    assert_eq!(
+        *panic
+            .downcast::<&str>()
+            .expect("the original pre-readiness panic is retained"),
+        "planted pre-readiness panic"
+    );
+    assert!(startup.join.is_none());
+}
+
+struct E2eFinalTaskSupervisor {
+    input_required: mpsc::SyncSender<()>,
+    cancelled: mpsc::SyncSender<()>,
+}
+
+impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        let input_required = self.input_required.clone();
+        let cancelled = self.cancelled.clone();
+        Box::pin(async move {
+            match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    let requests: FinalTaskInputRequests = serde_json::from_value(json!({
+                        "roots": {"method": "roots/list"}
+                    }))
+                    .expect("the public final roots input descriptor is typed");
+                    initial.require_input(
+                        requests,
+                        Some("awaiting roots from live supervisor".to_owned()),
+                    )?;
+                    input_required.send(()).map_err(|_| {
+                        McpError::internal_error("E2E input-required observer dropped")
+                    })?;
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => loop {
+                    if accepted.is_cancellation_requested()? {
+                        accepted
+                            .honor_cancellation(Some("cancelled by live supervisor".to_owned()))?;
+                        cancelled.send(()).map_err(|_| {
+                            McpError::internal_error("E2E cancellation observer dropped")
+                        })?;
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                },
+            }
+            Ok(())
+        })
     }
 }
 
-// ============================================================================
-// Additional Task Management E2E Tests (bd-3n2)
-// ============================================================================
+fn state_only_mrtr_input_required() -> InputRequiredResult {
+    let wire = serde_json::json!({
+        "resultType": "input_required",
+        "requestState": "handler-forged-state",
+    })
+    .to_string();
+    let (decoded, diagnostic) =
+        decode_peer_result(&wire, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
+            .expect("state-only final input-required result decodes");
+    assert!(diagnostic.is_none());
+    let DecodedResult::InputRequired(result) = decoded else {
+        panic!("state-only final result retains the input-required branch");
+    };
+    assert!(result.input_requests().is_none());
+    result
+}
 
-#[test]
-fn workflow_task_polling_until_complete() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
+fn state_only_mrtr_complete_result() -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![ContentBlock::text("state-only MRTR resumed")],
+            is_error: false,
+            structured_content: None,
+        },
+        ResultMeta::server_generated(Implementation {
+            name: "state-only-mrtr-e2e".to_owned(),
+            version: "1.0.0".to_owned(),
+            title: None,
+            description: None,
+            website_url: None,
+            icons: Vec::new(),
+            additional: BTreeMap::new(),
+        }),
+    )
+}
 
-    // Submit a quick task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 50}}),
-        )
-        .unwrap();
+struct PublicStateOnlyMrtrTool {
+    initial_calls: Arc<std::sync::atomic::AtomicUsize>,
+    resumed_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
 
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
+impl ToolHandler for PublicStateOnlyMrtrTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "public-state-only-mrtr".to_owned(),
+            description: Some("Proves state-only MRTR over the public HTTP facade".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
 
-    // Poll until complete (simulating wait_for_task behavior)
-    let mut attempts = 0;
-    let max_attempts = 20;
-    let mut final_status = String::new();
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("legacy state-only MRTR")])
+    }
 
-    while attempts < max_attempts {
-        let get_result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.initial_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(FinalToolOutcome::InputRequired(
+            state_only_mrtr_input_required(),
+        ))
+    }
 
-        let status = get_result["task"]["status"].as_str().unwrap();
-        final_status = status.to_string();
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _arguments: serde_json::Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            // Every modern final tool call reaches this hook: `None` marks the
+            // initial invocation and `Some` an admitted retry, so the initial
+            // leg must issue the continuation here rather than error. The
+            // non-resuming `call_final_outcome` above is unreachable on the
+            // modern path.
+            let Some(resume_inputs) = resume_inputs else {
+                self.initial_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Outcome::Ok(FinalToolOutcome::InputRequired(
+                    state_only_mrtr_input_required(),
+                ));
+            };
+            if !resume_inputs.responses().is_empty() {
+                return Outcome::Err(McpError::internal_error(
+                    "state-only MRTR resume unexpectedly carried input responses",
+                ));
+            }
+            self.resumed_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Outcome::Ok(FinalToolOutcome::Complete(state_only_mrtr_complete_result()))
+        })
+    }
+}
 
-        if status == "completed" || status == "failed" || status == "cancelled" {
+fn typed_roots_input_required() -> InputRequiredResult {
+    let requests = MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+        .expect("the E2E handler's typed roots request is valid");
+    let wire = serde_json::json!({
+        "resultType": "input_required",
+        "inputRequests": requests,
+        // This handler-authored value is deliberately forged. The framework
+        // must replace it with opaque state bound to the admitted operation.
+        "requestState": "handler-forged-resource-prompt-state",
+    })
+    .to_string();
+    let (decoded, diagnostic) =
+        decode_peer_result(&wire, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
+            .expect("typed resource/prompt input-required result decodes");
+    assert!(diagnostic.is_none());
+    let DecodedResult::InputRequired(result) = decoded else {
+        panic!("the typed resource/prompt result remains input_required");
+    };
+    assert!(
+        result
+            .input_requests()
+            .and_then(|requests| requests.get("roots"))
+            .is_some(),
+        "the handler emits one typed roots request"
+    );
+    result
+}
+
+fn public_mrtr_result_meta() -> ResultMeta {
+    ResultMeta::server_generated(Implementation {
+        name: "public-resource-prompt-mrtr-e2e".to_owned(),
+        version: "1.0.0".to_owned(),
+        title: None,
+        description: None,
+        website_url: None,
+        icons: Vec::new(),
+        additional: BTreeMap::new(),
+    })
+}
+
+struct PublicTypedMrtrResource {
+    uri: &'static str,
+    name: &'static str,
+    initial_calls: Arc<AtomicUsize>,
+    resumed_calls: Arc<AtomicUsize>,
+    legacy_calls: Arc<AtomicUsize>,
+    input_required_after_resume: Arc<AtomicUsize>,
+}
+
+impl ResourceHandler for PublicTypedMrtrResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.uri.to_owned(),
+            name: self.name.to_owned(),
+            description: Some("public modern typed MRTR resource proof".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![ResourceContent {
+            uri: self.uri.to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: Some("exact legacy resource result".to_owned()),
+            blob: None,
+        }])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::Explicit
+    }
+
+    fn read_final_outcome(
+        &self,
+        _ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.initial_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalMethodOutcome::InputRequired(
+            typed_roots_input_required(),
+        ))
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _uri: &'a str,
+        _params: &'a HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let Some(resume_inputs) = resume_inputs else {
+                return Outcome::Err(McpError::internal_error(
+                    "resource MRTR resume inputs were not supplied",
+                ));
+            };
+            match resume_inputs.roots("roots") {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Outcome::Err(McpError::internal_error(
+                        "resource MRTR typed roots input was not supplied",
+                    ));
+                }
+                Err(error) => return Outcome::Err(error),
+            }
+            self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .input_required_after_resume
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Outcome::Ok(FinalMethodOutcome::InputRequired(
+                    typed_roots_input_required(),
+                ));
+            }
+            Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                FinalReadResourceResult {
+                    contents: Vec::new(),
+                    ttl_ms: CacheTtl::milliseconds(17),
+                    cache_scope: CacheScope::Private,
+                },
+                public_mrtr_result_meta(),
+            )))
+        })
+    }
+}
+
+struct PublicTypedMrtrPrompt {
+    initial_requests: Arc<AtomicUsize>,
+    resume_attempts: Arc<AtomicUsize>,
+    legacy_fallbacks: Arc<AtomicUsize>,
+}
+
+impl PromptHandler for PublicTypedMrtrPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: "public-typed-mrtr-prompt".to_owned(),
+            description: Some("public modern typed MRTR prompt proof".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        self.legacy_fallbacks.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![PromptMessage {
+            role: Role::Assistant,
+            content: Content::text("exact legacy prompt result"),
+        }])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn get_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.initial_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalMethodOutcome::InputRequired(
+            typed_roots_input_required(),
+        ))
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            let Some(resume_inputs) = resume_inputs else {
+                return Outcome::Err(McpError::internal_error(
+                    "prompt MRTR resume inputs were not supplied",
+                ));
+            };
+            match resume_inputs.roots("roots") {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Outcome::Err(McpError::internal_error(
+                        "prompt MRTR typed roots input was not supplied",
+                    ));
+                }
+                Err(error) => return Outcome::Err(error),
+            }
+            self.resume_attempts.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: Some("exact final prompt result".to_owned()),
+                    messages: vec![FinalPromptMessage {
+                        role: Role::Assistant,
+                        content: ContentBlock::text("exact final prompt content"),
+                    }],
+                },
+                public_mrtr_result_meta(),
+            )))
+        })
+    }
+}
+
+struct PublicFinalTaskTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for PublicFinalTaskTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "public-final-task".to_owned(),
+            description: Some("Creates one official final Tasks operation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact legacy completion")])
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "public-final-task-e2e",
+            }))?,
+            status_message: Some("working through the public final API".to_owned()),
+        })
+    }
+}
+
+fn final_tasks_native_http_post(
+    address: SocketAddr,
+    mcp_name: &str,
+    body: &serde_json::Value,
+) -> (u16, Option<serde_json::Value>) {
+    let body = serde_json::to_vec(body).expect("final Tasks native HTTP request serializes");
+    let mut stream = std::net::TcpStream::connect_timeout(&address, FINAL_TASKS_E2E_BOUND)
+        .expect("native final Tasks probe connects to the facade listener");
+    stream
+        .set_read_timeout(Some(FINAL_TASKS_E2E_BOUND))
+        .expect("native final Tasks probe read deadline configures");
+    stream
+        .set_write_timeout(Some(FINAL_TASKS_E2E_BOUND))
+        .expect("native final Tasks probe write deadline configures");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {mcp_name}\r\nContent-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .expect("native final Tasks probe commits one bounded request");
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .expect("native final Tasks probe reads within its configured deadline");
+        if read == 0 {
             break;
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        attempts += 1;
-    }
-
-    // Should eventually complete
-    assert!(
-        attempts < max_attempts || final_status == "completed",
-        "Task should complete within timeout"
-    );
-}
-
-#[test]
-fn workflow_task_status_transitions() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 1}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-    let initial_status = submit_result["task"]["status"].as_str().unwrap();
-
-    // Initial status should be pending or running
-    assert!(
-        initial_status == "pending" || initial_status == "running",
-        "Initial status should be pending or running, got: {}",
-        initial_status
-    );
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    let final_status = get_result["task"]["status"].as_str().unwrap();
-
-    // Valid terminal states
-    assert!(
-        final_status == "completed" || final_status == "failed" || final_status == "cancelled",
-        "Final status should be terminal, got: {}",
-        final_status
-    );
-}
-
-#[test]
-fn workflow_task_list_pagination() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit several tasks
-    for i in 0..5 {
-        client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": "quick_task", "params": {"value": i}}),
-            )
-            .unwrap();
-    }
-
-    // List all tasks
-    let list_result = client.send_raw_request("tasks/list", json!({})).unwrap();
-
-    let tasks = list_result["tasks"].as_array().unwrap();
-    assert!(
-        tasks.len() >= 5,
-        "Should have at least 5 tasks, got {}",
-        tasks.len()
-    );
-
-    // Each task should have required fields
-    for task in tasks {
-        assert!(task["id"].is_string());
-        assert!(task["status"].is_string());
-        assert!(task["taskType"].is_string());
-    }
-}
-
-#[test]
-fn workflow_task_cancel_pending() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task that takes time (progress_task with many steps)
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "progress_task", "params": {"steps": 100}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Cancel immediately
-    let cancel_result = client
-        .send_raw_request(
-            "tasks/cancel",
-            json!({"id": task_id, "reason": "Cancelled during pending"}),
-        )
-        .unwrap();
-
-    assert!(cancel_result["cancelled"].as_bool().unwrap_or(false));
-
-    // Verify the task is cancelled
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    assert_eq!(get_result["task"]["status"].as_str().unwrap(), "cancelled");
-}
-
-#[test]
-fn workflow_task_result_structure() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a task that returns data
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "quick_task", "params": {"value": 123}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for completion
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    // If completed, verify result structure
-    if get_result["task"]["status"].as_str().unwrap() == "completed" {
-        let result = &get_result["result"];
-        assert!(result["success"].as_bool().unwrap_or(false));
-        assert!(result["data"].is_object());
-        // The task multiplies by 2
-        assert_eq!(result["data"]["result"], 246);
-    }
-}
-
-#[test]
-fn workflow_task_error_message_preserved() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
-
-    // Submit a failing task
-    let submit_result = client
-        .send_raw_request(
-            "tasks/submit",
-            json!({"taskType": "failing_task", "params": {}}),
-        )
-        .unwrap();
-
-    let task_id = submit_result["task"]["id"].as_str().unwrap();
-
-    // Wait for failure
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    let get_result = client
-        .send_raw_request("tasks/get", json!({"id": task_id}))
-        .unwrap();
-
-    // If failed, verify error is preserved
-    if get_result["task"]["status"].as_str().unwrap() == "failed" {
-        let error = get_result["task"]["error"].as_str();
-        assert!(error.is_some(), "Failed task should have error message");
         assert!(
-            error.unwrap().contains("intentionally") || error.unwrap().contains("failed"),
-            "Error message should describe failure"
+            response
+                .len()
+                .checked_add(read)
+                .is_some_and(|size| size <= FINAL_TASKS_HTTP_RESPONSE_MAX_BYTES),
+            "native final Tasks response exceeds its bounded response budget"
         );
+        response.extend_from_slice(&buffer[..read]);
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native final Tasks response has complete headers");
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("native final Tasks response headers are ASCII");
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .expect("native final Tasks response has a status")
+        .parse::<u16>()
+        .expect("native final Tasks response status is numeric");
+    let mut content_length = None;
+    let mut chunked = false;
+    for header in headers.lines().skip(1) {
+        let (name, value) = header
+            .split_once(':')
+            .expect("native final Tasks response header has a field delimiter");
+        if name.eq_ignore_ascii_case("content-length") {
+            assert!(
+                content_length.is_none(),
+                "native final Tasks response has one Content-Length field"
+            );
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("native final Tasks response Content-Length is valid"),
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+    }
+    let body = &response[header_end + 4..];
+    let body = if chunked {
+        assert!(
+            content_length.is_none(),
+            "chunked native final Tasks response does not carry Content-Length"
+        );
+        final_tasks_chunked_response_body(body)
+    } else {
+        let content_length = content_length
+            .expect("native final Tasks response uses Content-Length or chunked framing");
+        assert_eq!(
+            body.len(),
+            content_length,
+            "native final Tasks response body is complete"
+        );
+        body.to_vec()
+    };
+    let json = (!body.is_empty())
+        .then(|| serde_json::from_slice(&body).expect("native final Tasks JSON response parses"));
+    (status, json)
+}
+
+fn final_tasks_chunked_response_body(body: &[u8]) -> Vec<u8> {
+    let mut cursor = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let size_end = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| cursor + offset)
+            .expect("chunked final Tasks response has a complete chunk-size line");
+        let size_line = std::str::from_utf8(&body[cursor..size_end])
+            .expect("chunked final Tasks chunk size is ASCII");
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+            .expect("chunked final Tasks chunk size is hexadecimal");
+        cursor = size_end + 2;
+        if size == 0 {
+            loop {
+                let trailer_end = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| cursor + offset)
+                    .expect("chunked final Tasks response has a complete trailer line");
+                let trailer = &body[cursor..trailer_end];
+                cursor = trailer_end + 2;
+                if trailer.is_empty() {
+                    assert_eq!(
+                        cursor,
+                        body.len(),
+                        "chunked final Tasks response has no bytes after trailers"
+                    );
+                    return decoded;
+                }
+                assert!(
+                    trailer.contains(&b':'),
+                    "chunked final Tasks trailer has an HTTP field delimiter"
+                );
+            }
+        }
+        let chunk_end = cursor
+            .checked_add(size)
+            .expect("chunked final Tasks chunk length does not overflow");
+        assert!(
+            chunk_end.checked_add(2).is_some_and(|terminator_end| {
+                terminator_end <= body.len() && &body[chunk_end..terminator_end] == b"\r\n"
+            }),
+            "chunked final Tasks response has a complete chunk body and terminator"
+        );
+        decoded.extend_from_slice(&body[cursor..chunk_end]);
+        cursor = chunk_end + 2;
     }
 }
 
 #[test]
-fn workflow_task_type_preserved() {
-    let mut client = setup_task_server();
-    client.initialize().unwrap();
+fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
+    let store = Arc::new(InMemoryFinalTaskStore::new(8).expect("bounded public final Task store"));
+    let delivered_notifications = Arc::new(AtomicUsize::new(0));
+    let notification_counter = Arc::clone(&delivered_notifications);
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite final Tasks policy"),
+        Arc::new(move |_| {
+            notification_counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let (input_required_tx, input_required_rx) = mpsc::sync_channel(1);
+    let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required: input_required_tx,
+                cancelled: cancelled_tx,
+            }),
+        )
+        .expect("application-owned final Task service installs");
 
-    // Submit different task types
-    let task_types = ["quick_task", "progress_task"];
+    let task_handler_calls = Arc::new(AtomicUsize::new(0));
+    let server = auto::server_builder("final-tasks-e2e", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::clone(&task_handler_calls),
+        })
+        .final_tasks(runtime.clone())
+        .expect("official final Tasks extension installs through the public facade")
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let admitted_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                },
+            },
+            "name": "public-final-task",
+            "arguments": {},
+        },
+    });
+    let mut missing_capability = admitted_request.clone();
+    missing_capability["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let (status, missing_capability_response) =
+        final_tasks_native_http_post(fixture.address, "public-final-task", &missing_capability);
+    assert_eq!(
+        status, 400,
+        "the native HTTP boundary maps missing Tasks capability to its canonical refusal"
+    );
+    let missing_capability_response =
+        missing_capability_response.expect("missing-capability rejection has a JSON-RPC body");
+    assert_eq!(missing_capability_response["id"], admitted_request["id"]);
+    assert_eq!(
+        missing_capability_response["error"]["code"],
+        fastmcp_protocol::MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+        "changing only the Tasks capability returns the canonical capability error"
+    );
+    assert_eq!(
+        missing_capability_response["error"]["data"],
+        json!({
+            "requiredCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        })
+    );
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        1,
+        "missing Tasks capability rejects CreateTask after one handler invocation"
+    );
+    assert_eq!(
+        store.task_count(),
+        0,
+        "rejected capability preserves the task store"
+    );
+    assert_eq!(
+        delivered_notifications.load(Ordering::SeqCst),
+        0,
+        "rejected capability emits no task notification"
+    );
 
-    for task_type in task_types {
-        let submit_result = client
-            .send_raw_request(
-                "tasks/submit",
-                json!({"taskType": task_type, "params": {"value": 1}}),
-            )
-            .unwrap();
+    let (status, _) =
+        final_tasks_native_http_post(fixture.address, "other-task", &admitted_request);
+    assert_eq!(
+        status, 400,
+        "changing only Mcp-Name rejects before final dispatch"
+    );
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        1,
+        "Mcp-Name rejection does not invoke the task-capable handler again"
+    );
+    assert_eq!(
+        store.task_count(),
+        0,
+        "Mcp-Name rejection preserves the task store"
+    );
+    assert_eq!(
+        delivered_notifications.load(Ordering::SeqCst),
+        0,
+        "Mcp-Name rejection emits no task notification"
+    );
 
-        let task_id = submit_result["task"]["id"].as_str().unwrap();
-        let returned_type = submit_result["task"]["taskType"].as_str().unwrap();
-        assert_eq!(returned_type, task_type);
+    let modern_builder = auto::client_builder()
+        .client_info("final-tasks-e2e-client", "1.0.0")
+        .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly));
+    let modern =
+        final_tasks_runtime_block_on_bounded(&cx, modern_builder.connect_http_client_with_cx(&cx))
+            .expect("public HTTP facade selects the final protocol");
 
-        // Verify on get as well
-        let get_result = client
-            .send_raw_request("tasks/get", json!({"id": task_id}))
-            .unwrap();
+    let created = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern.connection().call_tool_final_outcome(
+            &cx,
+            RequestId::Number(2),
+            "public-final-task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("public final tools/call creates a task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable final tool must return the task result branch");
+    };
+    let task_id = created.task.base().task_id.clone();
+    assert!(matches!(created.task, FinalTask::Working(_)));
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        2,
+        "admitted task creation invokes the handler exactly once more"
+    );
 
-        assert_eq!(get_result["task"]["taskType"].as_str().unwrap(), task_type);
+    input_required_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("the live supervisor moves the task to input_required within its bound");
+    let input_required = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get observes input_required");
+    assert!(matches!(
+        input_required.task,
+        FinalTask::InputRequired { .. }
+    ));
+
+    let modern_endpoint = CanonicalHttpUrl::parse(&format!("http://{}/mcp", fixture.address))
+        .expect("public modern final Tasks endpoint is canonical");
+    let mut task_watcher_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern::client_builder()
+            .client_info("final-tasks-watch-client", "1.0.0")
+            .connect_http_with_cx(&cx, modern_endpoint),
+    )
+    .expect("modern facade connects to the real final Tasks listener");
+    let mut task_handle = final_tasks_runtime_block_on_bounded(
+        &cx,
+        task_watcher_client.attach_final_task(&cx, task_id.clone()),
+    )
+    .expect("modern facade attaches the exact input-required task");
+    let mut task_watch = final_tasks_runtime_block_on_bounded(
+        &cx,
+        task_watcher_client.watch_final_task(
+            &cx,
+            &mut task_handle,
+            SseLimits::new(1_024, 8_192, 16).expect("bounded final Tasks SSE limits"),
+        ),
+    )
+    .expect("modern facade opens one live task subscription");
+    assert!(matches!(
+        final_tasks_runtime_block_on_bounded(&cx, task_watch.next_event(&cx))
+            .expect("live task subscription acknowledgement is admitted"),
+        Some(FinalTaskWatchEvent::Acknowledged { .. })
+    ));
+
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern.connection().update_task_final(
+            &cx,
+            RequestId::Number(5),
+            &input_required.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("official tasks/update accepts matching typed input");
+    let task_notification = final_tasks_runtime_block_on_bounded(&cx, task_watch.next_event(&cx))
+        .expect("live task subscription observes the post-update status");
+    assert!(matches!(
+        task_notification,
+        Some(FinalTaskWatchEvent::TaskUpdated(ref notification))
+            if matches!(&notification.params.task, FinalTask::Working(_))
+    ));
+    drop(task_watch);
+    let resumed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(6), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get observes the resumed working task");
+    assert!(matches!(resumed.task, FinalTask::Working(_)));
+
+    final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .cancel_task_final(&cx, RequestId::Number(7), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/cancel acknowledges the cancellation intent");
+    cancelled_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("the live supervisor honors cancellation within its bound");
+    let cancelled = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern
+            .connection()
+            .get_task_final(&cx, RequestId::Number(8), task_id.clone(), 1 << 20),
+    )
+    .expect("official tasks/get returns the cancelled task");
+    assert!(matches!(cancelled.task, FinalTask::Cancelled(_)));
+
+    let legacy_builder = auto::client_builder()
+        .client_info("final-tasks-e2e-client", "1.0.0")
+        .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly));
+    let legacy =
+        final_tasks_runtime_block_on_bounded(&cx, legacy_builder.connect_http_client_with_cx(&cx))
+            .expect("the real facade server retains its exact legacy route");
+    let legacy_error = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy
+            .connection()
+            .get_task_final(&cx, RequestId::Number(8), task_id, 1 << 20),
+    )
+    .expect_err("exact legacy selection rejects the official final Tasks method");
+    assert!(matches!(
+        legacy_error,
+        ClientHttpConnectionError::FinalTasksRequiresModern { .. }
+    ));
+
+    drop(legacy);
+    drop(modern);
+    drop(task_handle);
+    drop(task_watcher_client);
+    fixture.shutdown();
+}
+
+struct RetentionWorkDrop(Arc<AtomicBool>);
+
+impl Drop for RetentionWorkDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
+}
+
+struct RetentionTaskSupervisor {
+    started: mpsc::Sender<fastmcp_rust::FinalTaskId>,
+    successor_completed: mpsc::Sender<fastmcp_rust::FinalTaskId>,
+    invocations: Arc<AtomicUsize>,
+    clock_offset_ms: Arc<AtomicUsize>,
+    observed_clock_ms: Arc<AtomicUsize>,
+    release_first: Arc<AtomicBool>,
+    first_dropped: Arc<AtomicBool>,
+}
+
+impl ApplicationTaskSupervisor for RetentionTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            let FinalTaskSupervisorHandoff::Initial(initial) = handoff else {
+                return Err(McpError::internal_error(
+                    "retention test expects initial work",
+                ));
+            };
+            let ordinal = self.invocations.fetch_add(1, Ordering::SeqCst);
+            assert!(ordinal < 2, "each created task executes exactly once");
+            let _lifetime =
+                (ordinal == 0).then(|| RetentionWorkDrop(Arc::clone(&self.first_dropped)));
+            if ordinal == 1 {
+                assert!(
+                    self.first_dropped.load(Ordering::SeqCst),
+                    "first application future is dropped before successor execution"
+                );
+            }
+            let task_id = initial.task_id().clone();
+            self.started
+                .send(task_id.clone())
+                .expect("task-start observer remains live");
+            if ordinal == 0 {
+                while !self.release_first.load(Ordering::SeqCst) {
+                    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                    self.observed_clock_ms.store(
+                        self.clock_offset_ms.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            }
+            let result = serde_json::from_value(json!({
+                "content": [{"type": "text", "text": format!("completed-{}", task_id.as_str())}]
+            }))
+            .expect("typed application result");
+            initial.complete_task(result, None)?;
+            if ordinal == 1 {
+                self.successor_completed
+                    .send(task_id)
+                    .expect("successor observer remains live");
+            }
+            Ok(())
+        })
+    }
+}
+
+fn public_final_task_retention_boundary(expire_first: bool) {
+    let clock_origin = Instant::now();
+    let clock_offset_ms = Arc::new(AtomicUsize::new(0));
+    let store_clock = Arc::clone(&clock_offset_ms);
+    let store = Arc::new(
+        InMemoryFinalTaskStore::with_clock(
+            2,
+            Arc::new(move || {
+                clock_origin + Duration::from_millis(store_clock.load(Ordering::SeqCst) as u64)
+            }),
+        )
+        .expect("bounded public store with application-owned retention clock"),
+    );
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
+        FinalTaskRuntimeConfig::new(1_000, Some(10)).expect("finite one-second retention"),
+        Arc::new(|_| {}),
+    );
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let observed_clock_ms = Arc::new(AtomicUsize::new(usize::MAX));
+    let release_first = Arc::new(AtomicBool::new(false));
+    let first_dropped = Arc::new(AtomicBool::new(false));
+    let (started, starts) = mpsc::channel();
+    let (successor_completed, completion) = mpsc::channel();
+    let runner = runtime
+        .install_task_service(
+            2,
+            Arc::new(RetentionTaskSupervisor {
+                started,
+                successor_completed,
+                invocations: Arc::clone(&invocations),
+                clock_offset_ms: Arc::clone(&clock_offset_ms),
+                observed_clock_ms: Arc::clone(&observed_clock_ms),
+                release_first: Arc::clone(&release_first),
+                first_dropped: Arc::clone(&first_dropped),
+            }),
+        )
+        .expect("public application-owned supervisor installs");
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let server = auto::server_builder("final-tasks-retention", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::clone(&handler_calls),
+        })
+        .final_tasks(runtime)
+        .expect("public Tasks extension installs")
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public client discovers live Tasks server");
+    let create_task = |request_id| {
+        let outcome = final_tasks_runtime_block_on_bounded(
+            &cx,
+            client.connection().call_tool_final_outcome(
+                &cx,
+                RequestId::Number(request_id),
+                "public-final-task",
+                json!({}),
+                1 << 20,
+            ),
+        )
+        .expect("live tools/call creates a task");
+        let FinalToolCallOutcome::Task(created) = outcome else {
+            panic!("task-capable tool returns a real Task");
+        };
+        assert!(matches!(created.task, FinalTask::Working(_)));
+        created.task.base().task_id.clone()
+    };
+    let first_id = create_task(2);
+    assert_eq!(
+        starts
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("first task starts"),
+        first_id
+    );
+    // The successor has its own later deadline, while the first work remains owned.
+    clock_offset_ms.store(500, Ordering::SeqCst);
+    let successor_id = create_task(3);
+    assert_eq!(store.task_count(), 2);
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    // Only this clock value changes between the expiry and no-expiry scenarios.
+    clock_offset_ms.store(if expire_first { 1_001 } else { 999 }, Ordering::SeqCst);
+    if !expire_first {
+        let deadline = Instant::now() + FINAL_TASKS_E2E_BOUND;
+        while observed_clock_ms.load(Ordering::SeqCst) != 999 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(observed_clock_ms.load(Ordering::SeqCst), 999);
+        for (request_id, task_id) in [(4, &first_id), (5, &successor_id)] {
+            let retained = final_tasks_runtime_block_on_bounded(
+                &cx,
+                client.connection().get_task_final(
+                    &cx,
+                    RequestId::Number(request_id),
+                    task_id.clone(),
+                    1 << 20,
+                ),
+            )
+            .expect("unexpired tasks remain readable on the live server");
+            assert!(matches!(retained.task, FinalTask::Working(_)));
+        }
+        assert!(!first_dropped.load(Ordering::SeqCst));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(store.task_count(), 2);
+        // Ordinary application completion still lets this same service advance.
+        release_first.store(true, Ordering::SeqCst);
+    }
+    assert_eq!(
+        completion
+            .recv_timeout(FINAL_TASKS_E2E_BOUND)
+            .expect("same live service completes the successor"),
+        successor_id
+    );
+    assert!(first_dropped.load(Ordering::SeqCst));
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
+    let completed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.connection().get_task_final(
+            &cx,
+            RequestId::Number(6),
+            successor_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("public tasks/get returns the committed successor result");
+    let FinalTask::Completed { result, .. } = completed.task else {
+        panic!("successor must be Completed");
+    };
+    assert_eq!(
+        serde_json::to_value(result).expect("task result serializes")["content"][0]["text"],
+        format!("completed-{}", successor_id.as_str())
+    );
+    assert_eq!(store.task_count(), if expire_first { 1 } else { 2 });
+    if expire_first {
+        let error = final_tasks_runtime_block_on_bounded(
+            &cx,
+            client
+                .connection()
+                .get_task_final(&cx, RequestId::Number(7), first_id, 1 << 20),
+        )
+        .expect_err("expired task is not revived by the service");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(
+                fastmcp_rust::ModernHttpClientError::TasksRemoteError { code, .. }
+            ) if code.as_i32() == Some(McpErrorCode::InvalidParams.into())
+        ));
+    }
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+    drop(client);
+    fixture.shutdown();
+}
+
+#[test]
+fn workflow_final_tasks_retention_expiry_releases_work_and_runs_successor() {
+    public_final_task_retention_boundary(true);
+}
+
+#[test]
+fn workflow_final_tasks_unexpired_work_remains_owned() {
+    public_final_task_retention_boundary(false);
+}
+
+struct HoldingInitialTaskSupervisor;
+
+impl ApplicationTaskSupervisor for HoldingInitialTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            // Keep the first server's claim live until its caller-owned
+            // service context is cancelled. The runner then returns the
+            // durable work to the retained store for the reconstructed server.
+            let _handoff = handoff;
+            loop {
+                cx.checkpoint()
+                    .map_err(|error| McpError::internal_error(error.to_string()))?;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+        })
+    }
+}
+
+#[test]
+fn workflow_final_tasks_public_facade_rebuild_recovers_retained_work() {
+    let store = Arc::new(InMemoryFinalTaskStore::new(8).expect("bounded retained task store"));
+    let policy = FinalTaskRuntimeConfig::new(60_000, Some(1_000))
+        .expect("finite retained final Tasks policy");
+    let first_runtime = FinalTaskRuntime::new(store.clone(), policy.clone(), Arc::new(|_| {}));
+    let first_runner = first_runtime
+        .install_task_service(1, Arc::new(HoldingInitialTaskSupervisor))
+        .expect("first caller-owned service installs");
+    let first_server = auto::server_builder("final-tasks-rebuild-a", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .final_tasks(first_runtime)
+        .expect("first public facade server installs final Tasks")
+        .build();
+    let first_fixture = FinalTasksHttpFixture::spawn(first_server, first_runner);
+    let cx = Cx::for_request();
+    let first_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("final-tasks-rebuild-client", "1.0.0")
+            .protocol_plan(first_fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("first public facade client discovers final Tasks");
+    let created = final_tasks_runtime_block_on_bounded(
+        &cx,
+        first_client.connection().call_tool_final_outcome(
+            &cx,
+            RequestId::Number(2),
+            "public-final-task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("first facade server durably creates the task before caller-owned service shutdown");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("first public facade call returns the final Task branch");
+    };
+    let task_id = created.task.base().task_id.clone();
+    assert_eq!(
+        store.task_count(),
+        1,
+        "the retained application store owns the task"
+    );
+    drop(first_client);
+    first_fixture.shutdown();
+
+    let (input_required_tx, input_required_rx) = mpsc::sync_channel(1);
+    let (cancelled_tx, _cancelled_rx) = mpsc::sync_channel(1);
+    let recovered_runtime = FinalTaskRuntime::new(store.clone(), policy, Arc::new(|_| {}));
+    let recovered_runner = recovered_runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required: input_required_tx,
+                cancelled: cancelled_tx,
+            }),
+        )
+        .expect("reconstructed caller-owned service installs");
+    let recovered_server = auto::server_builder("final-tasks-rebuild-b", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .final_tasks(recovered_runtime)
+        .expect("reconstructed public facade server installs final Tasks")
+        .build();
+    let recovered_fixture = FinalTasksHttpFixture::spawn(recovered_server, recovered_runner);
+    input_required_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("reconstructed service recovers the retained initial work");
+    let recovered_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("final-tasks-rebuild-client", "1.0.0")
+            .protocol_plan(recovered_fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("reconstructed public facade client discovers final Tasks");
+    let recovered = final_tasks_runtime_block_on_bounded(
+        &cx,
+        recovered_client
+            .connection()
+            .get_task_final(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("reconstructed public facade server reads the retained task");
+    assert!(matches!(recovered.task, FinalTask::InputRequired { .. }));
+    assert_eq!(
+        store.task_count(),
+        1,
+        "reconstructed server preserves the one retained task without duplication"
+    );
+    drop(recovered_client);
+    recovered_fixture.shutdown();
+}
+
+struct LegacyTasksIsolationTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for LegacyTasksIsolationTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "legacy-task-isolation-tool".to_owned(),
+            description: Some("proves exact legacy Tasks isolation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![Content::text("exact legacy tool")])
+    }
+}
+
+#[test]
+fn workflow_exact_legacy_facade_rejects_final_tasks_without_mutation() {
+    let cx = Cx::for_testing();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let mut harness = LifecycleThreadHarness::spawn_detached(&cx, move |cx, transport| {
+        legacy_2024::server_builder("legacy-tasks-isolation", "1.0.0")
+            .tool(LegacyTasksIsolationTool {
+                calls: handler_calls,
+            })
+            .build()
+            .run_transport_returning_with_cx(cx, transport)
+    });
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        "exact legacy Tasks isolation",
+        "legacy-tasks-isolation",
+        lifecycle_legacy_opening(1),
+        false,
+    );
+    harness
+        .peer_mut()
+        .send(
+            &cx,
+            &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+        )
+        .expect("send exact-2024 initialized before the legacy Tasks rejection");
+    harness
+        .peer_mut()
+        .send(
+            &cx,
+            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tasks/get",
+                Some(json!({"taskId": "legacy-forbidden-task"})),
+                2_i64,
+            )),
+        )
+        .expect("send the exact final Tasks RPC to the legacy facade server");
+    let response = lifecycle_response(harness.peer_mut(), &cx, 2, "legacy Tasks refusal");
+    let error = response
+        .error
+        .expect("exact legacy Tasks RPC must receive a refusal");
+    assert_eq!(
+        error.code.as_i32(),
+        Some(McpErrorCode::MethodNotFound.into())
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "exact legacy Tasks rejection does not reach an application handler"
+    );
+    harness.peer.take();
+    harness
+        .settle("exact legacy Tasks isolation")
+        .expect("exact legacy server settles after the peer closes");
+}
+
+#[test]
+fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming_state() {
+    // Reuse the existing bounded HTTP fixture's idle service owner. This
+    // server deliberately exposes no Tasks capability; the service is only
+    // responsible for the fixture lifecycle while MRTR remains ordinary
+    // final-core transport state.
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite fixture task policy"),
+        Arc::new(|_| {}),
+    );
+    let (input_required, _input_required_observer) = mpsc::sync_channel::<()>(1);
+    let (cancelled, _cancelled_observer) = mpsc::sync_channel::<()>(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required,
+                cancelled,
+            }),
+        )
+        .expect("bounded fixture service installs");
+    let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resumed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = auto::server_builder("public-state-only-mrtr", "1.0.0")
+        .tool(PublicStateOnlyMrtrTool {
+            initial_calls: Arc::clone(&initial_calls),
+            resumed_calls: Arc::clone(&resumed_calls),
+        })
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let mut client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-state-only-mrtr-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public HTTP client selects the live modern server");
+
+    let initial = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({ "name": "public-state-only-mrtr", "arguments": {} }),
+        ),
+    )
+    .expect("the live server issues a state-only continuation");
+    let CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) = initial else {
+        panic!("the initial public HTTP result is state-only input_required");
+    };
+    assert!(
+        result.input_requests().is_none(),
+        "the real server omits inputRequests rather than manufacturing an empty map"
+    );
+    let request_state = result
+        .request_state()
+        .expect("the real state-only result carries framework-issued state")
+        .to_owned();
+
+    let explicit_empty = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({
+                "name": "public-state-only-mrtr",
+                "arguments": {},
+                "inputResponses": {},
+                "requestState": request_state,
+            }),
+        ),
+    )
+    .expect_err("only adding an explicit empty response map must reject");
+    let auto::HttpClientError::CoreResult(explicit_empty) = explicit_empty else {
+        panic!("the live server rejection remains a public core error");
+    };
+    assert_eq!(explicit_empty.code, McpErrorCode::InvalidParams);
+    assert_eq!(
+        explicit_empty.message, "Invalid MRTR input request or response map",
+        "the explicit empty map reaches the server's state-only continuation admission"
+    );
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let completed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({
+                "name": "public-state-only-mrtr",
+                "arguments": {},
+                "requestState": request_state,
+            }),
+        ),
+    )
+    .expect("the unchanged absent-member retry consumes the retained continuation");
+    assert!(matches!(
+        completed,
+        CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+    ));
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let mut callback_count = 0;
+    let automatic = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-state-only-mrtr",
+            json!({}),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded state-only SSE limits"),
+            1 << 20,
+            |input_required| {
+                callback_count += 1;
+                assert!(input_required.input_requests().is_none());
+                assert!(input_required.request_state().is_some());
+                Ok(BTreeMap::new())
+            },
+        ),
+    )
+    .expect("the public MRTR helper sends the state-only retry without inputResponses");
+    assert!(matches!(automatic, FinalCoreResult::ToolsCall { .. }));
+    assert_eq!(callback_count, 1);
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    fixture.shutdown();
+}
+
+#[test]
+fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds() {
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite fixture task policy"),
+        Arc::new(|_| {}),
+    );
+    let (input_required, _input_required_observer) = mpsc::sync_channel::<()>(1);
+    let (cancelled, _cancelled_observer) = mpsc::sync_channel::<()>(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required,
+                cancelled,
+            }),
+        )
+        .expect("bounded fixture service installs");
+
+    let resource_initial = Arc::new(AtomicUsize::new(0));
+    let resource_resumed = Arc::new(AtomicUsize::new(0));
+    let resource_legacy = Arc::new(AtomicUsize::new(0));
+    let round_initial = Arc::new(AtomicUsize::new(0));
+    let round_resumed = Arc::new(AtomicUsize::new(0));
+    let prompt_initial = Arc::new(AtomicUsize::new(0));
+    let prompt_resumed = Arc::new(AtomicUsize::new(0));
+    let prompt_legacy = Arc::new(AtomicUsize::new(0));
+    let server = auto::server_builder("public-resource-prompt-mrtr", "1.0.0")
+        .resource(PublicTypedMrtrResource {
+            uri: "file:///public-typed-mrtr-resource",
+            name: "public-typed-mrtr-resource",
+            initial_calls: Arc::clone(&resource_initial),
+            resumed_calls: Arc::clone(&resource_resumed),
+            legacy_calls: Arc::clone(&resource_legacy),
+            input_required_after_resume: Arc::new(AtomicUsize::new(0)),
+        })
+        .resource(PublicTypedMrtrResource {
+            uri: "file:///public-round-bound-mrtr-resource",
+            name: "public-round-bound-mrtr-resource",
+            initial_calls: Arc::clone(&round_initial),
+            resumed_calls: Arc::clone(&round_resumed),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            input_required_after_resume: Arc::new(AtomicUsize::new(MAX_MRTR_CONTINUATION_ROUNDS)),
+        })
+        .prompt(PublicTypedMrtrPrompt {
+            initial_requests: Arc::clone(&prompt_initial),
+            resume_attempts: Arc::clone(&prompt_resumed),
+            legacy_fallbacks: Arc::clone(&prompt_legacy),
+        })
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let mut client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-resource-prompt-mrtr-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public HTTP client selects the live modern server");
+
+    let resource_initial_result = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({"uri": "file:///public-typed-mrtr-resource"}),
+        ),
+    )
+    .expect("modern resource handler emits typed input_required");
+    let CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }) =
+        resource_initial_result
+    else {
+        panic!("public resource result remains a typed input_required result");
+    };
+    let resource_state = result
+        .request_state()
+        .expect("framework issues public resource retry state")
+        .to_owned();
+    assert_ne!(resource_state, "handler-forged-resource-prompt-state");
+    assert!(
+        result
+            .input_requests()
+            .and_then(|requests| requests.get("roots"))
+            .is_some(),
+        "public resource input_required retains the typed roots descriptor"
+    );
+
+    let bad_resource_state = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": format!("{resource_state}-bad"),
+            }),
+        ),
+    )
+    .expect_err("changing only resource requestState rejects without consuming the exchange");
+    let auto::HttpClientError::CoreResult(bad_resource_state) = bad_resource_state else {
+        panic!("resource requestState rejection remains a public core error");
+    };
+    assert_eq!(bad_resource_state.code, McpErrorCode::InvalidParams);
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 0);
+
+    let resource_complete = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": resource_state,
+            }),
+        ),
+    )
+    .expect("a later stateless POST consumes the retained typed resource exchange");
+    let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = resource_complete else {
+        panic!("resource continuation returns FinalReadResourceResult");
+    };
+    let FinalReadResourceResult {
+        contents,
+        ttl_ms,
+        cache_scope,
+    } = result.payload;
+    assert!(contents.is_empty());
+    assert_eq!(ttl_ms, CacheTtl::milliseconds(17));
+    assert_eq!(cache_scope, CacheScope::Private);
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_legacy.load(Ordering::SeqCst), 0);
+
+    let prompt_initial_result = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({"name": "public-typed-mrtr-prompt", "arguments": {}}),
+        ),
+    )
+    .expect("modern prompt handler emits typed input_required");
+    let CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) =
+        prompt_initial_result
+    else {
+        panic!("public prompt result remains a typed input_required result");
+    };
+    let prompt_state = result
+        .request_state()
+        .expect("framework issues public prompt retry state")
+        .to_owned();
+
+    let bad_prompt_inputs = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({
+                "name": "public-typed-mrtr-prompt",
+                "arguments": {},
+                "inputResponses": {"not-roots": {"roots": []}},
+                "requestState": prompt_state,
+            }),
+        ),
+    )
+    .expect_err("changing only prompt inputResponses rejects without consuming the exchange");
+    let auto::HttpClientError::CoreResult(bad_prompt_inputs) = bad_prompt_inputs else {
+        panic!("prompt inputResponses rejection remains a public core error");
+    };
+    assert_eq!(bad_prompt_inputs.code, McpErrorCode::InvalidParams);
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 0);
+
+    let prompt_complete = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({
+                "name": "public-typed-mrtr-prompt",
+                "arguments": {},
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": prompt_state,
+            }),
+        ),
+    )
+    .expect("a later stateless POST consumes the retained typed prompt exchange");
+    let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = prompt_complete else {
+        panic!("prompt continuation returns FinalGetPromptResult");
+    };
+    let FinalGetPromptResult {
+        description,
+        messages,
+    } = result.payload;
+    assert_eq!(description.as_deref(), Some("exact final prompt result"));
+    assert!(matches!(
+        messages.as_slice(),
+        [FinalPromptMessage {
+            role: Role::Assistant,
+            content: ContentBlock::Text { text, .. },
+        }] if text == "exact final prompt content"
+    ));
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_legacy.load(Ordering::SeqCst), 0);
+
+    let mut oversized_state = None;
+    let oversized = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-typed-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded resource MRTR SSE limits"),
+            1 << 20,
+            |input_required| {
+                oversized_state = input_required.request_state().map(str::to_owned);
+                Ok((0..=MAX_MRTR_INPUT_RESPONSES)
+                    .map(|index| (format!("roots-{index}"), json!({"roots": []})))
+                    .collect())
+            },
+        ),
+    )
+    .expect_err("shared client input-response bound rejects before a retry POST");
+    assert!(
+        oversized
+            .to_string()
+            .contains("inputResponses must not exceed")
+    );
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 2);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 1);
+    let oversized_state = oversized_state.expect("bounded input rejection retains issued state");
+
+    let retained_after_input_bound = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": oversized_state,
+            }),
+        ),
+    )
+    .expect("input-bound rejection preserves the issued resource exchange");
+    assert!(matches!(
+        retained_after_input_bound,
+        CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+    ));
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 2);
+
+    let mut round_callbacks = 0;
+    let round_bound = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-round-bound-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded round-limit SSE limits"),
+            1 << 20,
+            |_| {
+                round_callbacks += 1;
+                Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))]))
+            },
+        ),
+    )
+    .expect_err("shared client round bound stops before a fifth response callback");
+    assert!(
+        round_bound
+            .to_string()
+            .contains("continuation-round limit exceeded")
+    );
+    assert_eq!(round_callbacks, MAX_MRTR_CONTINUATION_ROUNDS);
+    assert_eq!(round_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        round_resumed.load(Ordering::SeqCst),
+        MAX_MRTR_CONTINUATION_ROUNDS,
+        "the shared driver never dispatches a fifth continuation"
+    );
+
+    let cancelled_cx = Cx::for_request();
+    cancelled_cx.set_cancel_requested(true);
+    let cancelled = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_with_mrtr_retry(
+            &cancelled_cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-typed-mrtr-prompt",
+            HashMap::new(),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded cancellation SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("a cancelled caller context cannot dispatch more prompt MRTR work");
+    assert!(cancelled.to_string().contains("cancel"));
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+
+    let mut legacy = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-resource-prompt-mrtr-legacy-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("the fixture retains its exact legacy HTTP route");
+    let legacy_resource = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-typed-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded legacy resource SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("exact legacy selection rejects public resource MRTR before dispatch");
+    assert!(matches!(
+        legacy_resource,
+        auto::HttpClientError::Connection(ClientHttpConnectionError::MrtrRequiresModern)
+    ));
+    let legacy_prompt = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy.get_prompt_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-typed-mrtr-prompt",
+            HashMap::new(),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded legacy prompt SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("exact legacy selection rejects public prompt MRTR before dispatch");
+    assert!(matches!(
+        legacy_prompt,
+        auto::HttpClientError::Connection(ClientHttpConnectionError::MrtrRequiresModern)
+    ));
+    assert_eq!(
+        resource_legacy.load(Ordering::SeqCst),
+        0,
+        "exact legacy resource MRTR rejection must not enter the legacy resource handler"
+    );
+    assert_eq!(
+        prompt_legacy.load(Ordering::SeqCst),
+        0,
+        "exact legacy prompt MRTR rejection must not enter the legacy prompt handler"
+    );
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 2);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 2);
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+
+    drop(legacy);
+    fixture.shutdown();
 }
 
 // ============================================================================
@@ -1452,14 +3954,12 @@ impl ToolHandler for SessionGetHandler {
     }
 }
 
-use std::sync::Arc;
-
 #[test]
 fn workflow_concurrent_clients_isolation() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
     // Create multiple client-server transport pairs
-    let mut server_handles = Vec::new();
+    let mut server_joins = ThreadJoins::new(Vec::new());
     let mut clients_and_servers = Vec::new();
 
     for client_num in 0..3 {
@@ -1472,12 +3972,14 @@ fn workflow_concurrent_clients_isolation() {
             .build();
 
         // Spawn server thread
-        let handle = spawn_thread(move || {
-            server.run_transport(server_transport);
-        });
-        server_handles.push(handle);
+        let handle = spawn_runtime_server(
+            server,
+            server_transport,
+            "server transport loop settles cleanly",
+        );
+        server_joins.push(handle);
 
-        let client = TestClient::new(client_transport)
+        let client = TestClient::new(client_transport, Cx::for_testing())
             .with_client_info(format!("client-{}", client_num), "1.0.0");
 
         clients_and_servers.push((client_num, client));
@@ -1498,10 +4000,10 @@ fn workflow_concurrent_clients_isolation() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert!(text.contains(&format!("value_from_client_{}", num)));
@@ -1514,10 +4016,10 @@ fn workflow_concurrent_clients_isolation() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         // Each client should see only its own value
@@ -1529,8 +4031,8 @@ fn workflow_concurrent_clients_isolation() {
         );
     }
 
-    let _joins = ThreadJoins::new(server_handles);
     drop(clients_and_servers);
+    drop(server_joins);
 }
 
 #[test]
@@ -1539,27 +4041,34 @@ fn workflow_concurrent_interleaved_operations() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let operation_counter = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..4 {
         let counter = Arc::clone(&operation_counter);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
         let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("interleaved-server", "1.0.0")
                 .tool(EchoTool)
                 .build();
 
-            let server_handle = spawn_thread(move || {
-                server.run_transport(server_transport);
-            });
-            let _server_join = ThreadJoins::new(vec![server_handle]);
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
+            server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport)
+            let mut client = TestClient::new(client_transport, Cx::for_testing())
                 .with_client_info(format!("client-{}", client_num), "1.0.0");
 
+            worker_progress.advance("client initialization");
             client.initialize().unwrap();
+            worker_progress.advance("RPC");
 
             // Perform multiple operations
             for op in 0..5 {
@@ -1572,10 +4081,10 @@ fn workflow_concurrent_interleaved_operations() {
                     .unwrap();
 
                 assert!(
-                    matches!(result.first(), Some(Content::Text { .. })),
+                    matches!(result.first(), Some(LegacyContent::Text { .. })),
                     "expected text content"
                 );
-                let Some(Content::Text { text }) = result.first() else {
+                let Some(LegacyContent::Text { text, .. }) = result.first() else {
                     std::panic::panic_any("expected text content".to_string());
                 };
                 assert!(
@@ -1583,22 +4092,17 @@ fn workflow_concurrent_interleaved_operations() {
                     "Operation {} result mismatch",
                     op_num
                 );
+                worker_progress.advance("RPC");
             }
 
             client_num
         });
 
-        handles.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads to complete
-    let mut completed_clients = Vec::new();
-    for handle in handles {
-        let Ok(client_num) = handle.join() else {
-            return;
-        };
-        completed_clients.push(client_num);
-    }
+    let completed_clients = workers.join_all("interleaved client worker");
 
     // Verify all clients completed
     assert_eq!(completed_clients.len(), 4);
@@ -1614,12 +4118,15 @@ fn workflow_concurrent_no_crosstalk() {
     use std::thread;
 
     let results = Arc::new(Mutex::new(Vec::new()));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..3 {
         let results = Arc::clone(&results);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
         let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("crosstalk-server", "1.0.0")
@@ -1627,19 +4134,24 @@ fn workflow_concurrent_no_crosstalk() {
                 .tool(SessionGetHandler)
                 .build();
 
-            let server_handle = spawn_thread(move || {
-                server.run_transport(server_transport);
-            });
-            let _server_join = ThreadJoins::new(vec![server_handle]);
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
+            server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport);
+            let mut client = TestClient::new(client_transport, Cx::for_testing());
+            worker_progress.advance("client initialization");
             client.initialize().unwrap();
+            worker_progress.advance("RPC");
 
             // Store a per-client value (ensure no cross-talk).
             let value = format!("value_{}", client_num);
             client
                 .call_tool("session_store", json!({"key": "value", "value": &value}))
                 .unwrap();
+            worker_progress.advance("RPC");
 
             // Sleep briefly to allow interleaving
             thread::sleep(std::time::Duration::from_millis(10));
@@ -1648,12 +4160,13 @@ fn workflow_concurrent_no_crosstalk() {
             let result = client
                 .call_tool("session_get", json!({"key": "value"}))
                 .unwrap();
+            worker_progress.advance("RPC");
 
             assert!(
-                matches!(result.first(), Some(Content::Text { .. })),
+                matches!(result.first(), Some(LegacyContent::Text { .. })),
                 "expected text content"
             );
-            let Some(Content::Text { text }) = result.first() else {
+            let Some(LegacyContent::Text { text, .. }) = result.first() else {
                 return;
             };
             let retrieved = text.clone();
@@ -1664,13 +4177,11 @@ fn workflow_concurrent_no_crosstalk() {
                 .push((client_num, value.clone(), retrieved));
         });
 
-        handles.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads
-    for handle in handles {
-        assert!(handle.join().is_ok(), "thread panicked");
-    }
+    workers.join_all("crosstalk client worker");
 
     // Verify each client got its own value back
     let results = results.lock().unwrap();
@@ -1697,12 +4208,14 @@ fn workflow_concurrent_session_state_persistence() {
         .tool(SessionGetHandler)
         .build();
 
-    let server_handle = spawn_thread(move || {
-        server.run_transport(server_transport);
-    });
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Store multiple values
@@ -1722,10 +4235,10 @@ fn workflow_concurrent_session_state_persistence() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("value_{}", i), "Key {} has wrong value", i);
@@ -1737,10 +4250,10 @@ fn workflow_concurrent_session_state_persistence() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "NOT_FOUND");
@@ -1750,18 +4263,20 @@ fn workflow_concurrent_session_state_persistence() {
 fn workflow_concurrent_stress_test() {
     use fastmcp_transport::memory::create_memory_transport_pair;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
 
     const NUM_CLIENTS: usize = 5;
     const OPS_PER_CLIENT: usize = 10;
 
     let success_count = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
+    let mut workers = WorkerJoins::new();
 
     for client_num in 0..NUM_CLIENTS {
         let success = Arc::clone(&success_count);
+        let progress = WorkerProgress::new();
+        let worker_progress = progress.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = spawn_thread(move || {
+            let mut server_join = ThreadJoins::with_worker_progress(worker_progress.clone());
             let (client_transport, server_transport) = create_memory_transport_pair();
 
             let server = Server::new("stress-server", "1.0.0")
@@ -1770,14 +4285,19 @@ fn workflow_concurrent_stress_test() {
                 .tool(SessionGetHandler)
                 .build();
 
-            thread::spawn(move || {
-                server.run_transport(server_transport);
-            });
+            let server_handle = spawn_runtime_server(
+                server,
+                server_transport,
+                "server transport loop settles cleanly",
+            );
+            server_join.push(server_handle);
 
-            let mut client = TestClient::new(client_transport);
-            if client.initialize().is_err() {
-                return;
-            }
+            let mut client = TestClient::new(client_transport, Cx::for_testing());
+            worker_progress.advance("client initialization");
+            client
+                .initialize()
+                .expect("stress client worker must initialize successfully");
+            worker_progress.advance("RPC");
 
             for op in 0..OPS_PER_CLIENT {
                 // Alternate between different operations
@@ -1796,16 +4316,15 @@ fn workflow_concurrent_stress_test() {
                 if result.is_ok() {
                     success.fetch_add(1, Ordering::SeqCst);
                 }
+                worker_progress.advance("RPC");
             }
         });
 
-        handles.push(handle);
+        workers.push(handle, progress);
     }
 
     // Wait for all threads
-    for handle in handles {
-        let _ = handle.join();
-    }
+    workers.join_all("stress client worker");
 
     // Verify most operations succeeded
     let total_success = success_count.load(Ordering::SeqCst);
@@ -1851,14 +4370,44 @@ fn session_initialization_stores_server_info() {
 #[test]
 fn session_capabilities_reflect_server_handlers() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
+
+    let mut server_joins = ThreadJoins::new(Vec::new());
 
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
+    server_joins.push(server_handle);
 
-    let mut client = TestClient::new(client_transport);
+    // Server with only resources
+    let (client_transport2, server_transport2) = create_memory_transport_pair();
+    let server2 = Server::new("resources-only", "1.0.0")
+        .resource(StatusResource)
+        .build();
+    let server_handle2 = spawn_runtime_server(
+        server2,
+        server_transport2,
+        "server transport loop settles cleanly",
+    );
+    server_joins.push(server_handle2);
+
+    // Server with only prompts
+    let (client_transport3, server_transport3) = create_memory_transport_pair();
+    let server3 = Server::new("prompts-only", "1.0.0")
+        .prompt(HelpPromptPrompt)
+        .build();
+    let server_handle3 = spawn_runtime_server(
+        server3,
+        server_transport3,
+        "server transport loop settles cleanly",
+    );
+    server_joins.push(server_handle3);
+
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     let caps = client.server_capabilities().unwrap();
@@ -1866,14 +4415,7 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps.resources.is_none());
     assert!(caps.prompts.is_none());
 
-    // Server with only resources
-    let (client_transport2, server_transport2) = create_memory_transport_pair();
-    let server2 = Server::new("resources-only", "1.0.0")
-        .resource(StatusResource)
-        .build();
-    thread::spawn(move || server2.run_transport(server_transport2));
-
-    let mut client2 = TestClient::new(client_transport2);
+    let mut client2 = TestClient::new(client_transport2, Cx::for_testing());
     client2.initialize().unwrap();
 
     let caps2 = client2.server_capabilities().unwrap();
@@ -1881,14 +4423,7 @@ fn session_capabilities_reflect_server_handlers() {
     assert!(caps2.resources.is_some());
     assert!(caps2.prompts.is_none());
 
-    // Server with only prompts
-    let (client_transport3, server_transport3) = create_memory_transport_pair();
-    let server3 = Server::new("prompts-only", "1.0.0")
-        .prompt(HelpPromptPrompt)
-        .build();
-    thread::spawn(move || server3.run_transport(server_transport3));
-
-    let mut client3 = TestClient::new(client_transport3);
+    let mut client3 = TestClient::new(client_transport3, Cx::for_testing());
     client3.initialize().unwrap();
 
     let caps3 = client3.server_capabilities().unwrap();
@@ -1913,13 +4448,17 @@ fn session_protocol_version_negotiated() {
 #[test]
 fn session_operations_fail_before_init() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test-server", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
 
     // All operations should fail before initialization
     assert!(client.list_tools().is_err());
@@ -1936,13 +4475,17 @@ fn session_operations_fail_before_init() {
 #[test]
 fn session_close_graceful() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("close-test", "1.0.0").tool(EchoTool).build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Perform some operations
@@ -1961,7 +4504,8 @@ fn session_close_graceful() {
 #[test]
 fn session_state_isolated_per_client() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
+
+    let mut server_joins = ThreadJoins::new(Vec::new());
 
     // Create two separate client-server pairs
     let (client_a_transport, server_a_transport) = create_memory_transport_pair();
@@ -1977,11 +4521,21 @@ fn session_state_isolated_per_client() {
         .tool(SessionGetHandler)
         .build();
 
-    thread::spawn(move || server_a.run_transport(server_a_transport));
-    thread::spawn(move || server_b.run_transport(server_b_transport));
+    let server_a_handle = spawn_runtime_server(
+        server_a,
+        server_a_transport,
+        "server transport loop settles cleanly",
+    );
+    server_joins.push(server_a_handle);
+    let server_b_handle = spawn_runtime_server(
+        server_b,
+        server_b_transport,
+        "server transport loop settles cleanly",
+    );
+    server_joins.push(server_b_handle);
 
-    let mut client_a = TestClient::new(client_a_transport);
-    let mut client_b = TestClient::new(client_b_transport);
+    let mut client_a = TestClient::new(client_a_transport, Cx::for_testing());
+    let mut client_b = TestClient::new(client_b_transport, Cx::for_testing());
 
     client_a.initialize().unwrap();
     client_b.initialize().unwrap();
@@ -2013,11 +4567,11 @@ fn session_state_isolated_per_client() {
     assert!(
         matches!(
             (&result_a[0], &result_b[0]),
-            (Content::Text { .. }, Content::Text { .. })
+            (LegacyContent::Text { .. }, LegacyContent::Text { .. })
         ),
         "expected text content"
     );
-    let (Content::Text { text: text_a }, Content::Text { text: text_b }) =
+    let (LegacyContent::Text { text: text_a, .. }, LegacyContent::Text { text: text_b, .. }) =
         (&result_a[0], &result_b[0])
     else {
         return;
@@ -2051,16 +4605,20 @@ fn session_reinitialize_fails() {
 #[test]
 fn session_tracks_client_info() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("client-info-test", "1.0.0")
         .tool(EchoTool)
         .build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client =
-        TestClient::new(client_transport).with_client_info("custom-client-name", "2.5.0");
+    let mut client = TestClient::new(client_transport, Cx::for_testing())
+        .with_client_info("custom-client-name", "2.5.0");
 
     // Verify client info is set before initialization
     let init = client.initialize().unwrap();
@@ -2080,25 +4638,21 @@ fn session_multiple_clients_independent_lifecycle() {
     use fastmcp_transport::memory::create_memory_transport_pair;
 
     // Create multiple independent client-server pairs
+    let mut server_joins = ThreadJoins::new(Vec::new());
     let mut clients = Vec::new();
-    let mut server_handles = Vec::new();
 
     for i in 0..3 {
         let (client_transport, server_transport) = create_memory_transport_pair();
         let server = Server::new(&format!("lifecycle-server-{}", i), "1.0.0")
             .tool(EchoTool)
             .build();
-        let handle = spawn_thread(move || {
-            server.run_transport_returning(server_transport);
-        });
-        server_handles.push(handle);
+        let handle = spawn_runtime_server(server, server_transport, "lifecycle server loop");
+        server_joins.push(handle);
 
-        let client = TestClient::new(client_transport)
+        let client = TestClient::new(client_transport, Cx::for_testing())
             .with_client_info(format!("lifecycle-client-{}", i), "1.0.0");
         clients.push((i, client));
     }
-
-    let _joins = ThreadJoins::new(server_handles);
 
     // Initialize clients in order
     for (i, client) in &mut clients {
@@ -2112,10 +4666,10 @@ fn session_multiple_clients_independent_lifecycle() {
             .call_tool("echo", json!({"message": format!("from-client-{}", i)}))
             .unwrap();
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert!(text.contains(&format!("from-client-{}", i)));
@@ -2137,12 +4691,10 @@ fn session_state_persists_across_operations() {
         .tool(SessionGetHandler)
         .tool(EchoTool)
         .build();
-    let handle = spawn_thread(move || {
-        server.run_transport_returning(server_transport);
-    });
+    let handle = spawn_runtime_server(server, server_transport, "persistence server loop");
     let _joins = ThreadJoins::new(vec![handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
     client.initialize().unwrap();
 
     // Store a value
@@ -2166,10 +4718,10 @@ fn session_state_persists_across_operations() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "stored_value", "Session state should persist");
@@ -2326,11 +4878,13 @@ fn setup_tool_test_server() -> TestHarness {
         .tool(FailOnDemandTool)
         .build();
 
-    let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
-    });
+    let handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 #[test]
@@ -2343,10 +4897,10 @@ fn tool_call_string_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("string_val: hello world"));
@@ -2362,10 +4916,10 @@ fn tool_call_integer_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("int_val: 42"));
@@ -2381,10 +4935,10 @@ fn tool_call_float_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("float_val: 3.14159"));
@@ -2400,10 +4954,10 @@ fn tool_call_boolean_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("bool_val: true"));
@@ -2413,10 +4967,10 @@ fn tool_call_boolean_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("bool_val: false"));
@@ -2432,10 +4986,10 @@ fn tool_call_array_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("array_val: [len=3]"));
@@ -2454,10 +5008,10 @@ fn tool_call_object_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("object_val: {keys=2}"));
@@ -2473,10 +5027,10 @@ fn tool_call_null_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("null_val: null"));
@@ -2494,16 +5048,18 @@ fn tool_call_multiple_argument_types() {
                 "string_val": "test",
                 "int_val": 100,
                 "bool_val": true,
-                "array_val": [1, 2, 3]
+                // This handler declares `array_val` as an array of strings,
+                // and input validation enforces that declared schema.
+                "array_val": ["one", "two", "three"]
             }),
         )
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("string_val: test"));
@@ -2520,10 +5076,10 @@ fn tool_call_empty_arguments() {
     let result = client.call_tool("types_test", json!({})).unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("(no arguments provided)"));
@@ -2539,10 +5095,10 @@ fn tool_call_required_argument_provided() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("required: value123"));
@@ -2565,10 +5121,10 @@ fn tool_call_required_and_optional_arguments() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("required: required_value"));
@@ -2601,10 +5157,10 @@ fn tool_call_returns_multiple_content() {
 
     for (i, content) in result.iter().enumerate() {
         assert!(
-            matches!(content, Content::Text { .. }),
+            matches!(content, LegacyContent::Text { .. }),
             "expected text content"
         );
-        let Content::Text { text } = content else {
+        let LegacyContent::Text { text, .. } = content else {
             return;
         };
         assert_eq!(text, &format!("Item {}", i + 1));
@@ -2646,10 +5202,10 @@ fn tool_call_unicode_arguments() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text, "こんにちは世界 🌍 مرحبا");
@@ -2668,10 +5224,10 @@ fn tool_call_special_characters() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("Line 1"));
@@ -2690,10 +5246,10 @@ fn tool_call_large_string_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert_eq!(text.len(), 10_000);
@@ -2720,10 +5276,10 @@ fn tool_call_nested_object_argument() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("object_val: {keys=1}"));
@@ -2739,10 +5295,10 @@ fn tool_call_negative_numbers() {
         .unwrap();
 
     assert!(
-        matches!(result.first(), Some(Content::Text { .. })),
+        matches!(result.first(), Some(LegacyContent::Text { .. })),
         "expected text content"
     );
-    let Some(Content::Text { text }) = result.first() else {
+    let Some(LegacyContent::Text { text, .. }) = result.first() else {
         return;
     };
     assert!(text.contains("int_val: -42"));
@@ -2761,10 +5317,10 @@ fn tool_call_sequential_success() {
             .unwrap();
 
         assert!(
-            matches!(result.first(), Some(Content::Text { .. })),
+            matches!(result.first(), Some(LegacyContent::Text { .. })),
             "expected text content"
         );
-        let Some(Content::Text { text }) = result.first() else {
+        let Some(LegacyContent::Text { text, .. }) = result.first() else {
             return;
         };
         assert_eq!(text, &format!("call_{}", i));
@@ -2797,7 +5353,14 @@ fn tool_call_alternating_success_failure() {
 // ============================================================================
 
 /// Resource that returns plain text content.
-#[resource(uri = "text://plain", name = "Plain Text", mime_type = "text/plain")]
+#[resource(
+    uri = "text://plain",
+    name = "Plain Text",
+    // Explicit description: the macro otherwise falls back to the doc
+    // comment above, which is the documented default.
+    description = "Returns plain text content",
+    mime_type = "text/plain"
+)]
 fn plain_text() -> String {
     "Hello, World!".to_string()
 }
@@ -2920,6 +5483,15 @@ fn failing_res() -> McpResult<String> {
     ))
 }
 
+fn require_legacy_text<'a>(content: &'a LegacyResourceContent, context: &str) -> &'a str {
+    match content {
+        LegacyResourceContent::Text { text, .. } => text.as_str(),
+        LegacyResourceContent::Blob { .. } => {
+            panic!("expected Text resource for {context}, got Blob variant: {content:?}");
+        }
+    }
+}
+
 fn setup_resource_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("resource-test-server")
@@ -2936,11 +5508,13 @@ fn setup_resource_test_server() -> TestHarness {
         .resource(FailingResResource)
         .build();
 
-    let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
-    });
+    let handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
 
-    TestHarness::new(TestClient::new(client_transport), handle)
+    TestHarness::new(TestClient::new(client_transport, Cx::for_testing()), handle)
 }
 
 #[test]
@@ -2951,10 +5525,22 @@ fn resource_read_plain_text() {
     let content = client.read_resource("text://plain").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].uri, "text://plain");
-    assert_eq!(content[0].mime_type.as_deref(), Some("text/plain"));
-    assert_eq!(content[0].text.as_deref(), Some("Hello, World!"));
-    assert!(content[0].blob.is_none());
+    assert!(matches!(&content[0], LegacyResourceContent::Text { .. }));
+    let LegacyResourceContent::Text {
+        uri,
+        mime_type,
+        text,
+        ..
+    } = &content[0]
+    else {
+        panic!(
+            "expected Text content in text://plain, got {:?}",
+            content[0]
+        );
+    };
+    assert_eq!(uri, "text://plain");
+    assert_eq!(mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(text, "Hello, World!");
 }
 
 #[test]
@@ -2965,9 +5551,18 @@ fn resource_read_json() {
     let content = client.read_resource("data://config.json").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(content[0].mime_type.as_deref(), Some("application/json"));
+    let LegacyResourceContent::Text {
+        mime_type, text, ..
+    } = &content[0]
+    else {
+        panic!(
+            "expected Text content in data://config.json, got {:?}",
+            content[0]
+        );
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/json"));
 
-    let json: serde_json::Value = serde_json::from_str(content[0].text.as_ref().unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(json["name"], "test-config");
     assert_eq!(json["version"], "1.0.0");
     assert_eq!(json["settings"]["debug"], true);
@@ -2982,15 +5577,19 @@ fn resource_read_binary() {
     let content = client.read_resource("binary://data.bin").unwrap();
 
     assert_eq!(content.len(), 1);
-    assert_eq!(
-        content[0].mime_type.as_deref(),
-        Some("application/octet-stream")
-    );
-    assert!(content[0].text.is_none());
-    assert!(content[0].blob.is_some());
+    assert!(matches!(&content[0], LegacyResourceContent::Blob { .. }));
+    let LegacyResourceContent::Blob {
+        mime_type, blob, ..
+    } = &content[0]
+    else {
+        panic!(
+            "expected Blob content in binary://data.bin, got {:?}",
+            content[0]
+        );
+    };
+    assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
 
     // Verify blob is base64 encoded
-    let blob = content[0].blob.as_ref().unwrap();
     assert!(!blob.is_empty());
     // Base64 uses only alphanumeric chars and +/=
     assert!(
@@ -3007,7 +5606,7 @@ fn resource_read_unicode() {
     let content = client.read_resource("text://unicode").unwrap();
 
     assert_eq!(content.len(), 1);
-    let text = content[0].text.as_ref().unwrap();
+    let text = require_legacy_text(&content[0], "text://unicode");
     assert!(text.contains("日本語"));
     assert!(text.contains("中文"));
     assert!(text.contains("العربية"));
@@ -3023,7 +5622,7 @@ fn resource_read_large_content() {
     let content = client.read_resource("data://large").unwrap();
 
     assert_eq!(content.len(), 1);
-    let text = content[0].text.as_ref().unwrap();
+    let text = require_legacy_text(&content[0], "data://large");
     assert_eq!(text.len(), 100_000);
     assert!(text.chars().all(|c| c == 'x'));
 }
@@ -3037,9 +5636,20 @@ fn resource_read_multiple_content_items() {
 
     assert_eq!(content.len(), 3, "Should return 3 content items");
 
-    assert_eq!(content[0].text.as_deref(), Some("Part 1"));
-    assert_eq!(content[1].text.as_deref(), Some("Part 2"));
-    assert_eq!(content[2].text.as_deref(), Some("Part 3"));
+    let [
+        LegacyResourceContent::Text { text: first, .. },
+        LegacyResourceContent::Text { text: second, .. },
+        LegacyResourceContent::Text { text: third, .. },
+    ] = content.as_slice()
+    else {
+        panic!(
+            "expected 3 Text contents in data://multi, got {:?}",
+            content.as_slice()
+        );
+    };
+    assert_eq!(first, "Part 1");
+    assert_eq!(second, "Part 2");
+    assert_eq!(third, "Part 3");
 }
 
 #[test]
@@ -3094,9 +5704,12 @@ fn resource_read_sequential() {
     let content2 = client.read_resource("data://config.json").unwrap();
     let content3 = client.read_resource("text://unicode").unwrap();
 
-    assert_eq!(content1[0].text.as_deref(), Some("Hello, World!"));
-    assert!(content2[0].text.as_ref().unwrap().contains("test-config"));
-    assert!(content3[0].text.as_ref().unwrap().contains("日本語"));
+    let text1 = require_legacy_text(&content1[0], "text://plain");
+    let text2 = require_legacy_text(&content2[0], "data://config.json");
+    let text3 = require_legacy_text(&content3[0], "text://unicode");
+    assert_eq!(text1, "Hello, World!");
+    assert!(text2.contains("test-config"));
+    assert!(text3.contains("日本語"));
 }
 
 #[test]
@@ -3143,15 +5756,19 @@ fn resource_metadata_preserved() {
 #[test]
 fn resource_read_before_init_fails() {
     use fastmcp_transport::memory::create_memory_transport_pair;
-    use std::thread;
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test", "1.0.0")
         .resource(PlainTextResource)
         .build();
-    thread::spawn(move || server.run_transport(server_transport));
+    let server_handle = spawn_runtime_server(
+        server,
+        server_transport,
+        "server transport loop settles cleanly",
+    );
+    let _server_join = ThreadJoins::new(vec![server_handle]);
 
-    let mut client = TestClient::new(client_transport);
+    let mut client = TestClient::new(client_transport, Cx::for_testing());
 
     // Should fail before initialization
     assert!(client.read_resource("text://plain").is_err());

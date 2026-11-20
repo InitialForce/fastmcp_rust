@@ -2,7 +2,7 @@
 name = "fastmcp-client"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "MCP client implementation for FastMCP"
 repository.workspace = true
@@ -11,6 +11,22 @@ readme.workspace = true
 documentation = "https://docs.rs/fastmcp-client"
 keywords = ["mcp", "client", "json-rpc", "async", "protocol"]
 categories = ["network-programming"]
+
+[features]
+default = ["legacy-2024-11-05"]
+legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "fastmcp-transport/legacy-2024-11-05"]
+tasks = ["fastmcp-protocol/tasks"]
+# Externally signed RFC 7523 client assertions (private_key_jwt). Opt-in
+# because fastmcp-protocol/jose pulls ring and zeroize; keeping it off the
+# default graph preserves FND-01's frozen dependency evidence.
+builtin-auth-server = ["fastmcp-protocol/jose"]
+apps = ["fastmcp-protocol/apps", "dep:html5ever"]
+# Use the operating system trust store for private-CA HTTPS deployments.
+# Without this option, the transport's bundled WebPKI roots remain in use.
+native-tls-roots = ["asupersync/tls-native-roots"]
+# Opt-in caller-upgraded async WebSocket client. This does not add URI parsing,
+# HTTP Upgrade, or a blocking byte-stream client.
+websocket-experimental = ["fastmcp-transport/websocket-experimental"]
 
 [dependencies]
 fastmcp-core.workspace = true
@@ -22,6 +38,116 @@ serde_json.workspace = true
 log.workspace = true
 toml.workspace = true
 dirs.workspace = true
+html5ever = { version = "=0.40.1", optional = true }
+
+# The native client always compiles its externally signed private_key_jwt
+# adapter. Enable that adapter's protocol primitives on the same target
+# boundary instead of relying on feature unification with an auth-enabled
+# server or an all-features build. Basic and legacy selection remain explicit.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fastmcp-protocol = { workspace = true, features = ["jose"] }
+
+[target.'cfg(unix)'.dependencies]
+# SecureAtomicFile converts owned rustix descriptors to std::fs::File. Require
+# std explicitly rather than relying on another crate's feature unification.
+rustix = { workspace = true, features = ["std", "event", "fs", "process"] }
+
+[dev-dependencies]
+# Test-only context construction; production callers supply or inherit a Cx.
+asupersync = { workspace = true, features = ["test-internals"] }
+
+[[test]]
+# TASK-01-B's frozen proofs (bd-mcp-task-01-b-wivg). They were promoted out of
+# `#[cfg(test)] mod tests` for PL-3, and that promotion is what made this
+# stanza necessary: out of crate, the Tasks symbols they import are only
+# exported under `--features tasks`, so without this the target is always
+# built, always fails E0432 under default features, and takes every other test
+# target in this package down with it.
+#
+# This stanza is ALSO why the runner card must pass `--features tasks`
+# explicitly. `required-features` turns a compile error into a SILENT SKIP: a
+# no-flags run reports success having discovered none of the frozen IDs. That
+# is the failure mode AGENTS.md names, so the flag is mandatory, not optional.
+name = "task_01_b"
+path = "tests/task_01_b.rs"
+required-features = ["tasks"]
+
+[[test]]
+# LEG-HTTP-01 B drives the exact 2024-11-05 GET+SSE client through
+# `into_legacy_sse`, which exists only with this feature. Without the stanza
+# every `--no-default-features --all-targets` build fails on this target.
+name = "leg_http_01_b"
+path = "tests/leg_http_01_b.rs"
+required-features = ["legacy-2024-11-05"]
+
+# --- Loud refusal for feature-gated targets (bd-ufj6r) ---------------------
+# Each target below starts with a file-scope `#![cfg(...)]`. Without a stanza
+# here, a build whose features do not satisfy that cfg compiles the target to
+# an EMPTY BINARY and libtest prints `ok. 0 passed` with exit status 0, which is
+# indistinguishable from a real pass. With the stanza, naming the target
+# explicitly (`--test <name>`) makes cargo refuse and say which feature is
+# missing.
+#
+# This is belt-and-braces, not a cure: `required-features` ALSO makes a bulk
+# `cargo test` exclude the target silently, so a runner card must still declare
+# its expected discovered count and treat `0 passed` as RED. The
+# `required-features` values below mirror each target's own cfg exactly.
+
+[[test]]
+name = "oauth_challenge"
+path = "tests/oauth_challenge.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_client_credentials"
+path = "tests/oauth_client_credentials.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_core_rpc"
+path = "tests/oauth_core_rpc.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_interaction"
+path = "tests/oauth_interaction.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_machine_revocation"
+path = "tests/oauth_machine_revocation.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_tool_catalog"
+path = "tests/oauth_tool_catalog.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_tool_header_repair"
+path = "tests/oauth_tool_header_repair.rs"
+required-features = ["native-tls-roots"]
+
+[[test]]
+name = "oauth_task_watch"
+path = "tests/oauth_task_watch.rs"
+required-features = ["tasks", "native-tls-roots"]
+
+[[test]]
+name = "oauth_task_watch_drive"
+path = "tests/oauth_task_watch_drive.rs"
+required-features = ["tasks", "native-tls-roots"]
+
+# The residual d0993fb0 did not cover (bd-ufj6r). Its cfg is
+# `all(target_os = "linux", feature = "tasks")`; `required-features` cannot
+# express the target_os half, so the stanza mirrors the feature half only —
+# which is the half that was silently failing. `tasks` is not in this crate's
+# default set, so before this stanza the target compiled to an empty binary and
+# printed `ok. 0 passed` on EVERY platform, Linux included, hiding 12 tests.
+[[test]]
+name = "task_resume_store"
+path = "tests/task_resume_store.rs"
+required-features = ["tasks"]
 
 [lints]
 workspace = true

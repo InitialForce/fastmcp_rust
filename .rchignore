@@ -1,0 +1,39 @@
+# RCH needs source content, not mutable local Git bookkeeping. Excluding the
+# repository database also avoids remote ownership drift blocking source sync.
+.git/
+
+# Build products stay worker-local. Copying worker-scoped target caches back
+# adds disk pressure and can stall old RCH clients after the command succeeded.
+target/
+target-*/
+.rch-target-*/
+
+# Local coordination and verification databases are not compiler inputs.
+# They can be large, contain host-specific locks, and must never be copied to
+# a remote build worker as part of a source verification snapshot.
+.beads/
+.beads_polish_tmp/
+.wm-verify/
+.wm-verify2/
+.grok/
+
+# Tests may emit diagnostic traces on remote workers. They are generated
+# artifacts (already ignored by Git) and must not participate in source sync.
+crates/fastmcp/test_traces/
+
+# Git-ignored host-local symlinks. `--source-content-receipt` refuses any
+# non-regular rsync item, so either one voids every receipt-bound dispatch
+# before it compiles. Neither is a compiler input: rich_rust is a crates.io
+# dependency pinned by checksum in Cargo.lock, not a path dependency.
+/rich_rust
+.doctor/
+# Upstream Python's agent-instruction link is documentation, not a Rust input.
+# Keep the local link intact while allowing source-content receipts to bind
+# the regular files that the remote compiler actually reads.
+/legacy_fastmcp/CLAUDE.md
+/legacy_fastmcp/.github/copilot-instructions.md
+
+# Orchestration notes (untracked; no code reads them). They change every few
+# minutes, and a change during transfer trips the source-content rsync barrier
+# and voids the dispatch (card #4, 22:18:04Z, delta on .ntm/WAVE16-CARD-QUEUE.md).
+.ntm/

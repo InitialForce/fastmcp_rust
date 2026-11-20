@@ -2,7 +2,18 @@
 //!
 //! Core types used in MCP communication.
 
+use std::collections::BTreeMap;
+use std::fmt;
+
+use crate::common_types::{
+    AbsoluteUri, Annotations, ContentBlock, Implementation, JsonInteger, OpenMetadata, RawIcon,
+    SamplingContentBlock,
+};
+use crate::extensions::MCP_APPS_HTML_MIME_TYPE;
+use crate::messages::{FinalCallToolResult, FinalCoreResult};
+use crate::result::{MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_ENCODED_BYTES};
 use base64::Engine as _;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 /// MCP protocol version.
@@ -23,10 +34,35 @@ pub struct ServerCapabilities {
     /// Logging capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Argument-completion capability (`completion/complete`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completions: Option<CompletionsCapability>,
     /// Background tasks capability (Docket/SEP-1686).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TasksCapability>,
+    /// Experimental, non-standard capabilities that the server supports.
+    ///
+    /// Schema: `type: object`, `additionalProperties: JSONObject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, serde_json::Value>>,
+    /// Optional MCP extensions that the server supports.
+    ///
+    /// Keys are extension identifiers and values are per-extension settings
+    /// objects; an empty object indicates support with no settings. Schema:
+    /// `type: object`, `additionalProperties: JSONObject`.
+    ///
+    /// `serde_json::Value` rather than a nested map, symmetrical with
+    /// `ClientCapabilities`: `additionalProperties` is UNSET on this type in
+    /// the schema, i.e. open, so it must not gain `deny_unknown_fields`, and a
+    /// non-object value must stay representable so consumers reject it at a
+    /// typed boundary instead of failing the whole deserialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<BTreeMap<String, serde_json::Value>>,
 }
+
+/// Empty object advertised when `completion/complete` is installed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompletionsCapability {}
 
 /// Tool capabilities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,11 +119,60 @@ pub struct ClientCapabilities {
     /// Roots capability (filesystem roots).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
+    /// Experimental, non-standard capabilities that the client supports.
+    ///
+    /// Schema: `type: object`, `additionalProperties: JSONObject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental: Option<BTreeMap<String, serde_json::Value>>,
+    /// Optional MCP extensions that the client supports.
+    ///
+    /// Keys are extension identifiers (for example
+    /// `io.modelcontextprotocol/oauth-client-credentials`) and values are
+    /// per-extension settings objects; an empty object indicates support with
+    /// no settings. Schema: `type: object`, `additionalProperties: JSONObject`.
+    ///
+    /// The value type is deliberately `serde_json::Value` rather than a nested
+    /// map, matching `ServerDiscoverCapabilities::members` and the `additional`
+    /// fields in this file. `ClientCapabilities` has `additionalProperties`
+    /// UNSET in the schema, i.e. open, so this must not gain
+    /// `deny_unknown_fields`, and a non-object value must stay representable so
+    /// consumers can reject it at a typed boundary instead of failing the whole
+    /// deserialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Sampling capability.
+///
+/// MCP 2026-07-28 lets a client declare two optional sub-capabilities,
+/// `context` (supports `includeContext`) and `tools` (supports `tools` /
+/// `toolChoice`). Both are retained so a decoded capability re-encodes without
+/// silently dropping what the peer declared.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SamplingCapability {}
+pub struct SamplingCapability {
+    /// Present if the client supports context inclusion via `includeContext`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Present if the client supports tool use via `tools` and `toolChoice`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl SamplingCapability {
+    /// Declares sampling with tool-use support (`sampling.tools`).
+    #[must_use]
+    pub fn with_tools(mut self) -> Self {
+        self.tools = Some(serde_json::Map::new());
+        self
+    }
+
+    /// Declares sampling with context-inclusion support (`sampling.context`).
+    #[must_use]
+    pub fn with_context(mut self) -> Self {
+        self.context = Some(serde_json::Map::new());
+        self
+    }
+}
 
 /// Capability for form mode elicitation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -214,6 +299,27 @@ pub struct ClientInfo {
     pub version: String,
 }
 
+impl ClientInfo {
+    /// Projects this exact-2024 name/version pair into a final Implementation.
+    ///
+    /// Empty name or version is replaced with a nonempty fallback so modern
+    /// request `_meta` can always carry a typed identity object.
+    #[must_use]
+    pub fn to_implementation(&self) -> Implementation {
+        let name = if self.name.is_empty() {
+            "unknown"
+        } else {
+            self.name.as_str()
+        };
+        let version = if self.version.is_empty() {
+            "0"
+        } else {
+            self.version.as_str()
+        };
+        Implementation::try_new(name, version).expect("the fallback client identity is nonempty")
+    }
+}
+
 // ============================================================================
 // Icon Metadata
 // ============================================================================
@@ -223,7 +329,7 @@ pub struct ClientInfo {
 /// Icons provide visual representation for tools, resources, and prompts
 /// in client UIs. All fields are optional to support various use cases.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Icon {
     /// URL or data URI for the icon.
     ///
@@ -302,20 +408,24 @@ impl Icon {
 pub struct ToolAnnotations {
     /// Whether the tool may cause destructive side effects.
     /// True means the tool modifies external state (e.g., deleting files).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized as the MCP-spec `destructiveHint` field.
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
     pub destructive: Option<bool>,
     /// Whether the tool is idempotent (safe to retry without side effects).
     /// True means calling the tool multiple times has the same effect as calling it once.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Serialized as the MCP-spec `idempotentHint` field.
+    #[serde(rename = "idempotentHint", skip_serializing_if = "Option::is_none")]
     pub idempotent: Option<bool>,
     /// Whether the tool is read-only (has no side effects).
     /// True means the tool only reads data without modifying anything.
-    #[serde(rename = "readOnly", skip_serializing_if = "Option::is_none")]
+    /// Serialized as the MCP-spec `readOnlyHint` field.
+    #[serde(rename = "readOnlyHint", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
-    /// Hint about the tool's behavior with unknown inputs.
-    /// Can be used to indicate how the tool handles inputs not explicitly defined.
+    /// Whether the tool interacts with an "open world" of external entities.
+    /// Per the MCP spec `openWorldHint` is a boolean: `true` if the tool may reach
+    /// external/unknown systems, `false` if it operates over a closed/local domain.
     #[serde(rename = "openWorldHint", skip_serializing_if = "Option::is_none")]
-    pub open_world_hint: Option<String>,
+    pub open_world_hint: Option<bool>,
 }
 
 impl ToolAnnotations {
@@ -347,9 +457,12 @@ impl ToolAnnotations {
     }
 
     /// Sets the open_world_hint annotation.
+    ///
+    /// Per the MCP spec `openWorldHint` is a boolean: `true` if the tool interacts
+    /// with an open world of external entities, `false` for a closed/local domain.
     #[must_use]
-    pub fn open_world_hint(mut self, hint: impl Into<String>) -> Self {
-        self.open_world_hint = Some(hint.into());
+    pub fn open_world_hint(mut self, value: bool) -> Self {
+        self.open_world_hint = Some(value);
         self
     }
 
@@ -392,7 +505,7 @@ pub struct Tool {
 }
 
 /// Resource definition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resource {
     /// Resource URI.
     pub uri: String,
@@ -419,7 +532,11 @@ pub struct Resource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceTemplate {
     /// URI template (RFC 6570).
-    #[serde(rename = "uriTemplate")]
+    #[serde(
+        rename = "uriTemplate",
+        serialize_with = "serialize_resource_uri_template",
+        deserialize_with = "deserialize_resource_uri_template"
+    )]
     pub uri_template: String,
     /// Template name.
     pub name: String,
@@ -438,6 +555,24 @@ pub struct ResourceTemplate {
     /// Tags for filtering and organization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+fn deserialize_resource_uri_template<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    crate::UriTemplate::parse(&value)
+        .map(|_| value)
+        .map_err(D::Error::custom)
+}
+
+fn serialize_resource_uri_template<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::UriTemplate::parse(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(value)
 }
 
 /// Prompt definition.
@@ -475,9 +610,1306 @@ pub struct PromptArgument {
     pub required: bool,
 }
 
-/// Content types in MCP messages.
+// ============================================================================
+// Final component definitions
+// ============================================================================
+
+/// Shared final component identity fields.
+///
+/// The final protocol separates a stable programmatic `name` from an optional
+/// user-facing `title`. Legacy component definitions deliberately remain
+/// separate because their icon, version, and tag members are not final wire
+/// members.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalBaseMetadata {
+    /// Programmatic component identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Final tool annotations, including the final display-title hint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalToolAnnotations {
+    /// Optional display title, lower priority than the enclosing tool title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Whether the tool may perform destructive updates.
+    #[serde(
+        rename = "destructiveHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destructive: Option<bool>,
+    /// Whether repeated calls are idempotent.
+    #[serde(
+        rename = "idempotentHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotent: Option<bool>,
+    /// Whether the tool is read-only.
+    #[serde(
+        rename = "readOnlyHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_only: Option<bool>,
+    /// Whether the tool may interact with an open world.
+    #[serde(
+        rename = "openWorldHint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_world_hint: Option<bool>,
+}
+
+// ============================================================================
+// MCP Apps metadata, lifecycle, and result projection
+// ============================================================================
+
+/// Nested `_meta` member reserved by the MCP Apps protocol.
+pub const MCP_APPS_UI_METADATA_KEY: &str = "ui";
+/// Deprecated flat metadata member that this final-only surface rejects.
+pub const MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY: &str = "ui/resourceUri";
+/// Maximum members in a closed nested MCP Apps tool `ui` metadata object.
+pub const MAX_MCP_APPS_UI_METADATA_MEMBERS: usize = 2;
+/// Maximum audience entries retained by one Apps tool visibility declaration.
+pub const MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES: usize = 128;
+/// Maximum origins retained by one Apps CSP directive.
+pub const MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE: usize = 128;
+/// Maximum UTF-8 bytes retained for one Apps CSP origin or host-selected domain.
+pub const MAX_MCP_APPS_CSP_DOMAIN_BYTES: usize = 2_048;
+
+/// A tool audience declared in nested MCP Apps metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAppsToolVisibility {
+    /// The model can discover and invoke the tool.
+    Model,
+    /// The rendered App can invoke the tool through its later bridge runtime.
+    App,
+}
+
+/// A Host-selected way to present an App View.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpAppsDisplayMode {
+    /// The View appears in normal document flow.
+    Inline,
+    /// The View occupies the host's full display surface.
+    Fullscreen,
+    /// The View is presented picture-in-picture.
+    Pip,
+}
+
+/// Closed Apps metadata attached to a final `Tool` under `_meta.ui`.
+///
+/// The resource URI is intentionally typed as an exact authority-form
+/// `ui://` URI. Security configuration belongs to resource metadata and is
+/// intentionally not part of this non-security protocol slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsToolMetadata {
+    /// UI resource rendered when this tool is invoked, when declared.
+    pub resource_uri: Option<AbsoluteUri>,
+    /// Optional explicit audiences; absence retains the Apps default of both.
+    pub visibility: Option<Vec<McpAppsToolVisibility>>,
+}
+
+impl McpAppsToolMetadata {
+    /// Creates validated closed Apps tool metadata.
+    pub fn try_new(
+        resource_uri: Option<AbsoluteUri>,
+        visibility: Option<Vec<McpAppsToolVisibility>>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        if resource_uri
+            .as_ref()
+            .is_some_and(|resource_uri| !resource_uri.as_str().starts_with("ui://"))
+        {
+            return Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix);
+        }
+        if visibility
+            .as_ref()
+            .is_some_and(|visibility| visibility.len() > MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES)
+        {
+            return Err(McpAppsMetadataError::TooManyToolVisibilityEntries);
+        }
+        Ok(Self {
+            resource_uri,
+            visibility,
+        })
+    }
+
+    /// Returns the effective visibility without changing absent versus present
+    /// wire state.
+    #[must_use]
+    pub fn effective_visibility(&self) -> &[McpAppsToolVisibility] {
+        const DEFAULT_VISIBILITY: [McpAppsToolVisibility; 2] =
+            [McpAppsToolVisibility::Model, McpAppsToolVisibility::App];
+        self.visibility.as_deref().unwrap_or(&DEFAULT_VISIBILITY)
+    }
+
+    /// Produces a standalone final `_meta` object containing this exact nested
+    /// Apps member.
+    pub fn to_open_metadata(&self) -> Result<OpenMetadata, McpAppsMetadataError> {
+        let value =
+            serde_json::to_value(self).map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?;
+        OpenMetadata::try_from_entries([(MCP_APPS_UI_METADATA_KEY.to_owned(), value)])
+            .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)
+    }
+
+    /// Merges this typed `ui` member into existing final open metadata.
+    pub fn merge_into(
+        &self,
+        metadata: &OpenMetadata,
+    ) -> Result<OpenMetadata, McpAppsMetadataError> {
+        reject_deprecated_mcp_apps_metadata(metadata)?;
+        if metadata.entries().contains_key(MCP_APPS_UI_METADATA_KEY) {
+            return Err(McpAppsMetadataError::UiMetadataAlreadyPresent);
+        }
+        let mut entries = metadata.entries().clone();
+        entries.insert(
+            MCP_APPS_UI_METADATA_KEY.to_owned(),
+            serde_json::to_value(self).map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?,
+        );
+        OpenMetadata::try_from_entries(entries)
+            .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsToolMetadataWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_uri: Option<AbsoluteUri>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visibility: Option<Vec<McpAppsToolVisibility>>,
+}
+
+impl Serialize for McpAppsToolMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(self.resource_uri.clone(), self.visibility.clone())
+            .map_err(serde::ser::Error::custom)?;
+        McpAppsToolMetadataWire {
+            resource_uri: self.resource_uri.clone(),
+            visibility: self.visibility.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsToolMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsToolMetadataWire::deserialize(deserializer)?;
+        Self::try_new(wire.resource_uri, wire.visibility).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded CSP origins declared by an Apps resource.
+///
+/// These declarations remain requests to the host. They do not authorize a
+/// network connection, nested frame, or base URI without host-side policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAppsResourceCsp {
+    /// Origins for network requests (`connect-src`).
+    pub connect_domains: Option<Vec<String>>,
+    /// Origins for static resources (`img-src`, `script-src`, and related directives).
+    pub resource_domains: Option<Vec<String>>,
+    /// Origins allowed for nested frames (`frame-src`).
+    pub frame_domains: Option<Vec<String>>,
+    /// Origins allowed as document base URIs (`base-uri`).
+    pub base_uri_domains: Option<Vec<String>>,
+}
+
+impl McpAppsResourceCsp {
+    /// Creates a bounded CSP declaration without granting any host authority.
+    pub fn try_new(
+        connect_domains: Option<Vec<String>>,
+        resource_domains: Option<Vec<String>>,
+        frame_domains: Option<Vec<String>>,
+        base_uri_domains: Option<Vec<String>>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        for domains in [
+            connect_domains.as_deref(),
+            resource_domains.as_deref(),
+            frame_domains.as_deref(),
+            base_uri_domains.as_deref(),
+        ] {
+            validate_mcp_apps_domains(domains)?;
+        }
+        Ok(Self {
+            connect_domains,
+            resource_domains,
+            frame_domains,
+            base_uri_domains,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpAppsResourceCspWire {
+    #[serde(
+        rename = "connectDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    connect: Option<Vec<String>>,
+    #[serde(
+        rename = "resourceDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    resources: Option<Vec<String>>,
+    #[serde(
+        rename = "frameDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    frames: Option<Vec<String>>,
+    #[serde(
+        rename = "baseUriDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    base_uris: Option<Vec<String>>,
+}
+
+impl Serialize for McpAppsResourceCsp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(
+            self.connect_domains.clone(),
+            self.resource_domains.clone(),
+            self.frame_domains.clone(),
+            self.base_uri_domains.clone(),
+        )
+        .map_err(serde::ser::Error::custom)?;
+        McpAppsResourceCspWire {
+            connect: self.connect_domains.clone(),
+            resources: self.resource_domains.clone(),
+            frames: self.frame_domains.clone(),
+            base_uris: self.base_uri_domains.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsResourceCsp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsResourceCspWire::deserialize(deserializer)?;
+        Self::try_new(wire.connect, wire.resources, wire.frames, wire.base_uris)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// An empty-object Apps sandbox permission marker.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAppsResourcePermission {}
+
+/// Optional sandbox permissions requested by an Apps resource.
+///
+/// Presence requests a host permission; absence does not. A host may further
+/// restrict or reject every requested permission.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpAppsResourcePermissions {
+    /// Camera permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<McpAppsResourcePermission>,
+    /// Microphone permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<McpAppsResourcePermission>,
+    /// Geolocation permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geolocation: Option<McpAppsResourcePermission>,
+    /// Clipboard-write permission marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_write: Option<McpAppsResourcePermission>,
+}
+
+/// Closed Apps rendering metadata attached to a `Resource` under `_meta.ui`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAppsResourceMetadata {
+    /// Optional CSP declarations for the rendered view.
+    pub csp: Option<McpAppsResourceCsp>,
+    /// Optional sandbox permission requests.
+    pub permissions: Option<McpAppsResourcePermissions>,
+    /// Optional host-defined dedicated view domain.
+    pub domain: Option<String>,
+    /// Whether the View prefers a visible host-provided border and background.
+    pub prefers_border: Option<bool>,
+}
+
+impl McpAppsResourceMetadata {
+    /// Creates closed non-security resource presentation metadata.
+    #[must_use]
+    pub const fn new(prefers_border: Option<bool>) -> Self {
+        Self {
+            csp: None,
+            permissions: None,
+            domain: None,
+            prefers_border,
+        }
+    }
+
+    /// Creates bounded resource rendering metadata with all currently stable
+    /// Apps fields. The domain is retained as host-defined opaque data.
+    pub fn try_new(
+        csp: Option<McpAppsResourceCsp>,
+        permissions: Option<McpAppsResourcePermissions>,
+        domain: Option<String>,
+        prefers_border: Option<bool>,
+    ) -> Result<Self, McpAppsMetadataError> {
+        if domain
+            .as_deref()
+            .is_some_and(|domain| domain.is_empty() || domain.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES)
+        {
+            return Err(McpAppsMetadataError::InvalidDomain);
+        }
+        Ok(Self {
+            csp,
+            permissions,
+            domain,
+            prefers_border,
+        })
+    }
+
+    /// Produces a standalone final `_meta` object containing this exact nested
+    /// Apps member.
+    pub fn to_open_metadata(&self) -> Result<OpenMetadata, McpAppsMetadataError> {
+        let value = serde_json::to_value(self)
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?;
+        OpenMetadata::try_from_entries([(MCP_APPS_UI_METADATA_KEY.to_owned(), value)])
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)
+    }
+
+    /// Merges this typed `ui` member into existing final open metadata.
+    pub fn merge_into(
+        &self,
+        metadata: &OpenMetadata,
+    ) -> Result<OpenMetadata, McpAppsMetadataError> {
+        reject_deprecated_mcp_apps_metadata(metadata)?;
+        if metadata.entries().contains_key(MCP_APPS_UI_METADATA_KEY) {
+            return Err(McpAppsMetadataError::UiMetadataAlreadyPresent);
+        }
+        let mut entries = metadata.entries().clone();
+        entries.insert(
+            MCP_APPS_UI_METADATA_KEY.to_owned(),
+            serde_json::to_value(self)
+                .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?,
+        );
+        OpenMetadata::try_from_entries(entries)
+            .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsResourceMetadataWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csp: Option<McpAppsResourceCsp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permissions: Option<McpAppsResourcePermissions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefers_border: Option<bool>,
+}
+
+impl Serialize for McpAppsResourceMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        McpAppsResourceMetadataWire {
+            csp: self.csp.clone(),
+            permissions: self.permissions.clone(),
+            domain: self.domain.clone(),
+            prefers_border: self.prefers_border,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsResourceMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsResourceMetadataWire::deserialize(deserializer)?;
+        Self::try_new(wire.csp, wire.permissions, wire.domain, wire.prefers_border)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated association between a tool's nested Apps metadata and an HTML
+/// UI resource in the final catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpAppsResourceBinding {
+    /// Exact authority-form `ui://` resource URI selected by the tool.
+    pub resource_uri: AbsoluteUri,
+    /// The tool's effective Apps visibility.
+    pub visibility: Vec<McpAppsToolVisibility>,
+}
+
+impl McpAppsResourceBinding {
+    /// Derives a binding only when the tool declares a nested Apps resource URI.
+    pub fn from_tool(tool: &FinalTool) -> Result<Option<Self>, McpAppsMetadataError> {
+        let Some(metadata) = tool.mcp_apps_metadata()? else {
+            return Ok(None);
+        };
+        let visibility = metadata.effective_visibility().to_vec();
+        let Some(resource_uri) = metadata.resource_uri else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            resource_uri,
+            visibility,
+        }))
+    }
+
+    /// Verifies that a catalog resource is the exact HTML resource selected by
+    /// this binding. Resource presentation metadata remains optional.
+    pub fn validate_resource(
+        &self,
+        resource: &FinalResource,
+    ) -> Result<(), McpAppsResourceBindingError> {
+        let _ = resource
+            .mcp_apps_metadata()
+            .map_err(McpAppsResourceBindingError::Metadata)?;
+        if resource.uri != self.resource_uri {
+            return Err(McpAppsResourceBindingError::UriMismatch);
+        }
+        if resource.mime_type.as_deref() != Some(MCP_APPS_HTML_MIME_TYPE) {
+            return Err(McpAppsResourceBindingError::HtmlMimeTypeRequired);
+        }
+        Ok(())
+    }
+}
+
+/// A View lifecycle phase. This pure protocol state machine does not send or
+/// receive any `ui/*` RPC message; a future bridge runtime owns that work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsViewLifecycle {
+    /// No initialization attempt has been admitted.
+    New,
+    /// One initialization request is reserved and awaiting its response.
+    InitializeInFlight,
+    /// Initialization succeeded and the initialized notification is due.
+    AwaitingInitialized,
+    /// The View may receive ordinary application traffic.
+    Active,
+    /// Terminal teardown has begun.
+    Closing,
+    /// Terminal teardown is complete.
+    Closed,
+}
+
+impl Default for McpAppsViewLifecycle {
+    fn default() -> Self {
+        Self::New
+    }
+}
+
+impl McpAppsViewLifecycle {
+    /// Reserves the single legal initialization attempt.
+    pub fn begin_initialize(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::New, Self::InitializeInFlight, "initialize")
+    }
+
+    /// Commits a successful initialization response.
+    pub fn initialization_succeeded(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(
+            Self::InitializeInFlight,
+            Self::AwaitingInitialized,
+            "initialize response",
+        )
+    }
+
+    /// Atomically rolls a failed initialization back before exposure.
+    pub fn initialization_failed(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::InitializeInFlight, Self::New, "initialize rollback")
+    }
+
+    /// Admits the sole initialized notification and enables application traffic.
+    pub fn admit_initialized(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(
+            Self::AwaitingInitialized,
+            Self::Active,
+            "initialized notification",
+        )
+    }
+
+    /// Begins one terminal teardown from every non-terminal phase.
+    pub fn begin_closing(&mut self) -> Result<(), McpAppsLifecycleError> {
+        match *self {
+            Self::New | Self::InitializeInFlight | Self::AwaitingInitialized | Self::Active => {
+                *self = Self::Closing;
+                Ok(())
+            }
+            Self::Closing | Self::Closed => Err(McpAppsLifecycleError::InvalidTransition {
+                from: *self,
+                operation: "begin closing",
+            }),
+        }
+    }
+
+    /// Completes one terminal teardown.
+    pub fn finish_closing(&mut self) -> Result<(), McpAppsLifecycleError> {
+        self.transition(Self::Closing, Self::Closed, "finish closing")
+    }
+
+    /// Returns whether ordinary Host/View application traffic is legal.
+    #[must_use]
+    pub const fn permits_application_traffic(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn transition(
+        &mut self,
+        expected: Self,
+        next: Self,
+        operation: &'static str,
+    ) -> Result<(), McpAppsLifecycleError> {
+        if *self != expected {
+            return Err(McpAppsLifecycleError::InvalidTransition {
+                from: *self,
+                operation,
+            });
+        }
+        *self = next;
+        Ok(())
+    }
+}
+
+/// One validated Apps-side projection of a complete final `tools/call` result.
+///
+/// This projection intentionally accepts only the complete final result
+/// branch. Tasks and MRTR input-required branches remain outside the Apps
+/// bridge until an explicit composition contract is implemented.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpAppsToolResult {
+    /// Complete final content projected without normalization.
+    pub content: Vec<ContentBlock>,
+    /// Tool-level error indicator retained exactly.
+    pub is_error: bool,
+    /// Optional structured output, including an explicitly present JSON null.
+    pub structured_content: Option<serde_json::Value>,
+}
+
+impl McpAppsToolResult {
+    /// Constructs a bounded Apps result projection.
+    pub fn try_new(
+        content: Vec<ContentBlock>,
+        is_error: bool,
+        structured_content: Option<serde_json::Value>,
+    ) -> Result<Self, McpAppsResultProjectionError> {
+        if content.len() > MAX_RESULT_CONTAINER_MEMBERS {
+            return Err(McpAppsResultProjectionError::ResultTooLarge);
+        }
+        let result = Self {
+            content,
+            is_error,
+            structured_content,
+        };
+        let encoded = serde_json::to_vec(&McpAppsToolResultWire::from(&result))
+            .map_err(|_| McpAppsResultProjectionError::ResultTooLarge)?;
+        if encoded.len() > MAX_RESULT_ENCODED_BYTES {
+            return Err(McpAppsResultProjectionError::ResultTooLarge);
+        }
+        Ok(result)
+    }
+
+    /// Projects one fully validated final `tools/call` payload exactly once.
+    pub fn from_final_call_tool_result(
+        result: &FinalCallToolResult,
+    ) -> Result<Self, McpAppsResultProjectionError> {
+        Self::try_new(
+            result.content.clone(),
+            result.is_error,
+            result.structured_content.clone(),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsToolResultWire {
+    content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_apps_present_json_value")]
+    structured_content: Option<serde_json::Value>,
+}
+
+fn deserialize_apps_present_json_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+impl From<&McpAppsToolResult> for McpAppsToolResultWire {
+    fn from(result: &McpAppsToolResult) -> Self {
+        Self {
+            content: result.content.clone(),
+            is_error: result.is_error,
+            structured_content: result.structured_content.clone(),
+        }
+    }
+}
+
+impl Serialize for McpAppsToolResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Self::try_new(
+            self.content.clone(),
+            self.is_error,
+            self.structured_content.clone(),
+        )
+        .map_err(serde::ser::Error::custom)?;
+        McpAppsToolResultWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpAppsToolResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpAppsToolResultWire::deserialize(deserializer)?;
+        Self::try_new(wire.content, wire.is_error, wire.structured_content)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Projects the complete `tools/call` branch while rejecting deferred Tasks and
+/// MRTR branches before any Apps result is produced.
+pub fn project_final_core_tools_call_result(
+    result: &FinalCoreResult,
+) -> Result<McpAppsToolResult, McpAppsResultProjectionError> {
+    match result {
+        FinalCoreResult::ToolsCall { result, .. } => {
+            McpAppsToolResult::from_final_call_tool_result(&result.payload)
+        }
+        #[cfg(feature = "tasks")]
+        FinalCoreResult::ToolsCallTask { .. } => {
+            Err(McpAppsResultProjectionError::TasksUnsupported)
+        }
+        FinalCoreResult::ToolsCallInputRequired { .. } => {
+            Err(McpAppsResultProjectionError::MrtrUnsupported)
+        }
+        _ => Err(McpAppsResultProjectionError::NotToolsCall),
+    }
+}
+
+/// Metadata validation failures specific to the closed Apps `ui` member.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsMetadataError {
+    /// The old flat `ui/resourceUri` key is forbidden on the final surface.
+    DeprecatedFlatResourceUri,
+    /// The nested `ui` member was not an object.
+    UiMetadataMustBeObject,
+    /// A tool `ui` object did not satisfy its closed schema.
+    InvalidToolMetadata,
+    /// A resource `ui` object did not satisfy its closed schema.
+    InvalidResourceMetadata,
+    /// A resource binding URI must start with the exact `ui://` prefix.
+    ResourceUriMustUseUiPrefix,
+    /// A tool visibility declaration carried more than its bounded number of entries.
+    TooManyToolVisibilityEntries,
+    /// One CSP directive carried more than its bounded number of origins.
+    TooManyCspDomains,
+    /// One CSP origin was empty or exceeded its bounded byte allowance.
+    InvalidCspDomain,
+    /// The host-defined Apps domain was empty or exceeded its bounded allowance.
+    InvalidDomain,
+    /// A merge would overwrite a pre-existing nested `ui` member.
+    UiMetadataAlreadyPresent,
+}
+
+impl fmt::Display for McpAppsMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeprecatedFlatResourceUri => formatter.write_str(
+                "deprecated flat MCP Apps metadata key ui/resourceUri is forbidden; use _meta.ui.resourceUri",
+            ),
+            Self::UiMetadataMustBeObject => {
+                formatter.write_str("MCP Apps _meta.ui must be an object")
+            }
+            Self::InvalidToolMetadata => {
+                formatter.write_str("MCP Apps tool _meta.ui does not satisfy its closed schema")
+            }
+            Self::InvalidResourceMetadata => formatter
+                .write_str("MCP Apps resource _meta.ui does not satisfy its closed schema"),
+            Self::ResourceUriMustUseUiPrefix => {
+                formatter.write_str("MCP Apps resourceUri must start with ui://")
+            }
+            Self::TooManyToolVisibilityEntries => {
+                formatter.write_str("MCP Apps tool visibility exceeds its entry limit")
+            }
+            Self::TooManyCspDomains => {
+                formatter.write_str("MCP Apps CSP directive exceeds its origin limit")
+            }
+            Self::InvalidCspDomain => {
+                formatter.write_str("MCP Apps CSP origin is empty or exceeds its byte limit")
+            }
+            Self::InvalidDomain => {
+                formatter.write_str("MCP Apps domain is empty or exceeds its byte limit")
+            }
+            Self::UiMetadataAlreadyPresent => {
+                formatter.write_str("MCP Apps _meta already contains a ui member")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsMetadataError {}
+
+/// A catalog resource did not satisfy one validated Apps binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsResourceBindingError {
+    /// The candidate resource URI differs from the tool's exact binding URI.
+    UriMismatch,
+    /// The candidate resource is not an Apps HTML resource.
+    HtmlMimeTypeRequired,
+    /// Resource metadata was not a valid closed Apps metadata object.
+    Metadata(McpAppsMetadataError),
+}
+
+impl fmt::Display for McpAppsResourceBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UriMismatch => {
+                formatter.write_str("MCP Apps resource URI differs from tool binding")
+            }
+            Self::HtmlMimeTypeRequired => {
+                formatter.write_str("MCP Apps bound resource must use text/html;profile=mcp-app")
+            }
+            Self::Metadata(error) => write!(formatter, "MCP Apps resource metadata: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for McpAppsResourceBindingError {}
+
+/// Illegal transition in the pure Apps View lifecycle state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsLifecycleError {
+    /// The requested operation is not legal from the retained lifecycle phase.
+    InvalidTransition {
+        /// Current lifecycle phase.
+        from: McpAppsViewLifecycle,
+        /// Name of the rejected operation.
+        operation: &'static str,
+    },
+}
+
+impl fmt::Display for McpAppsLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransition { from, operation } => {
+                write!(
+                    formatter,
+                    "MCP Apps lifecycle cannot {operation} from {from:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsLifecycleError {}
+
+/// Apps result projection failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpAppsResultProjectionError {
+    /// The projected result exceeds the final result bounds.
+    ResultTooLarge,
+    /// A Tasks-backed `tools/call` result has no Apps result composition.
+    TasksUnsupported,
+    /// An MRTR `input_required` tools/call result has no Apps result composition.
+    MrtrUnsupported,
+    /// Only the final `tools/call` result family can be projected.
+    NotToolsCall,
+}
+
+impl fmt::Display for McpAppsResultProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultTooLarge => {
+                formatter.write_str("MCP Apps result exceeds final result bounds")
+            }
+            Self::TasksUnsupported => {
+                formatter.write_str("MCP Apps does not project Tasks-backed tool results")
+            }
+            Self::MrtrUnsupported => {
+                formatter.write_str("MCP Apps does not project MRTR input-required tool results")
+            }
+            Self::NotToolsCall => {
+                formatter.write_str("MCP Apps projects only final tools/call results")
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpAppsResultProjectionError {}
+
+fn validate_mcp_apps_domains(domains: Option<&[String]>) -> Result<(), McpAppsMetadataError> {
+    let Some(domains) = domains else {
+        return Ok(());
+    };
+    if domains.len() > MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE {
+        return Err(McpAppsMetadataError::TooManyCspDomains);
+    }
+    if domains
+        .iter()
+        .any(|domain| domain.is_empty() || domain.len() > MAX_MCP_APPS_CSP_DOMAIN_BYTES)
+    {
+        return Err(McpAppsMetadataError::InvalidCspDomain);
+    }
+    Ok(())
+}
+
+fn reject_deprecated_mcp_apps_metadata(
+    metadata: &OpenMetadata,
+) -> Result<(), McpAppsMetadataError> {
+    if metadata
+        .entries()
+        .contains_key(MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY)
+    {
+        Err(McpAppsMetadataError::DeprecatedFlatResourceUri)
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_mcp_apps_tool_metadata(
+    metadata: &OpenMetadata,
+) -> Result<Option<McpAppsToolMetadata>, McpAppsMetadataError> {
+    reject_deprecated_mcp_apps_metadata(metadata)?;
+    let Some(value) = metadata.entries().get(MCP_APPS_UI_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(McpAppsMetadataError::UiMetadataMustBeObject);
+    }
+    let metadata = serde_json::from_value(value.clone())
+        .map_err(|_| McpAppsMetadataError::InvalidToolMetadata)?;
+    Ok(Some(metadata))
+}
+
+fn parse_mcp_apps_resource_metadata(
+    metadata: &OpenMetadata,
+) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> {
+    reject_deprecated_mcp_apps_metadata(metadata)?;
+    let Some(value) = metadata.entries().get(MCP_APPS_UI_METADATA_KEY) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(McpAppsMetadataError::UiMetadataMustBeObject);
+    }
+    let metadata = serde_json::from_value(value.clone())
+        .map_err(|_| McpAppsMetadataError::InvalidResourceMetadata)?;
+    Ok(Some(metadata))
+}
+
+fn serialize_final_tool_metadata<S>(
+    metadata: &Option<OpenMetadata>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(metadata) = metadata {
+        parse_mcp_apps_tool_metadata(metadata).map_err(serde::ser::Error::custom)?;
+    }
+    metadata.serialize(serializer)
+}
+
+fn deserialize_final_tool_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenMetadata>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let metadata = Option::<OpenMetadata>::deserialize(deserializer)?;
+    if let Some(metadata) = &metadata {
+        parse_mcp_apps_tool_metadata(metadata).map_err(serde::de::Error::custom)?;
+    }
+    Ok(metadata)
+}
+
+fn serialize_final_resource_metadata<S>(
+    metadata: &Option<OpenMetadata>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if let Some(metadata) = metadata {
+        parse_mcp_apps_resource_metadata(metadata).map_err(serde::ser::Error::custom)?;
+    }
+    metadata.serialize(serializer)
+}
+
+fn deserialize_final_resource_metadata<'de, D>(
+    deserializer: D,
+) -> Result<Option<OpenMetadata>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let metadata = Option::<OpenMetadata>::deserialize(deserializer)?;
+    if let Some(metadata) = &metadata {
+        parse_mcp_apps_resource_metadata(metadata).map_err(serde::de::Error::custom)?;
+    }
+    Ok(metadata)
+}
+
+/// Exact final `Tool` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalTool {
+    /// Programmatic component identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Required JSON Schema object for tool input.
+    #[serde(
+        rename = "inputSchema",
+        deserialize_with = "deserialize_final_tool_input_schema"
+    )]
+    pub input_schema: serde_json::Value,
+    /// Optional JSON Schema object for structured tool output.
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_json_object"
+    )]
+    pub output_schema: Option<serde_json::Value>,
+    /// Optional behavioral and display hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<FinalToolAnnotations>,
+    /// Optional final metadata.
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_final_tool_metadata",
+        deserialize_with = "deserialize_final_tool_metadata"
+    )]
+    pub meta: Option<OpenMetadata>,
+}
+
+impl FinalTool {
+    /// Reads and validates the tool's optional closed `_meta.ui` Apps member.
+    pub fn mcp_apps_metadata(&self) -> Result<Option<McpAppsToolMetadata>, McpAppsMetadataError> {
+        self.meta
+            .as_ref()
+            .map_or(Ok(None), parse_mcp_apps_tool_metadata)
+    }
+
+    /// Derives the optional exact Apps resource binding declared by this tool.
+    pub fn mcp_apps_resource_binding(
+        &self,
+    ) -> Result<Option<McpAppsResourceBinding>, McpAppsMetadataError> {
+        McpAppsResourceBinding::from_tool(self)
+    }
+}
+
+/// Exact final `Resource` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalResource {
+    /// Exact resource URI.
+    pub uri: AbsoluteUri,
+    /// Programmatic resource identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional resource MIME type.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional raw content size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<JsonInteger>,
+    /// Optional client-facing annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// Optional final metadata.
+    #[serde(
+        rename = "_meta",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_final_resource_metadata",
+        deserialize_with = "deserialize_final_resource_metadata"
+    )]
+    pub meta: Option<OpenMetadata>,
+}
+
+impl FinalResource {
+    /// Reads and validates the resource's optional closed `_meta.ui` Apps
+    /// presentation member.
+    pub fn mcp_apps_metadata(
+        &self,
+    ) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> {
+        self.meta
+            .as_ref()
+            .map_or(Ok(None), parse_mcp_apps_resource_metadata)
+    }
+}
+
+/// Exact final `ResourceTemplate` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalResourceTemplate {
+    /// RFC 6570 resource URI template.
+    #[serde(
+        rename = "uriTemplate",
+        serialize_with = "serialize_final_resource_uri_template",
+        deserialize_with = "deserialize_final_resource_uri_template"
+    )]
+    pub uri_template: String,
+    /// Programmatic template identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional MIME type for resources matched by the template.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional client-facing annotations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Annotations>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+fn deserialize_final_resource_uri_template<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    crate::UriTemplate::parse(&value)
+        .map(|_| value)
+        .map_err(D::Error::custom)
+}
+
+fn serialize_final_resource_uri_template<S>(
+    value: &String,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::UriTemplate::parse(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(value)
+}
+
+/// Exact final prompt-argument model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalPromptArgument {
+    /// Programmatic argument identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether an argument is required; absence remains distinct from false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+}
+
+/// Exact final `Prompt` model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalPrompt {
+    /// Programmatic prompt identifier.
+    pub name: String,
+    /// Optional human-facing display title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional sized icon collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<RawIcon>>,
+    /// Optional prompt arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<FinalPromptArgument>>,
+    /// Optional final metadata.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+fn deserialize_final_tool_input_schema<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(object) = value.as_object() else {
+        return Err(D::Error::custom("final tool inputSchema must be an object"));
+    };
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return Err(D::Error::custom(
+            "final tool inputSchema must declare type object",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_final_json_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Err(D::Error::custom(
+            "final tool outputSchema must be an object",
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Legacy 2024 metadata, retained exactly as an open JSON object.
+///
+/// The 2024-11-05 schema permits arbitrary JSON members in result `_meta`
+/// objects. This intentionally remains distinct from the final-era
+/// [`OpenMetadata`] policy.
+pub type LegacyMetadata = BTreeMap<String, serde_json::Value>;
+
+/// Exact 2024-11-05 content blocks carried in legacy results.
+///
+/// The legacy `Content` surface remains available to 2026 adapters. This
+/// separate wire model preserves the annotations, `_meta`, and open members
+/// that the checked-in 2024 schema permits, while deliberately excluding audio
+/// from the legacy content union.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+pub enum LegacyContent {
+    /// Text content.
+    Text {
+        /// The text content.
+        text: String,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// Image content.
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type (e.g., `image/png`).
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// An embedded resource.
+    Resource {
+        /// Resource contents.
+        resource: LegacyResourceContent,
+        /// Optional presentation annotations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        /// Other schema-allowed content members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+/// Exact 2024-11-05 resource contents carried by legacy results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LegacyResourceContent {
+    /// Text resource contents.
+    Text {
+        /// Resource URI.
+        uri: String,
+        /// Resource text.
+        text: String,
+        /// Optional MIME type.
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        /// Other schema-allowed resource members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+    /// Binary resource contents.
+    Blob {
+        /// Resource URI.
+        uri: String,
+        /// Base64-encoded resource data.
+        blob: String,
+        /// Optional MIME type.
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        /// Other schema-allowed resource members, including an open `_meta` value.
+        #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+        additional: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+/// Content types used by the broader server and 2026 adapter surfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Content {
     /// Text content.
     Text {
@@ -594,6 +2026,7 @@ impl Content {
 
 /// Resource content in a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceContent {
     /// Resource URI.
     pub uri: String,
@@ -616,6 +2049,18 @@ pub enum Role {
     User,
     /// Assistant role.
     Assistant,
+}
+
+/// Exact 2024-11-05 prompt messages carried in legacy results.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyPromptMessage {
+    /// Message role.
+    pub role: Role,
+    /// Exact legacy message content.
+    pub content: LegacyContent,
+    /// Other schema-allowed message members, including an open `_meta` value.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional: BTreeMap<String, serde_json::Value>,
 }
 
 /// A message in a prompt.
@@ -830,6 +2275,54 @@ impl SamplingMessage {
     }
 }
 
+/// Final sampling-specific content block.
+pub type FinalSamplingMessageContentBlock = SamplingContentBlock;
+
+/// Exact final sampling-message content, preserving one block versus an array
+/// of blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FinalSamplingMessageContent {
+    /// One sampled content block.
+    Block(FinalSamplingMessageContentBlock),
+    /// Multiple sampled content blocks.
+    Blocks(Vec<FinalSamplingMessageContentBlock>),
+}
+
+/// A final sampling conversation message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalSamplingMessage {
+    /// Sender role.
+    pub role: Role,
+    /// Exact final sampling content shape.
+    pub content: FinalSamplingMessageContent,
+    /// Optional metadata retained on the final wire.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
+}
+
+/// Tool-selection mode for final sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FinalToolChoiceMode {
+    /// The model decides whether to use tools.
+    Auto,
+    /// The model must use at least one tool.
+    Required,
+    /// The model must not use tools.
+    None,
+}
+
+/// Tool-selection controls for final sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalToolChoice {
+    /// Optional mode; absence keeps the wire default of `auto` distinct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<FinalToolChoiceMode>,
+}
+
 /// Model preferences for sampling requests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelPreferences {
@@ -902,7 +2395,9 @@ mod tests {
             }),
             prompts: Some(PromptsCapability { list_changed: true }),
             logging: Some(LoggingCapability {}),
+            completions: Some(CompletionsCapability {}),
             tasks: Some(TasksCapability { list_changed: true }),
+            ..Default::default()
         };
         let value = serde_json::to_value(&caps).expect("serialize");
         assert_eq!(value["tools"]["listChanged"], true);
@@ -910,6 +2405,7 @@ mod tests {
         assert_eq!(value["resources"]["listChanged"], true);
         assert_eq!(value["prompts"]["listChanged"], true);
         assert!(value.get("logging").is_some());
+        assert!(value.get("completions").is_some());
         assert_eq!(value["tasks"]["listChanged"], true);
     }
 
@@ -937,7 +2433,9 @@ mod tests {
             }),
             prompts: None,
             logging: Some(LoggingCapability {}),
+            completions: None,
             tasks: None,
+            ..Default::default()
         };
         let json_str = serde_json::to_string(&caps).expect("serialize");
         let deserialized: ServerCapabilities =
@@ -1007,9 +2505,10 @@ mod tests {
     #[test]
     fn client_capabilities_full_serialization() {
         let caps = ClientCapabilities {
-            sampling: Some(SamplingCapability {}),
+            sampling: Some(SamplingCapability::default()),
             elicitation: Some(ElicitationCapability::both()),
             roots: Some(RootsCapability { list_changed: true }),
+            ..Default::default()
         };
         let value = serde_json::to_value(&caps).expect("serialize");
         assert!(value.get("sampling").is_some());
@@ -1020,11 +2519,12 @@ mod tests {
     #[test]
     fn client_capabilities_round_trip() {
         let caps = ClientCapabilities {
-            sampling: Some(SamplingCapability {}),
+            sampling: Some(SamplingCapability::default()),
             elicitation: None,
             roots: Some(RootsCapability {
                 list_changed: false,
             }),
+            ..Default::default()
         };
         let json_str = serde_json::to_string(&caps).expect("serialize");
         let deserialized: ClientCapabilities =
@@ -1160,6 +2660,28 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    #[test]
+    fn legacy_icon_rejects_final_theme_without_mutating_accepted_wire() {
+        let accepted = json!({
+            "src": "https://example.com/icon.svg",
+            "mimeType": "image/svg+xml",
+            "sizes": "48x48"
+        });
+        let legacy: Icon = serde_json::from_value(accepted.clone()).expect("legacy icon");
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["theme"] = json!("dark");
+        assert!(
+            serde_json::from_value::<Icon>(planted).is_err(),
+            "the final-only theme field must not be silently discarded by the legacy icon"
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the rejected one-field final addition cannot mutate accepted legacy wire state"
+        );
+        assert_eq!(serde_json::to_value(legacy).expect("legacy wire"), accepted);
+    }
+
     // ========================================================================
     // Content Tests
     // ========================================================================
@@ -1249,6 +2771,24 @@ mod tests {
         };
         assert_eq!(data.as_deref(), Some("abc123"));
         assert_eq!(mime_type.as_deref(), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn legacy_content_rejects_final_metadata_without_mutating_accepted_wire() {
+        let accepted = json!({"type": "text", "text": "legacy text"});
+        let legacy: Content = serde_json::from_value(accepted.clone()).expect("legacy content");
+        let baseline = accepted.clone();
+        let mut planted = accepted.clone();
+        planted["_meta"] = json!({"com.example/renderHint": true});
+        assert!(
+            serde_json::from_value::<Content>(planted).is_err(),
+            "the final-only content metadata must not be silently discarded by legacy content"
+        );
+        assert_eq!(
+            accepted, baseline,
+            "the rejected one-field final metadata addition cannot mutate accepted legacy wire state"
+        );
+        assert_eq!(serde_json::to_value(legacy).expect("legacy wire"), accepted);
     }
 
     // ========================================================================
@@ -1438,8 +2978,8 @@ mod tests {
         assert_eq!(value["icon"]["src"], "https://example.com/icon.png");
         assert_eq!(value["version"], "2.1.0");
         assert_eq!(value["tags"], json!(["math", "compute"]));
-        assert_eq!(value["annotations"]["readOnly"], true);
-        assert_eq!(value["annotations"]["idempotent"], true);
+        assert_eq!(value["annotations"]["readOnlyHint"], true);
+        assert_eq!(value["annotations"]["idempotentHint"], true);
     }
 
     #[test]
@@ -1451,7 +2991,7 @@ mod tests {
             "outputSchema": {"type": "string"},
             "version": "1.0.0",
             "tags": ["greeting"],
-            "annotations": {"readOnly": true}
+            "annotations": {"readOnlyHint": true}
         });
         let tool: Tool = serde_json::from_value(json.clone()).expect("deserialize");
         assert_eq!(tool.name, "greet");
@@ -1520,6 +3060,37 @@ mod tests {
         assert_eq!(value["name"], "File Reader");
         assert_eq!(value["description"], "Read any file");
         assert_eq!(value["mimeType"], "text/plain");
+    }
+
+    #[test]
+    fn resource_template_peer_admission_rejects_malformed_and_oversized_templates() {
+        let accepted_wire = json!({
+            "uriTemplate": "file://{path}",
+            "name": "File Reader"
+        });
+        let accepted: ResourceTemplate = serde_json::from_value(accepted_wire.clone())
+            .expect("a legal exact-2024 resource template remains admissible");
+        assert_eq!(
+            serde_json::to_value(accepted).expect("admitted template serializes"),
+            accepted_wire
+        );
+
+        let mut malformed = accepted_wire.clone();
+        malformed["uriTemplate"] = json!("file://{path");
+        assert!(
+            serde_json::from_value::<ResourceTemplate>(malformed).is_err(),
+            "changing only the closing brace rejects malformed peer input"
+        );
+
+        let mut oversized = accepted_wire;
+        oversized["uriTemplate"] = json!(format!(
+            "mcp://{}",
+            "x".repeat(crate::MAX_URI_TEMPLATE_BYTES)
+        ));
+        assert!(
+            serde_json::from_value::<ResourceTemplate>(oversized).is_err(),
+            "changing only the template length beyond the protocol bound rejects peer input"
+        );
     }
 
     // ========================================================================
@@ -1916,12 +3487,12 @@ mod tests {
             .read_only(true)
             .idempotent(true)
             .destructive(false)
-            .open_world_hint("none");
+            .open_world_hint(false);
 
         assert_eq!(ann.read_only, Some(true));
         assert_eq!(ann.idempotent, Some(true));
         assert_eq!(ann.destructive, Some(false));
-        assert_eq!(ann.open_world_hint.as_deref(), Some("none"));
+        assert_eq!(ann.open_world_hint, Some(false));
         assert!(!ann.is_empty());
     }
 
@@ -1930,16 +3501,16 @@ mod tests {
         assert!(!ToolAnnotations::new().destructive(true).is_empty());
         assert!(!ToolAnnotations::new().idempotent(false).is_empty());
         assert!(!ToolAnnotations::new().read_only(true).is_empty());
-        assert!(!ToolAnnotations::new().open_world_hint("x").is_empty());
+        assert!(!ToolAnnotations::new().open_world_hint(true).is_empty());
     }
 
     #[test]
     fn tool_annotations_serialization_skips_none() {
         let ann = ToolAnnotations::new().read_only(true);
         let value = serde_json::to_value(&ann).expect("serialize");
-        assert_eq!(value["readOnly"], true);
-        assert!(value.get("destructive").is_none());
-        assert!(value.get("idempotent").is_none());
+        assert_eq!(value["readOnlyHint"], true);
+        assert!(value.get("destructiveHint").is_none());
+        assert!(value.get("idempotentHint").is_none());
         assert!(value.get("openWorldHint").is_none());
     }
 
@@ -1948,7 +3519,7 @@ mod tests {
         let ann = ToolAnnotations::new()
             .destructive(true)
             .idempotent(false)
-            .open_world_hint("strict");
+            .open_world_hint(true);
         let json_str = serde_json::to_string(&ann).expect("serialize");
         let deserialized: ToolAnnotations = serde_json::from_str(&json_str).expect("deserialize");
         assert_eq!(ann, deserialized);
@@ -2027,7 +3598,7 @@ mod tests {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .expect("valid base64");
-                assert!(decoded.is_empty());
+                assert_eq!(decoded.len(), 0);
             }
             _ => panic!("expected Image content"),
         }
@@ -2220,5 +3791,625 @@ mod tests {
             }
             _ => panic!("expected Resource content"),
         }
+    }
+
+    #[test]
+    fn final_models_and_sampling_blocks_round_trip_without_legacy_fields() {
+        let tool_wire = json!({
+            "name": "weather",
+            "title": "Weather lookup",
+            "description": "Looks up forecast data",
+            "icons": [{"src": "https://example.test/weather.png"}],
+            "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "annotations": {"title": "Forecast", "readOnlyHint": true},
+            "_meta": {"com.example/source": "catalog"}
+        });
+        let tool: FinalTool = serde_json::from_value(tool_wire.clone())
+            .expect("final tool accepts final metadata and icons array");
+        assert_eq!(tool.title.as_deref(), Some("Weather lookup"));
+        assert_eq!(
+            serde_json::to_value(&tool).expect("final tool re-encodes"),
+            tool_wire
+        );
+
+        let sampling_wire = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "call-1", "name": "weather", "input": {"city": "Boston"}},
+                {"type": "tool_result", "toolUseId": "call-1", "content": [{"type": "text", "text": "sunny"}], "structuredContent": {"temperature": 22}}
+            ],
+            "_meta": {"com.example/turn": 4}
+        });
+        let message: FinalSamplingMessage = serde_json::from_value(sampling_wire.clone())
+            .expect("final sampling admits tool-use and tool-result blocks");
+        assert_eq!(
+            serde_json::to_value(message).expect("final sampling re-encodes"),
+            sampling_wire
+        );
+    }
+
+    #[test]
+    fn final_tool_rejects_one_legacy_icon_field_without_mutating_final_baseline() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"}
+        });
+        let baseline: FinalTool =
+            serde_json::from_value(accepted.clone()).expect("final tool baseline");
+        let mut planted = accepted.clone();
+        planted["icon"] = json!({"src": "https://example.test/legacy.png"});
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "only the legacy singular icon field changes the final model"
+        );
+        assert_eq!(
+            serde_json::to_value(baseline).expect("baseline re-encodes"),
+            accepted,
+            "legacy-field rejection does not mutate final model state"
+        );
+    }
+
+    #[test]
+    fn final_tool_output_schema_distinguishes_absence_from_explicit_null() {
+        let absent_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"}
+        });
+        let absent: FinalTool =
+            serde_json::from_value(absent_wire.clone()).expect("absent outputSchema is valid");
+        assert!(absent.output_schema.is_none());
+        assert_eq!(
+            serde_json::to_value(absent).expect("absent outputSchema re-encodes"),
+            absent_wire
+        );
+
+        let accepted_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "outputSchema": {"type": "null"}
+        });
+        let accepted: FinalTool = serde_json::from_value(accepted_wire.clone())
+            .expect("an object schema whose admitted instances are null is valid");
+
+        let mut planted = accepted_wire.clone();
+        planted["outputSchema"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "a present outputSchema must itself be an object, not JSON null"
+        );
+        assert_eq!(
+            serde_json::to_value(accepted).expect("accepted outputSchema re-encodes"),
+            accepted_wire,
+            "rejecting the one-field null plant cannot mutate the accepted model"
+        );
+    }
+
+    #[test]
+    fn final_resource_size_preserves_arbitrary_width_and_rejects_fractional_values() {
+        let accepted: serde_json::Value = serde_json::from_str(
+            r#"{"uri":"file:///data.bin","name":"data","size":922337203685477580812345678901234567890}"#,
+        )
+        .expect("arbitrary-width resource size wire parses");
+        let resource: FinalResource = serde_json::from_value(accepted.clone())
+            .expect("arbitrary-width final resource size is accepted");
+        assert_eq!(
+            resource.size.as_ref().map(JsonInteger::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+        assert_eq!(
+            serde_json::to_value(resource).expect("arbitrary-width final resource re-encodes"),
+            accepted,
+            "the exact integer resource size lexeme round-trips"
+        );
+
+        let planted: serde_json::Value = serde_json::from_str(
+            r#"{"uri":"file:///data.bin","name":"data","size":922337203685477580812345678901234567890.5}"#,
+        )
+        .expect("one-field fractional resource size wire parses");
+        assert!(
+            serde_json::from_value::<FinalResource>(planted).is_err(),
+            "changing only the resource size to a fractional number rejects it"
+        );
+    }
+
+    #[test]
+    fn final_resource_template_enforces_the_uri_template_schema_format() {
+        let accepted_wire = json!({
+            "uriTemplate": "mcp://resources/{item:3}{?cursor,labels*}",
+            "name": "resource-template"
+        });
+        let accepted: FinalResourceTemplate = serde_json::from_value(accepted_wire.clone())
+            .expect("a final RFC 6570 Level 4 resource template is admitted");
+        assert_eq!(
+            accepted.uri_template, "mcp://resources/{item:3}{?cursor,labels*}",
+            "typed final decoding preserves the accepted template spelling"
+        );
+        assert_eq!(
+            serde_json::to_value(accepted).expect("accepted template re-encodes"),
+            accepted_wire,
+            "template validation does not normalize the final wire value"
+        );
+
+        let mut planted = accepted_wire;
+        planted["uriTemplate"] = json!("mcp://resources/{item:0}");
+        assert!(
+            serde_json::from_value::<FinalResourceTemplate>(planted).is_err(),
+            "changing only the prefix modifier to RFC 6570's forbidden zero rejects the template"
+        );
+
+        let locally_invalid = FinalResourceTemplate {
+            uri_template: "mcp://resources/{item:0}".to_owned(),
+            name: "resource-template".to_owned(),
+            title: None,
+            description: None,
+            icons: None,
+            mime_type: None,
+            annotations: None,
+            meta: None,
+        };
+        assert!(
+            serde_json::to_value(locally_invalid).is_err(),
+            "direct construction cannot serialize a URI template rejected at peer admission"
+        );
+    }
+
+    #[test]
+    fn apps_02_nested_tool_resource_metadata_and_result_projection_round_trip() {
+        let tool_wire = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {
+                "ui": {
+                    "resourceUri": "ui://weather/dashboard",
+                    "visibility": ["model", "app"]
+                },
+                "com.example/catalog": "weather"
+            }
+        });
+        let tool: FinalTool = serde_json::from_value(tool_wire.clone())
+            .expect("a nested Apps tool resource binding is valid final metadata");
+        let metadata = tool
+            .mcp_apps_metadata()
+            .expect("nested Apps tool metadata remains typed")
+            .expect("the tool declares Apps metadata");
+        assert_eq!(
+            metadata.resource_uri.as_ref().map(AbsoluteUri::as_str),
+            Some("ui://weather/dashboard")
+        );
+        assert_eq!(
+            metadata.effective_visibility(),
+            [McpAppsToolVisibility::Model, McpAppsToolVisibility::App]
+        );
+        assert_eq!(
+            serde_json::to_value(&tool).expect("tool re-encodes exact nested metadata"),
+            tool_wire
+        );
+
+        let resource_wire = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "_meta": {"ui": {
+                "csp": {
+                    "connectDomains": ["https://api.weather.example"],
+                    "resourceDomains": ["https://cdn.weather.example"],
+                    "frameDomains": ["https://maps.weather.example"],
+                    "baseUriDomains": ["https://cdn.weather.example"]
+                },
+                "permissions": {"geolocation": {}},
+                "domain": "weather-view.host.example",
+                "prefersBorder": true
+            }}
+        });
+        let resource: FinalResource = serde_json::from_value(resource_wire.clone())
+            .expect("an Apps HTML resource accepts nested presentation metadata");
+        let resource_metadata = resource
+            .mcp_apps_metadata()
+            .expect("resource metadata remains typed")
+            .expect("resource declares Apps presentation");
+        assert_eq!(resource_metadata.prefers_border, Some(true));
+        assert_eq!(
+            resource_metadata
+                .csp
+                .as_ref()
+                .and_then(|csp| csp.connect_domains.as_ref())
+                .map(|domains| domains.iter().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["https://api.weather.example"])
+        );
+        assert!(
+            resource_metadata
+                .permissions
+                .as_ref()
+                .and_then(|permissions| permissions.geolocation.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            resource_metadata.domain.as_deref(),
+            Some("weather-view.host.example")
+        );
+        tool.mcp_apps_resource_binding()
+            .expect("tool metadata is valid")
+            .expect("tool has an Apps binding")
+            .validate_resource(&resource)
+            .expect("the exact Apps HTML catalog resource satisfies the binding");
+        assert_eq!(
+            serde_json::to_value(&resource).expect("resource re-encodes exact nested metadata"),
+            resource_wire
+        );
+
+        let final_result = FinalCallToolResult {
+            content: vec![ContentBlock::text("sunny")],
+            is_error: false,
+            structured_content: Some(serde_json::Value::Null),
+        };
+        let projected = McpAppsToolResult::from_final_call_tool_result(&final_result)
+            .expect("a complete final tools/call result projects into Apps content");
+        let result_wire = json!({
+            "content": [{"type": "text", "text": "sunny"}],
+            "structuredContent": null
+        });
+        assert_eq!(
+            serde_json::to_value(&projected).expect("Apps result serializes"),
+            result_wire
+        );
+        assert_eq!(
+            serde_json::from_value::<McpAppsToolResult>(result_wire)
+                .expect("Apps result round-trips exactly"),
+            projected
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_opaque_ui_uri_in_tool_metadata_construction_and_serde() {
+        let accepted_uri = AbsoluteUri::parse("ui://opaque").expect("authority-form UI URI");
+        let accepted = McpAppsToolMetadata::try_new(Some(accepted_uri), None)
+            .expect("the exact UI URI is admitted");
+        let accepted_wire = serde_json::json!({"resourceUri": "ui://opaque"});
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("the admitted UI URI serializes"),
+            accepted_wire,
+        );
+
+        let opaque_uri = AbsoluteUri::parse("ui:opaque").expect("opaque UI URI is absolute");
+        assert_eq!(
+            McpAppsToolMetadata::try_new(Some(opaque_uri.clone()), None),
+            Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix),
+            "removing only the authority delimiter rejects constructor input"
+        );
+        let planted = McpAppsToolMetadata {
+            resource_uri: Some(opaque_uri),
+            visibility: None,
+        };
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "direct construction cannot serialize an opaque ui: URI"
+        );
+
+        let mut opaque_wire = accepted_wire.clone();
+        opaque_wire["resourceUri"] = serde_json::json!("ui:opaque");
+        assert!(
+            serde_json::from_value::<McpAppsToolMetadata>(opaque_wire).is_err(),
+            "removing only the authority delimiter rejects deserialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("rejected variants do not mutate the baseline"),
+            accepted_wire,
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_only_deprecated_flat_resource_uri_metadata() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"resourceUri": "ui://weather/dashboard"}}
+        });
+        let baseline: FinalTool = serde_json::from_value(accepted.clone())
+            .expect("nested Apps resource metadata is the baseline");
+        let mut planted = accepted.clone();
+        let metadata = planted["_meta"]
+            .as_object_mut()
+            .expect("baseline metadata is an object");
+        let nested = metadata
+            .remove(MCP_APPS_UI_METADATA_KEY)
+            .expect("baseline has nested Apps metadata");
+        let resource_uri = nested["resourceUri"].clone();
+        metadata.insert(
+            MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY.to_owned(),
+            resource_uri,
+        );
+
+        assert!(
+            serde_json::from_value::<FinalTool>(planted).is_err(),
+            "only replacing nested ui.resourceUri with the deprecated flat key rejects the tool"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline remains serializable"),
+            accepted,
+            "the flat-key rejection cannot mutate the accepted nested binding"
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_csp_origin_beyond_the_bounded_directive_limit() {
+        let accepted = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "_meta": {"ui": {"csp": {
+                "connectDomains": (0..MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE)
+                    .map(|index| format!("https://{index}.weather.example"))
+                    .collect::<Vec<_>>()
+            }}}
+        });
+        let baseline: FinalResource = serde_json::from_value(accepted.clone())
+            .expect("a bounded Apps CSP declaration is valid");
+        let mut planted = accepted.clone();
+        planted["_meta"]["ui"]["csp"]["connectDomains"]
+            .as_array_mut()
+            .expect("bounded baseline has a CSP origin array")
+            .push(json!(format!(
+                "https://{MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE}.weather.example"
+            )));
+
+        assert!(
+            serde_json::from_value::<FinalResource>(planted).is_err(),
+            "adding only one origin beyond the CSP directive bound rejects the resource metadata"
+        );
+        assert_eq!(
+            serde_json::to_value(baseline).expect("bounded baseline re-encodes"),
+            accepted,
+            "the one-origin rejection cannot mutate the admitted Apps metadata"
+        );
+    }
+
+    #[test]
+    fn apps_02_direct_csp_construction_cannot_bypass_serialization_bounds() {
+        let accepted = McpAppsResourceCsp {
+            connect_domains: Some(
+                (0..MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE)
+                    .map(|index| format!("https://{index}.weather.example"))
+                    .collect(),
+            ),
+            ..McpAppsResourceCsp::default()
+        };
+        let accepted_wire = serde_json::to_value(&accepted)
+            .expect("the direct CSP value at the directive bound serializes");
+
+        let mut planted = accepted.clone();
+        planted
+            .connect_domains
+            .as_mut()
+            .expect("the direct CSP fixture has connect domains")
+            .push(format!(
+                "https://{MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE}.weather.example"
+            ));
+
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "adding only one domain beyond the bound rejects direct CSP serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).expect("accepted direct CSP re-serializes"),
+            accepted_wire,
+            "a rejected direct CSP serialization cannot mutate the bounded baseline"
+        );
+    }
+
+    #[test]
+    fn apps_02_preserves_duplicate_and_ordered_visibility() {
+        let accepted = json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"visibility": ["app", "model", "app"]}}
+        });
+        let tool: FinalTool = serde_json::from_value(accepted.clone())
+            .expect("the stable Apps visibility array permits duplicates in wire order");
+        let metadata = tool
+            .mcp_apps_metadata()
+            .expect("Apps metadata remains typed")
+            .expect("the tool declares Apps metadata");
+        assert_eq!(
+            metadata.effective_visibility(),
+            [
+                McpAppsToolVisibility::App,
+                McpAppsToolVisibility::Model,
+                McpAppsToolVisibility::App,
+            ],
+            "Apps visibility preserves the received duplicate sequence"
+        );
+        assert_eq!(
+            serde_json::to_value(&tool).expect("tool re-encodes"),
+            accepted,
+            "Apps visibility re-encodes duplicates in their received order"
+        );
+    }
+
+    #[test]
+    fn apps_02_bounds_tool_visibility_entries_without_changing_duplicates_or_order() {
+        let accepted_visibility = (0..MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES)
+            .map(|index| {
+                if index % 2 == 0 {
+                    McpAppsToolVisibility::App
+                } else {
+                    McpAppsToolVisibility::Model
+                }
+            })
+            .collect::<Vec<_>>();
+        let baseline = McpAppsToolMetadata::try_new(None, Some(accepted_visibility.clone()))
+            .expect("the tool visibility entry bound is admitted");
+        let baseline_wire =
+            serde_json::to_value(&baseline).expect("bounded visibility metadata serializes");
+        assert_eq!(
+            baseline.effective_visibility(),
+            accepted_visibility,
+            "bounded visibility retains received duplicate entries in order"
+        );
+
+        let mut planted_visibility = accepted_visibility;
+        planted_visibility.push(McpAppsToolVisibility::App);
+        assert_eq!(
+            McpAppsToolMetadata::try_new(None, Some(planted_visibility.clone())),
+            Err(McpAppsMetadataError::TooManyToolVisibilityEntries),
+            "adding only one visibility entry beyond the bound is rejected with the typed error"
+        );
+        let planted = McpAppsToolMetadata {
+            resource_uri: None,
+            visibility: Some(planted_visibility),
+        };
+        assert!(
+            serde_json::to_value(&planted).is_err(),
+            "direct construction cannot bypass the visibility entry bound during serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("bounded metadata re-serializes"),
+            baseline_wire,
+            "rejecting the one-entry plant cannot mutate the admitted metadata"
+        );
+    }
+
+    #[test]
+    fn apps_02_rejects_one_non_html_bound_resource_without_mutating_binding() {
+        let tool: FinalTool = serde_json::from_value(json!({
+            "name": "weather",
+            "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"resourceUri": "ui://weather/dashboard"}}
+        }))
+        .expect("nested Apps binding is valid");
+        let binding = tool
+            .mcp_apps_resource_binding()
+            .expect("tool metadata is valid")
+            .expect("tool declares an Apps resource");
+        let accepted = json!({
+            "uri": "ui://weather/dashboard",
+            "name": "weather-dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE
+        });
+        let baseline: FinalResource =
+            serde_json::from_value(accepted.clone()).expect("Apps resource baseline decodes");
+        let mut planted = accepted.clone();
+        planted["mimeType"] = json!("text/plain");
+
+        assert_eq!(binding.validate_resource(&baseline), Ok(()));
+        let incompatible: FinalResource = serde_json::from_value(planted)
+            .expect("only MIME type changes; resource remains a final resource");
+        assert_eq!(
+            binding.validate_resource(&incompatible),
+            Err(McpAppsResourceBindingError::HtmlMimeTypeRequired),
+            "only replacing the Apps HTML MIME type rejects the bound resource"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline resource re-encodes"),
+            accepted,
+            "the invalid resource cannot mutate the admitted binding target"
+        );
+    }
+
+    #[test]
+    fn apps_02_view_lifecycle_requires_initialization_before_activation() {
+        assert_eq!(
+            serde_json::to_value(McpAppsDisplayMode::Pip).expect("display mode serializes exactly"),
+            json!("pip")
+        );
+        assert_eq!(
+            serde_json::from_value::<McpAppsDisplayMode>(json!("fullscreen"))
+                .expect("known display mode decodes"),
+            McpAppsDisplayMode::Fullscreen
+        );
+        assert!(
+            serde_json::from_value::<McpAppsDisplayMode>(json!("overlay")).is_err(),
+            "only replacing a known display mode with an undeclared value rejects it"
+        );
+
+        let mut lifecycle = McpAppsViewLifecycle::default();
+        assert!(!lifecycle.permits_application_traffic());
+        assert_eq!(
+            lifecycle.admit_initialized(),
+            Err(McpAppsLifecycleError::InvalidTransition {
+                from: McpAppsViewLifecycle::New,
+                operation: "initialized notification",
+            }),
+            "only omitting the prior initialization transition rejects early activation"
+        );
+        assert_eq!(lifecycle, McpAppsViewLifecycle::New);
+
+        lifecycle
+            .begin_initialize()
+            .expect("one initialization reservation is legal from New");
+        lifecycle
+            .initialization_succeeded()
+            .expect("a successful initialization awaits exactly one notification");
+        lifecycle
+            .admit_initialized()
+            .expect("the first initialized notification activates the View");
+        assert!(lifecycle.permits_application_traffic());
+        lifecycle
+            .begin_closing()
+            .expect("an active View can begin terminal teardown");
+        lifecycle
+            .finish_closing()
+            .expect("a closing View reaches Closed exactly once");
+        assert_eq!(lifecycle, McpAppsViewLifecycle::Closed);
+    }
+
+    #[test]
+    fn apps_02_result_projection_rejects_one_unknown_wire_member() {
+        let accepted = json!({
+            "content": [{"type": "text", "text": "sunny"}],
+            "isError": true
+        });
+        let baseline: McpAppsToolResult = serde_json::from_value(accepted.clone())
+            .expect("bounded complete Apps tool result is valid");
+        let mut planted = accepted.clone();
+        planted["task"] = json!({"taskId": "deferred"});
+
+        assert!(
+            serde_json::from_value::<McpAppsToolResult>(planted).is_err(),
+            "only adding a Tasks-shaped member rejects the complete Apps result projection"
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline).expect("baseline result re-encodes"),
+            accepted,
+            "the rejected Tasks-shaped member cannot mutate the complete Apps result"
+        );
+    }
+
+    #[test]
+    fn sampling_capability_round_trips_tools_and_context() {
+        // Official MCP 2026-07-28 ClientCapabilities.sampling carries optional
+        // `context` and `tools` objects; decoding must not drop them.
+        let wire = json!({"sampling": {"tools": {}, "context": {"note": "kept"}}});
+        let capabilities: ClientCapabilities =
+            serde_json::from_value(wire.clone()).expect("decode official sampling capability");
+        let sampling = capabilities.sampling.as_ref().expect("sampling present");
+        assert!(sampling.tools.is_some());
+        assert_eq!(
+            sampling
+                .context
+                .as_ref()
+                .and_then(|context| context.get("note")),
+            Some(&json!("kept"))
+        );
+        assert_eq!(
+            serde_json::to_value(&capabilities).expect("encode"),
+            wire,
+            "a decoded sampling capability must re-encode without loss"
+        );
+
+        // Near-identical negative: plain sampling stays exactly `{}`; the new
+        // members never appear unless declared.
+        let plain = ClientCapabilities {
+            sampling: Some(SamplingCapability::default()),
+            ..ClientCapabilities::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).expect("encode")["sampling"],
+            json!({})
+        );
+        let builder = SamplingCapability::default().with_tools().with_context();
+        assert_eq!(
+            serde_json::to_value(&builder).expect("encode"),
+            json!({"tools": {}, "context": {}})
+        );
     }
 }

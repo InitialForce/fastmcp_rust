@@ -2,6 +2,10 @@
 
 Rich console output for FastMCP servers.
 
+MCP 2026-07-28 support is under implementation and remains unverified. The
+workspace's public protocol constant is still `2024-11-05`; console rendering
+is not aggregate conformance or release evidence.
+
 fastmcp-console renders human-friendly output to stderr and keeps stdout
 reserved for JSON-RPC (NDJSON). This preserves protocol correctness for agents
 while giving humans polished output.
@@ -19,12 +23,10 @@ clients and agents that parse stdout as a protocol stream.
 use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
-use log::Level;
 
 fn main() {
     // Optional: initialize rich logger (stderr only)
     let _ = RichLoggerBuilder::new()
-        .level(Level::Info)
         .with_targets(true)
         .init();
 
@@ -47,6 +49,23 @@ fn main() {
 - Dual-stream architecture: stdout is JSON-RPC only, stderr is human output.
 - DisplayContext: automatic detection of agent vs human context.
 
+## Feature Boundaries
+
+The default feature set is protocol-free. It provides the generic console,
+banner, diagnostics, logging, status, statistics, theme, configuration, and
+test utilities without pulling `fastmcp-protocol` into the dependency graph.
+
+Protocol-aware request traffic, client information, capability tables, and
+handler rendering require one of the protocol features:
+
+- `legacy-2024-11-05` for exact legacy rendering.
+- `tasks` for Tasks rendering.
+- `apps` for Apps rendering.
+
+The remaining nonsecurity presentation features compose those protocol
+features where needed: `proxy-legacy` implies `proxy` and
+`legacy-2024-11-05`; `proxy-tasks` implies `proxy` and `tasks`.
+
 ## Detection and Environment Variables
 
 Rich output is enabled when we are in a human context and not explicitly
@@ -58,15 +77,18 @@ suppressed. The most common toggles are:
   CI, or AGENT_MODE set.
 
 ConsoleConfig::from_env() also supports:
-- FASTMCP_FORCE_COLOR, FASTMCP_BANNER, FASTMCP_LOG,
-  FASTMCP_LOG_TIMESTAMPS, FASTMCP_TRAFFIC, RUST_BACKTRACE
+- FASTMCP_FORCE_COLOR, FASTMCP_BANNER, FASTMCP_NO_BANNER, FASTMCP_LOG,
+  FASTMCP_LOG_TIMESTAMPS, FASTMCP_LOG_TARGETS, FASTMCP_LOG_FILE_LINE,
+  FASTMCP_TRAFFIC, RUST_BACKTRACE
 
 ## API Overview
 
 - console::FastMcpConsole: printing, renderables, rules, tables, panels
 - banner::StartupBanner: startup banner
 - tables::ToolTableRenderer / ResourceTableRenderer / PromptTableRenderer
-- handlers::HandlerRegistryRenderer: combined capabilities view
+  (requires a protocol feature)
+- handlers::HandlerRegistryRenderer: combined capabilities view (requires a
+  protocol feature)
 - logging::RichLogger / RichLoggerBuilder / RichLayer (tracing)
 - stats::ServerStats + StatsRenderer
 - config::ConsoleConfig for customization
@@ -89,4 +111,8 @@ See `crates/fastmcp-console/examples`:
 
 ## License
 
-MIT. See LICENSE-MIT.
+The workspace release-license representation is unresolved: Cargo metadata,
+the root `LICENSE`, and the root `LICENSE-MIT` do not currently describe one
+consistent set of terms. Do not infer authoritative release terms from this
+crate page; publication remains blocked pending the explicit license decision
+required by the implementation plan.

@@ -2,33 +2,269 @@
 name = "fastmcp-rust"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
-description = "Fast, cancel-correct MCP framework for Rust"
+description = "Asupersync-based MCP framework for Rust"
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 documentation = "https://docs.rs/fastmcp-rust"
 keywords = ["mcp", "json-rpc", "async", "ai", "protocol"]
 categories = ["network-programming", "api-bindings", "development-tools"]
+exclude = [
+    "tests/fnd_01_dependency_evidence.rs",
+    "tests/fnd_01_dependency_evidence.rs.*",
+]
+autoexamples = false
+
+[features]
+# Official 2026 Tasks are available from the default facade graph.  The
+# exact-2024 adapter remains a separate, Tasks-blind protocol surface.
+default = ["legacy-2024-11-05", "tasks"]
+
+# Canonical nonsecurity facade graph (plan 25.10).  The facade owns these
+# forwarding equations; component crates own the implementation behind them.
+legacy-2024-11-05 = [
+    "fastmcp-protocol/legacy-2024-11-05",
+    "fastmcp-transport/legacy-2024-11-05",
+    "fastmcp-server/legacy-2024-11-05",
+    "fastmcp-client/legacy-2024-11-05",
+    "fastmcp-console/legacy-2024-11-05",
+]
+tasks = [
+    "fastmcp-protocol/tasks",
+    "fastmcp-server/tasks",
+    "fastmcp-client/tasks",
+    "fastmcp-derive/tasks",
+    "fastmcp-console/tasks",
+]
+# Opt-in platform trust roots, including the provider's certificate-file overrides.
+native-tls-roots = ["fastmcp-client/native-tls-roots"]
+apps = [
+    "fastmcp-protocol/apps",
+    "fastmcp-server/apps",
+    "fastmcp-client/apps",
+    "fastmcp-derive/apps",
+    "fastmcp-console/apps",
+]
+proxy = ["fastmcp-server/proxy", "fastmcp-console/proxy"]
+proxy-legacy = [
+    "proxy",
+    "legacy-2024-11-05",
+    "fastmcp-server/proxy-legacy",
+    "fastmcp-console/proxy-legacy",
+]
+proxy-tasks = [
+    "proxy",
+    "tasks",
+    "fastmcp-server/proxy-tasks",
+    "fastmcp-console/proxy-tasks",
+]
+# OIDC signing remains opt-in: it forwards the protocol's bounded JOSE facade
+# and the server's external-signer admission without selecting a local key.
+builtin-auth-server = [
+    "fastmcp-protocol/jose",
+    "fastmcp-client/builtin-auth-server",
+    "fastmcp-server/builtin-auth-server",
+    "fastmcp-console/builtin-auth-server",
+]
+# The built-in machine grant also requires builtin-auth-server and an explicit
+# development issuer configuration. External authorization-server clients
+# remain independently available through the ordinary client surface.
+oauth-client-credentials = [
+    "fastmcp-server/oauth-client-credentials",
+    "fastmcp-console/oauth-client-credentials",
+]
+# Full WebSocket support: URI client transport, negotiated MCP client, and
+# server-owned listener/Upgrade bridge. The facade keeps raw framing adapters
+# outside era namespaces while era-pinned builders select their policy first.
+websocket-experimental = [
+    "fastmcp-transport/websocket-experimental",
+    "fastmcp-server/websocket",
+    "fastmcp-client/websocket-experimental",
+    "fastmcp-console/websocket-experimental",
+]
+
+# `testing` remains production-faithful.  Deterministic runtime internals are
+# deliberately available only through the opt-in lab profile.
+testing = []
+testing-lab = ["testing", "asupersync/test-internals"]
 
 [dependencies]
 fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true
 fastmcp-transport.workspace = true
-fastmcp-server.workspace = true
-fastmcp-client.workspace = true
+fastmcp-server = { workspace = true, default-features = false }
+# Keep the facade's ModernOnly graph free of the component's default
+# exact-2024 adapter. The explicit facade forwarding feature above is the
+# sole owner of that legacy selection.
+fastmcp-client = { workspace = true, default-features = false }
 fastmcp-derive.workspace = true
+# Console rendering is activated only by a facade profile that forwards to it.
+# Keeping the dependency optional preserves the core ModernOnly graph when
+# consumers select `--no-default-features`.
+fastmcp-console = { workspace = true, optional = true }
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# Internal facade tests may exercise deterministic lab behavior without making
+# it part of the facade's default public dependency graph.
+asupersync = { workspace = true, features = ["test-internals"] }
+# FND-01 FACADE-*-DEV evidence surface (exact root pins; no JWT/Redis)
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+ring = { workspace = true }
+proc-macro2 = { workspace = true }
+
+[[test]]
+name = "fnd_01_dependency_evidence"
+path = "tests/fnd_01_dependency_evidence.rs"
+# Frozen FND-01 attestation still records nightly-2026-07-11 / workspace 0.5.0.
+# Re-run the producer after a dedicated FND-01 re-attest. This binary is not
+# part of the default product test gate.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_middleware"
+path = "tests/e2e_middleware.rs"
+# The middleware harness requires deterministic `TestClient` and `Cx::for_testing`.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_protocol"
+path = "tests/e2e_protocol.rs"
+# The protocol harness uses deterministic testing, exact-2024 callbacks, and
+# the public final Tasks lifecycle against the shipped echo example.
+required-features = ["testing-lab", "legacy-2024-11-05", "tasks"]
+
+[[test]]
+name = "e2e_modern_http"
+path = "tests/e2e_modern_http.rs"
+# This dual-era HTTP harness directly names the sealed exact-2024 facade and
+# its Tasks/proxy fixtures; the canonical gate feature set matches every
+# recorded acceptance run for this target.
+required-features = ["legacy-2024-11-05", "tasks", "proxy"]
+
+[[test]]
+name = "e2e_stress"
+path = "tests/e2e_stress.rs"
+# The stress harness requires deterministic `TestClient` and `Cx::for_testing`.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_workflow"
+path = "tests/e2e_workflow.rs"
+# The workflow harness requires deterministic test helpers, the Tasks API, and
+# the Auto facade it exercises over both exact protocol eras.
+required-features = ["testing-lab", "tasks", "legacy-2024-11-05"]
+
+[[bin]]
+name = "echo_server"
+path = "examples/echo_server.rs"
+# The CLI integration target launches an explicit freshly built instance of
+# this shipped executable rather than a scripted fixture.
+#
+# COUPLING, deliberately noted here rather than left to be rediscovered: the
+# README documents `cargo run -p fastmcp-rust --bin echo_server` with no
+# `--features`. That command works ONLY because this required set is exactly
+# equal to the package `default`. Narrow either one and the README does not
+# fail with a missing-target error — it fails with a required-features refusal,
+# which reads like a different bug entirely. If you change `default`, change
+# the README in the same commit.
+required-features = ["legacy-2024-11-05", "tasks"]
+
+# The README's server snippets, compiled from their exact text so
+# tests/readme_examples.rs can drive them over stdio. The `testing` gate keeps
+# them out of default builds and `cargo install`; they use the dual-era
+# `auto::ServerBuilder`, which needs the exact-2024 adapter.
+[[bin]]
+name = "readme_tldr"
+path = "tests/readme/tldr.rs"
+required-features = ["testing", "legacy-2024-11-05"]
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "readme_quick_example"
+path = "tests/readme/quick_example.rs"
+required-features = ["testing", "legacy-2024-11-05"]
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "readme_quick_start"
+path = "tests/readme/quick_start.rs"
+required-features = ["testing", "legacy-2024-11-05"]
+test = false
+bench = false
+doc = false
+
+# Conformance adapter for the official @modelcontextprotocol/conformance suite.
+# It serves the upstream fixture contract over modern HTTP so the harness that
+# plan section 2.6 requires can be pointed at this codebase at all. Declared
+# explicitly because this crate sets `autoexamples = false`.
+[[bin]]
+name = "conformance_server"
+path = "examples/conformance_server.rs"
+# Serves the Tasks-extension fixtures too, and answers exact-2024 completion
+# requests through `fastmcp_rust::legacy_2024`, so the ModernOnly
+# (--no-default-features) facade profile must not try to build it.
+required-features = ["tasks", "legacy-2024-11-05"]
+test = false
+bench = false
+doc = false
+
+# Client-mode counterpart: the suite runs it with the scenario server URL.
+[[bin]]
+name = "conformance_client"
+path = "examples/conformance_client.rs"
+# Exercise catalog admission and real-body header projection in the adapter.
+test = true
+bench = false
+doc = false
+
+[[test]]
+name = "readme_examples"
+path = "tests/readme_examples.rs"
+# Uses the three README binaries above.
+required-features = ["testing", "legacy-2024-11-05"]
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[[example]]
+name = "calculator_server"
+path = "examples/calculator_server.rs"
+
+[[example]]
+name = "fnd_01_evidence_harness"
+path = "examples/fnd_01_evidence_harness.rs"
+# This is an executable proof runner whose included verifier module owns its
+# tests separately; never execute it as an example test harness.
+test = false
+
+[[example]]
+name = "fnd_01_sdk_batch"
+path = "examples/fnd_01_sdk_batch.rs"
+# Like the evidence harness above, this is a shipped proof runner rather than
+# a Cargo test target.
+test = false
+
+[[example]]
+name = "notes_server"
+path = "examples/notes_server.rs"
+
+[[example]]
+name = "weather_server"
+path = "examples/weather_server.rs"
 
 [lints]
 workspace = true
-
-[features]
-jwt = ["fastmcp-server/jwt"]

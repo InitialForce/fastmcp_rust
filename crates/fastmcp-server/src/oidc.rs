@@ -3,22 +3,28 @@
 //! This module extends the OAuth 2.0/2.1 server with OpenID Connect identity
 //! layer features:
 //!
-//! - **ID Token Issuance**: JWT tokens containing user identity claims
+//! - **ID Token Issuance**: fail-closed until an FND-09 external signer is admitted
 //! - **UserInfo Endpoint**: Standard endpoint for retrieving user claims
 //! - **Discovery Document**: `.well-known/openid-configuration` metadata
 //! - **Standard Claims**: OpenID Connect standard claim types
+//!
+//! This source inventory is not a promoted production OIDC profile. AUTH and
+//! MCP 2026-07-28 conformance gates remain outstanding; the public protocol
+//! constant is still `2024-11-05`.
 //!
 //! # Architecture
 //!
 //! The OIDC provider builds on top of [`OAuthServer`] by:
 //!
 //! 1. Adding the `openid` scope to enable OIDC flows
-//! 2. Issuing ID tokens alongside access tokens
+//! 2. Reserving ID-token issuance for an FND-09 externally custodied signer
 //! 3. Providing standard endpoints for identity operations
 //!
 //! # Example
 //!
 //! ```ignore
+//! use std::sync::Arc;
+//!
 //! use fastmcp_rust::oidc::{OidcProvider, OidcProviderConfig, UserClaims};
 //! use fastmcp_rust::oauth::{OAuthServer, OAuthServerConfig};
 //!
@@ -30,18 +36,51 @@
 //!     .expect("oidc provider");
 //!
 //! // Set up user claims provider
-//! oidc.set_claims_provider(|subject| {
-//!     UserClaims::new(subject)
+//! oidc.set_claims_fn(|subject| {
+//!     Some(UserClaims::new(subject)
 //!         .with_name("John Doe")
-//!         .with_email("john@example.com")
+//!         .with_email("john@example.com"))
 //! });
 //! ```
 
+#[cfg(feature = "builtin-auth-server")]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+#[cfg(feature = "builtin-auth-server")]
+use std::future::Future;
+#[cfg(feature = "builtin-auth-server")]
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "builtin-auth-server")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::oauth::{OAuthError, OAuthServer, OAuthToken};
+#[cfg(feature = "builtin-auth-server")]
+use fastmcp_core::Cx;
+#[cfg(feature = "builtin-auth-server")]
+use fastmcp_protocol::jose::{
+    AdmittedRsaJwks, BoundedJwsClaims, CanonicalRs256PublicJwks, CanonicalRs256PublicJwksSet,
+    ExternalRs256Signer, ExternalRs256SigningDeadline, JwksEndpointReadBack, JwsSigningError,
+    JwsSigningProfile, MAX_JWKS_BYTES, MAX_JWKS_KEYS, MAX_KID_BYTES, Rs256PublicKeyRing,
+    Rs256SigningBinding, SigningActivationProfile, SigningActivationReceipt,
+    verify_compact_jws_rs256,
+};
+#[cfg(feature = "builtin-auth-server")]
+use url::Url;
+
+use crate::oauth::{OAuthError, OAuthServer, OAuthServerConfig, OAuthToken, validate_oauth_issuer};
+
+#[cfg(feature = "builtin-auth-server")]
+const MAX_OIDC_NONCE_BYTES: usize = 1_024;
+
+/// Fixed framework-owned claims for the external signer health canary.
+///
+/// This is not an ID token and is never exposed to a client. Its issuer,
+/// endpoint, canonical public bytes, and signer generations are instead bound
+/// by the sealed activation state that owns the canary result. Keeping this
+/// input fixed lets a KMS/HSM integration provision one independently audited
+/// test vector without putting any private material in this process.
+#[cfg(feature = "builtin-auth-server")]
+const OIDC_SIGNING_CANARY_CLAIMS: &str = r#"{"sub":"fixed-vector","aud":"server-policy-later"}"#;
 
 // =============================================================================
 // Configuration
@@ -52,20 +91,6 @@ use crate::oauth::{OAuthError, OAuthServer, OAuthToken};
 pub struct OidcProviderConfig {
     /// Issuer identifier (URL) - must match OAuth server issuer.
     pub issuer: String,
-    /// ID token lifetime.
-    pub id_token_lifetime: Duration,
-    /// Signing algorithm for ID tokens.
-    pub signing_algorithm: SigningAlgorithm,
-    /// Key ID for token signing.
-    pub key_id: Option<String>,
-    /// RS256 signing key (PEM-encoded private key).
-    ///
-    /// Required when `signing_algorithm = RS256`.
-    pub rsa_private_key_pem: Option<Vec<u8>>,
-    /// JSON Web Key Set (JWKS) served at `/.well-known/jwks.json`.
-    ///
-    /// Required when `signing_algorithm = RS256`.
-    pub jwks: Option<serde_json::Value>,
     /// Supported claims.
     pub supported_claims: Vec<String>,
     /// Supported scopes beyond `openid`.
@@ -75,12 +100,7 @@ pub struct OidcProviderConfig {
 impl Default for OidcProviderConfig {
     fn default() -> Self {
         Self {
-            issuer: "fastmcp".to_string(),
-            id_token_lifetime: Duration::from_secs(3600), // 1 hour
-            signing_algorithm: SigningAlgorithm::HS256,
-            key_id: None,
-            rsa_private_key_pem: None,
-            jwks: None,
+            issuer: OAuthServerConfig::default().issuer,
             supported_claims: vec![
                 "sub".to_string(),
                 "name".to_string(),
@@ -99,26 +119,6 @@ impl Default for OidcProviderConfig {
     }
 }
 
-/// Signing algorithm for ID tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigningAlgorithm {
-    /// HMAC-SHA256 (symmetric).
-    HS256,
-    /// RSA-SHA256 (asymmetric) - requires RSA key pair.
-    RS256,
-}
-
-impl SigningAlgorithm {
-    /// Returns the algorithm name as used in JWT headers.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::HS256 => "HS256",
-            Self::RS256 => "RS256",
-        }
-    }
-}
-
 // =============================================================================
 // User Claims
 // =============================================================================
@@ -127,7 +127,7 @@ impl SigningAlgorithm {
 ///
 /// These claims describe the authenticated user and are included in
 /// ID tokens and returned from the userinfo endpoint.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserClaims {
     /// Subject identifier (required, unique user ID).
     pub sub: String,
@@ -200,6 +200,44 @@ pub struct UserClaims {
     /// Additional custom claims.
     #[serde(flatten)]
     pub custom: HashMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for UserClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let profile_claim_count = [
+            self.name.is_some(),
+            self.given_name.is_some(),
+            self.family_name.is_some(),
+            self.middle_name.is_some(),
+            self.nickname.is_some(),
+            self.preferred_username.is_some(),
+            self.profile.is_some(),
+            self.picture.is_some(),
+            self.website.is_some(),
+            self.gender.is_some(),
+            self.birthdate.is_some(),
+            self.zoneinfo.is_some(),
+            self.locale.is_some(),
+            self.updated_at.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+        f.debug_struct("UserClaims")
+            .field("subject_len", &self.sub.len())
+            .field("profile_claim_count", &profile_claim_count)
+            .field("email_present", &self.email.is_some())
+            .field("email_verified_present", &self.email_verified.is_some())
+            .field("phone_number_present", &self.phone_number.is_some())
+            .field(
+                "phone_number_verified_present",
+                &self.phone_number_verified.is_some(),
+            )
+            .field("address_present", &self.address.is_some())
+            .field("custom_claim_count", &self.custom.len())
+            .finish()
+    }
 }
 
 impl UserClaims {
@@ -330,7 +368,7 @@ impl UserClaims {
 }
 
 /// Address claim structure per OpenID Connect spec.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AddressClaim {
     /// Full formatted address.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -352,12 +390,32 @@ pub struct AddressClaim {
     pub country: Option<String>,
 }
 
+impl std::fmt::Debug for AddressClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let populated_field_count = [
+            self.formatted.is_some(),
+            self.street_address.is_some(),
+            self.locality.is_some(),
+            self.region.is_some(),
+            self.postal_code.is_some(),
+            self.country.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+
+        f.debug_struct("AddressClaim")
+            .field("populated_field_count", &populated_field_count)
+            .finish()
+    }
+}
+
 // =============================================================================
 // ID Token
 // =============================================================================
 
 /// ID Token claims (JWT payload).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IdTokenClaims {
     /// Issuer identifier.
     pub iss: String,
@@ -395,13 +453,40 @@ pub struct IdTokenClaims {
     pub user_claims: UserClaims,
 }
 
+impl std::fmt::Debug for IdTokenClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdTokenClaims")
+            .field("issuer_len", &self.iss.len())
+            .field("subject_len", &self.sub.len())
+            .field("audience_len", &self.aud.len())
+            .field("auth_time_present", &self.auth_time.is_some())
+            .field("nonce_present", &self.nonce.is_some())
+            .field("acr_present", &self.acr.is_some())
+            .field("amr_count", &self.amr.as_ref().map_or(0, Vec::len))
+            .field("authorized_party_present", &self.azp.is_some())
+            .field("access_token_hash_present", &self.at_hash.is_some())
+            .field("code_hash_present", &self.c_hash.is_some())
+            .field("user_claims", &self.user_claims)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A signed ID token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IdToken {
     /// The raw JWT string.
     pub raw: String,
     /// The parsed claims.
     pub claims: IdTokenClaims,
+}
+
+impl std::fmt::Debug for IdToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdToken")
+            .field("raw_len", &self.raw.len())
+            .field("claims", &self.claims)
+            .finish()
+    }
 }
 
 // =============================================================================
@@ -431,6 +516,13 @@ pub struct DiscoveryDocument {
     /// Revocation endpoint URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revocation_endpoint: Option<String>,
+    /// Client authentication methods accepted by the revocation endpoint.
+    ///
+    /// The public-client `none` method is present only when the attached
+    /// OAuth server admits public clients.
+    pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    /// Whether every authorization response carries RFC 9207 `iss`.
+    pub authorization_response_iss_parameter_supported: bool,
     /// Supported scopes.
     pub scopes_supported: Vec<String>,
     /// Supported response types.
@@ -459,7 +551,11 @@ impl DiscoveryDocument {
     #[must_use]
     pub fn new(issuer: impl Into<String>, base_url: impl Into<String>) -> Self {
         let issuer = issuer.into();
-        let base = base_url.into();
+        let base_url = base_url.into();
+        // Endpoints are appended to the base, and `OAuthHttpRoutes` serves
+        // `/authorize` for `https://a.example` and `https://a.example/` alike,
+        // so a trailing slash must not be advertised as `//authorize`.
+        let base = base_url.trim_end_matches('/');
 
         Self {
             issuer: issuer.clone(),
@@ -469,6 +565,12 @@ impl DiscoveryDocument {
             jwks_uri: None,
             registration_endpoint: None,
             revocation_endpoint: Some(format!("{}/revoke", base)),
+            revocation_endpoint_auth_methods_supported: vec![
+                "none".to_string(),
+                "client_secret_post".to_string(),
+                "client_secret_basic".to_string(),
+            ],
+            authorization_response_iss_parameter_supported: true,
             scopes_supported: vec![
                 "openid".to_string(),
                 "profile".to_string(),
@@ -481,8 +583,9 @@ impl DiscoveryDocument {
                 "refresh_token".to_string(),
             ],
             subject_types_supported: vec!["public".to_string()],
-            id_token_signing_alg_values_supported: vec!["HS256".to_string()],
+            id_token_signing_alg_values_supported: Vec::new(),
             token_endpoint_auth_methods_supported: vec![
+                "none".to_string(),
                 "client_secret_post".to_string(),
                 "client_secret_basic".to_string(),
             ],
@@ -498,7 +601,7 @@ impl DiscoveryDocument {
                 "preferred_username".to_string(),
                 "picture".to_string(),
             ]),
-            code_challenge_methods_supported: Some(vec!["plain".to_string(), "S256".to_string()]),
+            code_challenge_methods_supported: Some(vec!["S256".to_string()]),
         }
     }
 }
@@ -516,9 +619,18 @@ pub trait ClaimsProvider: Send + Sync {
 }
 
 /// Simple in-memory claims provider.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct InMemoryClaimsProvider {
     claims: RwLock<HashMap<String, UserClaims>>,
+}
+
+impl std::fmt::Debug for InMemoryClaimsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let claim_count = self.claims.try_read().ok().map(|claims| claims.len());
+        f.debug_struct("InMemoryClaimsProvider")
+            .field("claim_count", &claim_count)
+            .finish()
+    }
 }
 
 impl InMemoryClaimsProvider {
@@ -591,7 +703,6 @@ impl ClaimsProvider for Arc<dyn ClaimsProvider> {
 // =============================================================================
 
 /// OIDC-specific errors.
-#[derive(Debug, Clone)]
 pub enum OidcError {
     /// Underlying OAuth error.
     OAuth(OAuthError),
@@ -599,10 +710,39 @@ pub enum OidcError {
     MissingOpenIdScope,
     /// User claims not found.
     ClaimsNotFound(String),
+    /// Claims provider returned an identity other than the requested subject.
+    ClaimsSubjectMismatch,
     /// Token signing failed.
     SigningError(String),
+    /// An external signer outcome, including its dispatch knowledge.
+    #[cfg(feature = "builtin-auth-server")]
+    ExternalSigning(JwsSigningError),
     /// Invalid ID token.
     InvalidIdToken(String),
+}
+
+impl std::fmt::Debug for OidcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OAuth(error) => f.debug_tuple("OAuth").field(error).finish(),
+            Self::MissingOpenIdScope => f.write_str("MissingOpenIdScope"),
+            Self::ClaimsNotFound(subject) => f
+                .debug_struct("ClaimsNotFound")
+                .field("subject_len", &subject.len())
+                .finish(),
+            Self::ClaimsSubjectMismatch => f.write_str("ClaimsSubjectMismatch"),
+            Self::SigningError(description) => f
+                .debug_struct("SigningError")
+                .field("description_len", &description.len())
+                .finish(),
+            #[cfg(feature = "builtin-auth-server")]
+            Self::ExternalSigning(error) => f.debug_tuple("ExternalSigning").field(error).finish(),
+            Self::InvalidIdToken(description) => f
+                .debug_struct("InvalidIdToken")
+                .field("description_len", &description.len())
+                .finish(),
+        }
+    }
 }
 
 impl std::fmt::Display for OidcError {
@@ -610,9 +750,14 @@ impl std::fmt::Display for OidcError {
         match self {
             Self::OAuth(e) => write!(f, "OAuth error: {}", e),
             Self::MissingOpenIdScope => write!(f, "missing 'openid' scope"),
-            Self::ClaimsNotFound(s) => write!(f, "claims not found for subject: {}", s),
-            Self::SigningError(s) => write!(f, "signing error: {}", s),
-            Self::InvalidIdToken(s) => write!(f, "invalid ID token: {}", s),
+            Self::ClaimsNotFound(_) => f.write_str("claims not found for requested subject"),
+            Self::ClaimsSubjectMismatch => {
+                write!(f, "claims provider returned a mismatched subject")
+            }
+            Self::SigningError(_) => f.write_str("ID token signing failed"),
+            #[cfg(feature = "builtin-auth-server")]
+            Self::ExternalSigning(error) => write!(f, "external ID token signing failed: {error}"),
+            Self::InvalidIdToken(_) => f.write_str("invalid ID token"),
         }
     }
 }
@@ -637,110 +782,433 @@ pub struct OidcProvider {
     oauth: Arc<OAuthServer>,
     /// OIDC configuration.
     config: OidcProviderConfig,
-    /// Signing key (HMAC secret).
-    signing_key: RwLock<SigningKey>,
     /// Claims provider.
     claims_provider: RwLock<Option<Arc<dyn ClaimsProvider>>>,
-    /// Cached ID tokens by access token.
-    id_tokens: RwLock<HashMap<String, IdToken>>,
+    /// A non-forgeable external-signer activation. It remains absent until a
+    /// caller supplies an exact publication/read-back of the selected public
+    /// JWKS under the same immutable signer binding.
+    #[cfg(feature = "builtin-auth-server")]
+    signing_activation: RwLock<OidcIdTokenSigningState>,
+    /// The embedding-owned verifier and durable CAS store.  There is no
+    /// default: a missing dependency leaves activation fail-closed.
+    #[cfg(feature = "builtin-auth-server")]
+    signing_activation_dependencies: RwLock<Option<OidcSigningActivationDependencies>>,
 }
 
-/// Signing key for ID tokens.
-#[derive(Clone, Default)]
-enum SigningKey {
-    /// HMAC-SHA256 secret.
-    Hmac(Vec<u8>),
-    /// No key configured (will generate on first use).
-    #[default]
-    None,
+/// Bounded, embedding-owned fetcher for every public JWKS endpoint bound to an
+/// OIDC signer activation.
+///
+/// This is deliberately an external effect boundary.  Native route handlers
+/// only serve bytes; they cannot mint a read-back record by parsing their own
+/// in-memory publication buffer.
+#[cfg(feature = "builtin-auth-server")]
+pub trait OidcJwksReadBackVerifier: Send + Sync + 'static {
+    /// Fetches every supplied exact URI and returns the observed URI, origin,
+    /// response bytes, and monotonic publication generation.
+    fn read_back<'a>(
+        &'a self,
+        cx: &'a Cx,
+        endpoints: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<JwksEndpointReadBack>, OidcError>> + Send + 'a>>;
 }
 
-fn validate_oidc_config(config: &OidcProviderConfig) -> Result<(), OidcError> {
-    match config.signing_algorithm {
-        SigningAlgorithm::HS256 => Ok(()),
-        SigningAlgorithm::RS256 => {
-            #[cfg(feature = "jwt")]
-            {
-                let kid = config.key_id.as_deref().ok_or_else(|| {
-                    OidcError::SigningError("RS256 requires `key_id` to be set".to_string())
-                })?;
+/// Persistent compare-and-set record for an OIDC activation generation.
+///
+/// A store implementation must retain this record across process replacement.
+/// The provider always reconstructs the cryptographic receipt through a fresh
+/// external read-back; a stored generation alone never restores `Active`.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcSigningActivationStoreRecord {
+    issuer: String,
+    key_ring_generation: u64,
+    activation_generation: u64,
+    status: OidcSigningActivationStatus,
+    maximum_id_token_expires_at: i64,
+    key_id_maximum_id_token_expires_at: BTreeMap<String, OidcSigningKeyExpiry>,
+}
 
-                let pem = config.rsa_private_key_pem.as_ref().ok_or_else(|| {
-                    OidcError::SigningError("RS256 requires `rsa_private_key_pem`".to_string())
-                })?;
-                // Fail fast: reject invalid PEM so we never advertise RS256 with a broken signer.
-                jsonwebtoken::EncodingKey::from_rsa_pem(pem).map_err(|e| {
-                    OidcError::SigningError(format!("invalid RSA private key PEM: {e}"))
-                })?;
+/// One bounded, canonical public-key identity and its greatest issued
+/// ID-token expiry. The identity contains public JWKS bytes only; it never
+/// carries private key material or a signer backend.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcSigningKeyExpiry {
+    expires_at: i64,
+    canonical_public_key_identity: Vec<u8>,
+}
 
-                let jwks = config.jwks.as_ref().ok_or_else(|| {
-                    OidcError::SigningError("RS256 requires `jwks` (JWKS JSON)".to_string())
-                })?;
+#[cfg(feature = "builtin-auth-server")]
+impl OidcSigningKeyExpiry {
+    /// Reconstructs a bounded public-key expiry watermark for an
+    /// embedding-owned durable store.
+    pub fn new(expires_at: i64, canonical_public_key_identity: Vec<u8>) -> Result<Self, OidcError> {
+        if expires_at < 0
+            || canonical_public_key_identity.is_empty()
+            || canonical_public_key_identity.len() > MAX_JWKS_BYTES
+        {
+            return Err(OidcError::SigningError(
+                "OIDC durable key expiry watermark is outside bounded admission".to_string(),
+            ));
+        }
+        Ok(Self {
+            expires_at,
+            canonical_public_key_identity,
+        })
+    }
 
-                // Validate JWKS shape and that it includes a plausible RSA key with the configured kid.
-                let keys = jwks.get("keys").and_then(|v| v.as_array()).ok_or_else(|| {
-                    OidcError::SigningError(
-                        "JWKS must be an object with a `keys` array".to_string(),
-                    )
-                })?;
+    /// Greatest ID-token expiry bound to this exact public key.
+    #[must_use]
+    pub const fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
 
-                let mut found = false;
-                for key in keys {
-                    let Some(obj) = key.as_object() else { continue };
-                    let key_kid = obj.get("kid").and_then(|v| v.as_str());
-                    if key_kid != Some(kid) {
-                        continue;
-                    }
-                    let kty = obj.get("kty").and_then(|v| v.as_str());
-                    if kty != Some("RSA") {
-                        continue;
-                    }
-                    // Require the minimal RSA public key components so the JWKS is usable.
-                    if obj.get("n").and_then(|v| v.as_str()).is_none()
-                        || obj.get("e").and_then(|v| v.as_str()).is_none()
-                    {
-                        return Err(OidcError::SigningError(format!(
-                            "JWKS key kid={kid} is missing RSA components `n`/`e`"
-                        )));
-                    }
-                    found = true;
-                    break;
-                }
+    /// Exact canonical public JWKS bytes for this one key.
+    #[must_use]
+    pub fn canonical_public_key_identity(&self) -> &[u8] {
+        &self.canonical_public_key_identity
+    }
+}
 
-                if !found {
-                    return Err(OidcError::SigningError(format!(
-                        "JWKS does not contain an RSA key with kid={kid}"
-                    )));
-                }
+/// Durable status for one profile-specific OIDC signing activation.
+///
+/// Any status or generation transition must advance the durable activation
+/// generation. Issuers use this to fence stale process-local activation state
+/// before and after external signing.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcSigningActivationStatus {
+    /// The record authorizes issuance for its exact key-ring generation.
+    Active,
+    /// The record has closed issuance while retaining public verification
+    /// material until its durable maximum ID-token expiry.
+    Retiring,
+    /// The record has been explicitly revoked; no local activation may issue.
+    Revoked,
+}
 
-                Ok(())
-            }
-            #[cfg(not(feature = "jwt"))]
-            {
-                Err(OidcError::SigningError(
-                    "RS256 requires the `fastmcp-server/jwt` feature".to_string(),
-                ))
-            }
+#[cfg(feature = "builtin-auth-server")]
+impl OidcSigningActivationStoreRecord {
+    /// Reconstructs one bounded durable record supplied by an embedding-owned
+    /// store. This is the only public constructor; field mutation is not
+    /// possible after validation.
+    pub fn new(
+        issuer: impl Into<String>,
+        key_ring_generation: u64,
+        activation_generation: u64,
+        status: OidcSigningActivationStatus,
+        maximum_id_token_expires_at: i64,
+        key_id_maximum_id_token_expires_at: BTreeMap<String, OidcSigningKeyExpiry>,
+    ) -> Result<Self, OidcError> {
+        let issuer = issuer.into();
+        if issuer.is_empty()
+            || issuer.len() > crate::oauth::MAX_OAUTH_ISSUER_BYTES
+            || issuer.bytes().any(|byte| byte.is_ascii_control())
+            || key_ring_generation == 0
+            || activation_generation == 0
+            || maximum_id_token_expires_at < 0
+            || key_id_maximum_id_token_expires_at.len() > MAX_JWKS_KEYS
+            || key_id_maximum_id_token_expires_at
+                .iter()
+                .any(|(key_id, watermark)| {
+                    key_id.is_empty()
+                        || key_id.len() > MAX_KID_BYTES
+                        || watermark.expires_at() > maximum_id_token_expires_at
+                        || !canonical_oidc_key_identity_matches(
+                            key_id,
+                            watermark.canonical_public_key_identity(),
+                        )
+                })
+            || key_id_maximum_id_token_expires_at
+                .values()
+                .try_fold(0usize, |total, watermark| {
+                    total.checked_add(watermark.canonical_public_key_identity().len())
+                })
+                .is_none_or(|total| total > MAX_JWKS_BYTES)
+        {
+            return Err(OidcError::SigningError(
+                "OIDC activation store record is outside bounded admission".to_string(),
+            ));
+        }
+        Ok(Self {
+            issuer,
+            key_ring_generation,
+            activation_generation,
+            status,
+            maximum_id_token_expires_at,
+            key_id_maximum_id_token_expires_at,
+        })
+    }
+
+    /// Exact issuer bound to the CAS record.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Key-ring generation admitted by the record.
+    #[must_use]
+    pub const fn key_ring_generation(&self) -> u64 {
+        self.key_ring_generation
+    }
+
+    /// Monotonic CAS generation assigned by the store.
+    #[must_use]
+    pub const fn activation_generation(&self) -> u64 {
+        self.activation_generation
+    }
+
+    /// Durable status used to fence issuance across provider instances.
+    #[must_use]
+    pub const fn status(&self) -> OidcSigningActivationStatus {
+        self.status
+    }
+
+    /// Greatest ID-token expiry durably committed for this key-ring generation.
+    #[must_use]
+    pub const fn maximum_id_token_expires_at(&self) -> i64 {
+        self.maximum_id_token_expires_at
+    }
+
+    /// Ordered per-key expiry watermarks durably carried across process
+    /// replacement. Each entry is bounded and cannot exceed the aggregate
+    /// maximum recorded above.
+    #[must_use]
+    pub fn key_id_maximum_id_token_expires_at(&self) -> &BTreeMap<String, OidcSigningKeyExpiry> {
+        &self.key_id_maximum_id_token_expires_at
+    }
+}
+
+/// Bounded durable CAS boundary for profile-specific OIDC signer activation.
+///
+/// Absence, a failed read, or a lost race is a fail-closed activation failure.
+/// Implementations own durability, restore fencing, and process-instance
+/// coordination; FastMCP deliberately supplies no implicit local persistence.
+#[cfg(feature = "builtin-auth-server")]
+pub trait OidcSigningActivationStore: Send + Sync + 'static {
+    /// Reads the current record for the exact issuer.
+    fn load(
+        &self,
+        cx: &Cx,
+        issuer: &str,
+    ) -> Result<Option<OidcSigningActivationStoreRecord>, OidcError>;
+
+    /// Atomically writes `next` only if the currently stored activation
+    /// generation equals `expected_generation` (`None` means no record).
+    fn compare_and_set(
+        &self,
+        cx: &Cx,
+        expected_generation: Option<u64>,
+        next: OidcSigningActivationStoreRecord,
+    ) -> Result<OidcSigningActivationStoreRecord, OidcError>;
+}
+
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone)]
+struct OidcSigningActivationDependencies {
+    verifier: Arc<dyn OidcJwksReadBackVerifier>,
+    store: Arc<dyn OidcSigningActivationStore>,
+}
+
+/// Fail-closed state of the current process's ID-token signer activation.
+///
+/// Process restart deliberately returns to [`Self::Inactive`]; this server
+/// does not deserialize an `Active` state from unverified storage. An embedding
+/// must repeat publication and the public-endpoint read-back before signing can
+/// resume.
+#[cfg(feature = "builtin-auth-server")]
+// The state lives behind one mutex-guarded slot and every transition moves
+// the whole value; boxing a variant would only add indirection to the CAS.
+#[allow(clippy::large_enum_variant)]
+enum OidcIdTokenSigningState {
+    /// No signer has been admitted for this issuer.
+    Inactive,
+    /// A signer and exact public endpoint are bound, but no bytes are public.
+    Pending(OidcIdTokenSigningPending),
+    /// Canonical public bytes are ready at the configured endpoint, but an
+    /// endpoint read-back has not yet been observed and verified.
+    Published(OidcIdTokenSigningPublished),
+    /// The signer completed a canary that verified against endpoint read-back.
+    Active(OidcIdTokenSigningActivation),
+    /// An Active signer continues issuing while a successor ring progresses
+    /// through Pending then Published read-back. The successor JWKS must
+    /// retain the active key before it can replace this activation.
+    Rotating {
+        active: OidcIdTokenSigningActivation,
+        successor: OidcIdTokenSigningSuccessor,
+    },
+    /// The published verification key remains visible, but issuance is closed
+    /// after the issuer's recorded maximum token lifetime.
+    Retiring(OidcIdTokenSigningActivation),
+}
+
+/// A signer/key/endpoint binding that cannot yet issue ID tokens.
+#[cfg(feature = "builtin-auth-server")]
+struct OidcIdTokenSigningPending {
+    key_ring: Rs256PublicKeyRing,
+    binding: Rs256SigningBinding,
+    issuer: String,
+    advertised_jwks_uris: Vec<String>,
+    advertised_jwks_origins: Vec<String>,
+    canonical_jwks: CanonicalRs256PublicJwksSet,
+    dependencies: Option<OidcSigningActivationDependencies>,
+}
+
+/// A pending signer whose exact canonical public JWKS is available to the
+/// configured public endpoint.
+#[cfg(feature = "builtin-auth-server")]
+struct OidcIdTokenSigningPublished {
+    pending: OidcIdTokenSigningPending,
+    published_jwks: Vec<u8>,
+    publication_generation: u64,
+}
+
+/// A server-held active signer for one externally custodied ID-token key.
+///
+/// Its fields are private and it has no public constructor. It can only be
+/// created after the selected signer's canonical public JWKS was served by the
+/// exact public endpoint and a signer-produced canary verified through those
+/// read-back public keys. This type neither implements a KMS/HSM adapter nor
+/// contains private material.
+#[cfg(feature = "builtin-auth-server")]
+struct OidcIdTokenSigningActivation {
+    published: OidcIdTokenSigningPublished,
+    receipt: SigningActivationReceipt,
+    activation_generation: u64,
+    maximum_id_token_expires_at: i64,
+    /// Per-key expiry watermarks let a successor retain every verification
+    /// key that still protects an issued ID token while permitting keys whose
+    /// artifacts have all expired to leave a later ring.
+    live_key_expiries: BTreeMap<String, OidcSigningKeyExpiry>,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+enum OidcIdTokenSigningSuccessor {
+    Pending(OidcIdTokenSigningPending),
+    Published(OidcIdTokenSigningPublished),
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl OidcIdTokenSigningState {
+    fn published(&self) -> Option<&OidcIdTokenSigningPublished> {
+        match self {
+            Self::Published(published) => Some(published),
+            Self::Active(active) => Some(&active.published),
+            Self::Rotating {
+                active,
+                successor: OidcIdTokenSigningSuccessor::Pending(_),
+            } => Some(&active.published),
+            Self::Rotating {
+                successor: OidcIdTokenSigningSuccessor::Published(published),
+                ..
+            } => Some(published),
+            Self::Retiring(retiring) => Some(&retiring.published),
+            Self::Inactive | Self::Pending(_) => None,
+        }
+    }
+
+    fn active(&self) -> Option<&OidcIdTokenSigningActivation> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Rotating { active, .. } => Some(active),
+            Self::Inactive | Self::Pending(_) | Self::Published(_) | Self::Retiring(_) => None,
         }
     }
 }
 
+#[cfg(feature = "builtin-auth-server")]
+impl std::fmt::Debug for OidcIdTokenSigningState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inactive => formatter.write_str("OidcIdTokenSigningState::Inactive"),
+            Self::Pending(_) => formatter.write_str("OidcIdTokenSigningState::Pending"),
+            Self::Published(_) => formatter.write_str("OidcIdTokenSigningState::Published"),
+            Self::Active(_) => formatter.write_str("OidcIdTokenSigningState::Active"),
+            Self::Rotating { .. } => formatter.write_str("OidcIdTokenSigningState::Rotating"),
+            Self::Retiring(_) => formatter.write_str("OidcIdTokenSigningState::Retiring"),
+        }
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl std::fmt::Debug for OidcIdTokenSigningActivation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let published = &self.published;
+        formatter
+            .debug_struct("OidcIdTokenSigningActivation")
+            .field("binding", &published.pending.binding)
+            .field("issuer_bytes", &published.pending.issuer.len())
+            .field(
+                "advertised_jwks_uri_bytes",
+                &published
+                    .pending
+                    .advertised_jwks_uris
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .field(
+                "advertised_jwks_origin_bytes",
+                &published
+                    .pending
+                    .advertised_jwks_origins
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+            .field("published_jwks_bytes", &published.published_jwks.len())
+            .field(
+                "key_ring_generation",
+                &published.pending.key_ring.generation(),
+            )
+            .field("publication_generation", &published.publication_generation)
+            .field("activation_generation", &self.activation_generation)
+            .finish()
+    }
+}
+
+fn validate_oidc_config(config: &OidcProviderConfig) -> Result<(), OidcError> {
+    // Reuse the OAuth issuer admission policy so OIDC discovery cannot publish
+    // a non-HTTPS, non-canonical, or otherwise unsafe issuer spelling.
+    validate_oauth_issuer(&config.issuer).map_err(OidcError::from)
+}
+
 impl OidcProvider {
     /// Creates a new OIDC provider with the given OAuth server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the OIDC issuer is unsafe or does not exactly
+    /// match the underlying OAuth server issuer.
     pub fn new(oauth: Arc<OAuthServer>, config: OidcProviderConfig) -> Result<Self, OidcError> {
         validate_oidc_config(&config)?;
+        if config.issuer != oauth.config().issuer {
+            return Err(OidcError::OAuth(OAuthError::ServerError(
+                "OIDC issuer must exactly match the OAuth server issuer".to_string(),
+            )));
+        }
         Ok(Self {
             oauth,
             config,
-            signing_key: RwLock::new(SigningKey::None),
             claims_provider: RwLock::new(None),
-            id_tokens: RwLock::new(HashMap::new()),
+            #[cfg(feature = "builtin-auth-server")]
+            signing_activation: RwLock::new(OidcIdTokenSigningState::Inactive),
+            #[cfg(feature = "builtin-auth-server")]
+            signing_activation_dependencies: RwLock::new(None),
         })
     }
 
     /// Creates a new OIDC provider with default configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying OAuth server has an unsafe issuer.
     pub fn with_defaults(oauth: Arc<OAuthServer>) -> Result<Self, OidcError> {
-        Self::new(oauth, OidcProviderConfig::default())
+        let config = OidcProviderConfig {
+            issuer: oauth.config().issuer.clone(),
+            ..OidcProviderConfig::default()
+        };
+        Self::new(oauth, config)
     }
 
     /// Returns the OIDC configuration.
@@ -753,13 +1221,6 @@ impl OidcProvider {
     #[must_use]
     pub fn oauth(&self) -> &Arc<OAuthServer> {
         &self.oauth
-    }
-
-    /// Sets the HMAC signing key.
-    pub fn set_hmac_key(&self, key: impl AsRef<[u8]>) {
-        if let Ok(mut guard) = self.signing_key.write() {
-            *guard = SigningKey::Hmac(key.as_ref().to_vec());
-        }
     }
 
     /// Sets the claims provider.
@@ -777,99 +1238,943 @@ impl OidcProvider {
         self.set_claims_provider(FnClaimsProvider::new(func));
     }
 
+    /// Configures the explicit external read-back and durable-CAS boundaries
+    /// required before this provider can activate an ID-token signer.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn set_id_token_signing_activation_dependencies(
+        &self,
+        verifier: Arc<dyn OidcJwksReadBackVerifier>,
+        store: Arc<dyn OidcSigningActivationStore>,
+    ) -> Result<(), OidcError> {
+        let mut dependencies = self.signing_activation_dependencies.write().map_err(|_| {
+            OidcError::SigningError(
+                "OIDC signing activation dependencies are unavailable".to_string(),
+            )
+        })?;
+        if dependencies.is_some() {
+            return Err(OidcError::SigningError(
+                "OIDC signing activation dependencies are already configured".to_string(),
+            ));
+        }
+        *dependencies = Some(OidcSigningActivationDependencies { verifier, store });
+        Ok(())
+    }
+
+    /// Starts a sealed Pending activation for one externally custodied signer.
+    ///
+    /// This is intentionally not enough to issue tokens. The caller must next
+    /// publish the exact canonical bytes through the configured public route,
+    /// let that route observe a read-back, and then activate its canary.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn begin_id_token_signing_activation(
+        &self,
+        signer: Arc<ExternalRs256Signer>,
+        advertised_jwks_uri: &str,
+    ) -> Result<(), OidcError> {
+        let signer_ring_generation = signer.binding().ring_generation();
+        let key_ring = Rs256PublicKeyRing::new(signer, Vec::new(), signer_ring_generation)
+            .map_err(|_| {
+                OidcError::SigningError("unable to admit OIDC signer key ring".to_string())
+            })?;
+        self.begin_id_token_signing_key_ring_activation(
+            key_ring,
+            vec![advertised_jwks_uri.to_string()],
+        )
+    }
+
+    /// Starts Pending activation for a selected active signer plus retained
+    /// verification overlap.  Every endpoint is independently bound and must
+    /// later appear in the external verifier's receipt.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn begin_id_token_signing_key_ring_activation(
+        &self,
+        key_ring: Rs256PublicKeyRing,
+        advertised_jwks_uris: Vec<String>,
+    ) -> Result<(), OidcError> {
+        if advertised_jwks_uris.is_empty() {
+            return Err(OidcError::SigningError(
+                "OIDC signer activation requires at least one advertised JWKS endpoint".to_string(),
+            ));
+        }
+        let mut admitted_uris = Vec::with_capacity(advertised_jwks_uris.len());
+        let mut admitted_origins = Vec::with_capacity(advertised_jwks_uris.len());
+        for uri in advertised_jwks_uris {
+            let (uri, origin) = validate_advertised_jwks_uri(&self.config.issuer, &uri)?;
+            if admitted_uris.iter().any(|existing| existing == &uri) {
+                return Err(OidcError::SigningError(
+                    "OIDC signer activation has duplicate advertised JWKS endpoints".to_string(),
+                ));
+            }
+            admitted_uris.push(uri);
+            admitted_origins.push(origin);
+        }
+        let canonical_jwks = key_ring.canonical_public_jwks().map_err(|_| {
+            OidcError::SigningError("unable to canonicalize signing JWKS".to_string())
+        })?;
+        let dependencies = self
+            .signing_activation_dependencies
+            .read()
+            .map_err(|_| {
+                OidcError::SigningError(
+                    "OIDC signing activation dependencies are unavailable".to_string(),
+                )
+            })?
+            .clone();
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        if !matches!(*slot, OidcIdTokenSigningState::Inactive) {
+            return Err(OidcError::SigningError(
+                "OIDC signing activation is already in progress or active".to_string(),
+            ));
+        }
+        *slot = OidcIdTokenSigningState::Pending(OidcIdTokenSigningPending {
+            binding: key_ring.active_signer().binding(),
+            key_ring,
+            issuer: self.config.issuer.clone(),
+            advertised_jwks_uris: admitted_uris,
+            advertised_jwks_origins: admitted_origins,
+            canonical_jwks,
+            dependencies,
+        });
+        Ok(())
+    }
+
+    /// Begins a live successor transition without withdrawing the currently
+    /// Active signer. The successor ring must retain the exact active signer
+    /// as a public verification key and advance the key-ring generation.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn begin_id_token_signing_key_ring_rotation(
+        &self,
+        key_ring: Rs256PublicKeyRing,
+        advertised_jwks_uris: Vec<String>,
+    ) -> Result<(), OidcError> {
+        if advertised_jwks_uris.is_empty() {
+            return Err(OidcError::SigningError(
+                "OIDC signer rotation requires at least one advertised JWKS endpoint".to_string(),
+            ));
+        }
+        let mut admitted_uris = Vec::with_capacity(advertised_jwks_uris.len());
+        let mut admitted_origins = Vec::with_capacity(advertised_jwks_uris.len());
+        for uri in advertised_jwks_uris {
+            let (uri, origin) = validate_advertised_jwks_uri(&self.config.issuer, &uri)?;
+            if admitted_uris.iter().any(|existing| existing == &uri) {
+                return Err(OidcError::SigningError(
+                    "OIDC signer rotation has duplicate advertised JWKS endpoints".to_string(),
+                ));
+            }
+            admitted_uris.push(uri);
+            admitted_origins.push(origin);
+        }
+        let canonical_jwks = key_ring.canonical_public_jwks().map_err(|_| {
+            OidcError::SigningError("unable to canonicalize successor signing JWKS".to_string())
+        })?;
+        let successor_identities = oidc_key_ring_public_identities(&key_ring)?;
+        let now = oidc_unix_timestamp()?;
+        let dependencies = self
+            .signing_activation_dependencies
+            .read()
+            .map_err(|_| {
+                OidcError::SigningError(
+                    "OIDC signing activation dependencies are unavailable".to_string(),
+                )
+            })?
+            .clone();
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
+        let OidcIdTokenSigningState::Active(active) = state else {
+            *slot = state;
+            return Err(OidcError::SigningError(
+                "OIDC signer rotation requires an Active generation".to_string(),
+            ));
+        };
+        let current = active.published.pending.key_ring.active_signer();
+        let drops_live_key = active.live_key_expiries.iter().any(|(key_id, watermark)| {
+            (key_id == current.key_id() || watermark.expires_at() > now)
+                && (!key_ring.retains_key_from(&active.published.pending.key_ring, key_id)
+                    || successor_identities.get(key_id).is_none_or(|identity| {
+                        identity.as_slice() != watermark.canonical_public_key_identity()
+                    }))
+        });
+        if key_ring.generation() <= active.published.pending.key_ring.generation()
+            || key_ring.active_signer().binding() == current.binding()
+            || drops_live_key
+        {
+            *slot = OidcIdTokenSigningState::Active(active);
+            return Err(OidcError::SigningError(
+                "OIDC successor ring must advance and retain every live public key".to_string(),
+            ));
+        }
+        let pending = OidcIdTokenSigningPending {
+            binding: key_ring.active_signer().binding(),
+            key_ring,
+            issuer: self.config.issuer.clone(),
+            advertised_jwks_uris: admitted_uris,
+            advertised_jwks_origins: admitted_origins,
+            canonical_jwks,
+            dependencies,
+        };
+        *slot = OidcIdTokenSigningState::Rotating {
+            active,
+            successor: OidcIdTokenSigningSuccessor::Pending(pending),
+        };
+        Ok(())
+    }
+
+    /// Publishes the exact signer-bound canonical JWKS to this provider's
+    /// public endpoint state. Copied or stale bytes leave the state Pending.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn publish_id_token_signing_jwks(
+        &self,
+        published_jwks: CanonicalRs256PublicJwks,
+    ) -> Result<(), OidcError> {
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
+        let OidcIdTokenSigningState::Pending(pending) = state else {
+            *slot = state;
+            return Err(OidcError::SigningError(
+                "OIDC signing JWKS publication requires a Pending activation".to_string(),
+            ));
+        };
+        if published_jwks.binding() != pending.binding
+            || published_jwks.as_bytes() != pending.canonical_jwks.as_bytes()
+        {
+            *slot = OidcIdTokenSigningState::Pending(pending);
+            return Err(OidcError::SigningError(
+                "OIDC signing JWKS publication does not match the pending signer binding"
+                    .to_string(),
+            ));
+        }
+        *slot = OidcIdTokenSigningState::Published(OidcIdTokenSigningPublished {
+            published_jwks: published_jwks.as_bytes().to_vec(),
+            pending,
+            publication_generation: published_jwks.binding().ring_generation(),
+        });
+        Ok(())
+    }
+
+    /// Publishes the exact canonical active-plus-retained JWKS for a key-ring
+    /// activation.  This is the rotation-capable publication entry point.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn publish_id_token_signing_key_ring_jwks(
+        &self,
+        published_jwks: CanonicalRs256PublicJwksSet,
+    ) -> Result<(), OidcError> {
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
+        let (pending, active) = match state {
+            OidcIdTokenSigningState::Pending(pending) => (pending, None),
+            OidcIdTokenSigningState::Rotating {
+                active,
+                successor: OidcIdTokenSigningSuccessor::Pending(pending),
+            } => (pending, Some(active)),
+            state => {
+                *slot = state;
+                return Err(OidcError::SigningError(
+                    "OIDC signing JWKS publication requires a Pending activation".to_string(),
+                ));
+            }
+        };
+        if published_jwks.generation() != pending.key_ring.generation()
+            || published_jwks.as_bytes() != pending.canonical_jwks.as_bytes()
+        {
+            *slot = match active {
+                Some(active) => OidcIdTokenSigningState::Rotating {
+                    active,
+                    successor: OidcIdTokenSigningSuccessor::Pending(pending),
+                },
+                None => OidcIdTokenSigningState::Pending(pending),
+            };
+            return Err(OidcError::SigningError(
+                "OIDC signing JWKS publication does not match the pending key ring".to_string(),
+            ));
+        }
+        let published = OidcIdTokenSigningPublished {
+            published_jwks: published_jwks.as_bytes().to_vec(),
+            publication_generation: published_jwks.generation(),
+            pending,
+        };
+        *slot = match active {
+            Some(active) => OidcIdTokenSigningState::Rotating {
+                active,
+                successor: OidcIdTokenSigningSuccessor::Published(published),
+            },
+            None => OidcIdTokenSigningState::Published(published),
+        };
+        Ok(())
+    }
+
+    /// Returns the exact public JWKS URI bound while this activation is
+    /// Pending, Published, or Active. Native HTTP configuration uses this to
+    /// install one non-inferred route; callers cannot substitute a Host header
+    /// or copied endpoint spelling.
+    #[cfg(feature = "builtin-auth-server")]
+    pub(crate) fn advertised_id_token_jwks_uri(&self) -> Result<String, OidcError> {
+        let slot = self.signing_activation.read().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        match &*slot {
+            OidcIdTokenSigningState::Pending(pending) => {
+                Ok(pending.advertised_jwks_uris[0].clone())
+            }
+            OidcIdTokenSigningState::Published(published) => {
+                Ok(published.pending.advertised_jwks_uris[0].clone())
+            }
+            OidcIdTokenSigningState::Active(active) => {
+                Ok(active.published.pending.advertised_jwks_uris[0].clone())
+            }
+            OidcIdTokenSigningState::Rotating {
+                active,
+                successor: OidcIdTokenSigningSuccessor::Pending(_),
+            } => Ok(active.published.pending.advertised_jwks_uris[0].clone()),
+            OidcIdTokenSigningState::Rotating {
+                successor: OidcIdTokenSigningSuccessor::Published(published),
+                ..
+            } => Ok(published.pending.advertised_jwks_uris[0].clone()),
+            OidcIdTokenSigningState::Retiring(retiring) => {
+                Ok(retiring.published.pending.advertised_jwks_uris[0].clone())
+            }
+            OidcIdTokenSigningState::Inactive => Err(OidcError::SigningError(
+                "OIDC signing activation has no advertised JWKS endpoint".to_string(),
+            )),
+        }
+    }
+
+    /// Returns exact canonical bytes for the bound public JWKS route.
+    ///
+    /// This is intentionally side-effect free.  Serving a response is not an
+    /// endpoint read-back and can never mint activation evidence; only the
+    /// embedding-owned [`OidcJwksReadBackVerifier`] may do that.
+    #[cfg(feature = "builtin-auth-server")]
+    pub(crate) fn published_jwks_document(
+        &self,
+        advertised_jwks_uri: &str,
+    ) -> Result<Vec<u8>, OidcError> {
+        let slot = self.signing_activation.read().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let Some(published) = slot.published() else {
+            return Err(OidcError::SigningError(
+                "OIDC signing JWKS is not published".to_string(),
+            ));
+        };
+        if !published
+            .pending
+            .advertised_jwks_uris
+            .iter()
+            .any(|uri| uri == advertised_jwks_uri)
+        {
+            return Err(OidcError::SigningError(
+                "OIDC public JWKS request did not use the activated endpoint".to_string(),
+            ));
+        }
+        Ok(published.published_jwks.clone())
+    }
+
+    /// Completes Active admission through an external endpoint read-back and
+    /// durable compare-and-set.  A route handler's local buffer is never
+    /// sufficient evidence.
+    #[cfg(feature = "builtin-auth-server")]
+    pub async fn activate_id_token_signing(
+        &self,
+        cx: &Cx,
+        deadline: ExternalRs256SigningDeadline,
+    ) -> Result<(), OidcError> {
+        let (
+            key_ring,
+            binding,
+            expected,
+            endpoints,
+            origins,
+            issuer,
+            dependencies,
+            publication_generation,
+            rotating,
+        ) = {
+            let slot = self.signing_activation.read().map_err(|_| {
+                OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+            })?;
+            let (published, rotating) = match &*slot {
+                OidcIdTokenSigningState::Published(published) => (published, false),
+                OidcIdTokenSigningState::Rotating {
+                    successor: OidcIdTokenSigningSuccessor::Published(published),
+                    ..
+                } => (published, true),
+                _ => {
+                    return Err(OidcError::SigningError(
+                        "OIDC signing activation requires published JWKS read-back".to_string(),
+                    ));
+                }
+            };
+            (
+                published.pending.key_ring.clone(),
+                published.pending.binding,
+                published.pending.canonical_jwks.clone(),
+                published.pending.advertised_jwks_uris.clone(),
+                published.pending.advertised_jwks_origins.clone(),
+                published.pending.issuer.clone(),
+                published.pending.dependencies.clone(),
+                published.publication_generation,
+                rotating,
+            )
+        };
+        let dependencies = dependencies.ok_or_else(|| {
+            OidcError::SigningError(
+                "OIDC signer activation requires an external read-back verifier and durable store"
+                    .to_string(),
+            )
+        })?;
+        let canary = oidc_signing_canary_claims()?;
+        let signed = key_ring
+            .active_signer()
+            .sign(cx, JwsSigningProfile::OidcIdToken, canary, deadline)
+            .await
+            .map_err(OidcError::ExternalSigning)?;
+        if signed.binding() != binding {
+            return Err(OidcError::SigningError(
+                "OIDC signing canary returned a stale signer binding".to_string(),
+            ));
+        }
+        cx.checkpoint().map_err(|_| {
+            OidcError::SigningError(
+                "OIDC signing activation cancelled after canary dispatch".to_string(),
+            )
+        })?;
+        let canary = signed.into_compact_jws();
+        let observed = dependencies.verifier.read_back(cx, &endpoints).await?;
+        cx.checkpoint().map_err(|_| {
+            OidcError::SigningError("OIDC activation cancelled after JWKS read-back".to_string())
+        })?;
+        let receipt = SigningActivationReceipt::verify(
+            SigningActivationProfile::OidcIdToken,
+            issuer.clone(),
+            &expected,
+            &endpoints,
+            &origins,
+            observed,
+            canary,
+        )
+        .map_err(|_| {
+            OidcError::SigningError(
+                "OIDC signing canary failed public JWKS verification".to_string(),
+            )
+        })?;
+
+        cx.checkpoint().map_err(|_| {
+            OidcError::SigningError("OIDC activation cancelled before durable CAS".to_string())
+        })?;
+        let prior = dependencies.store.load(cx, &issuer)?;
+        if prior.as_ref().is_some_and(|record| {
+            record.issuer() != issuer
+                || record.status() != OidcSigningActivationStatus::Active
+                || record.key_ring_generation() > expected.generation()
+        }) {
+            return Err(OidcError::SigningError(
+                "OIDC activation store rejected a stale or rollback key-ring generation"
+                    .to_string(),
+            ));
+        }
+        let now = oidc_unix_timestamp()?;
+        let successor_key_identities = oidc_key_ring_public_identities(&key_ring)?;
+        let mut key_id_maximum_id_token_expires_at =
+            prior.as_ref().map_or_else(BTreeMap::new, |record| {
+                record.key_id_maximum_id_token_expires_at().clone()
+            });
+        if key_id_maximum_id_token_expires_at
+            .iter()
+            .any(|(key_id, watermark)| {
+                watermark.expires_at() > now
+                    && successor_key_identities.get(key_id).is_none_or(|identity| {
+                        identity.as_slice() != watermark.canonical_public_key_identity()
+                    })
+            })
+        {
+            return Err(OidcError::SigningError(
+                "OIDC activation key ring omits or substitutes a durably live verification key"
+                    .to_string(),
+            ));
+        }
+        key_id_maximum_id_token_expires_at.retain(|key_id, watermark| {
+            watermark.expires_at() > now || successor_key_identities.contains_key(key_id)
+        });
+        for (key_id, identity) in successor_key_identities {
+            let replaces_expired_identity = key_id_maximum_id_token_expires_at
+                .get(&key_id)
+                .is_some_and(|watermark| {
+                    watermark.expires_at() <= now
+                        && watermark.canonical_public_key_identity() != identity.as_slice()
+                });
+            if replaces_expired_identity
+                || !key_id_maximum_id_token_expires_at.contains_key(&key_id)
+            {
+                key_id_maximum_id_token_expires_at
+                    .insert(key_id, OidcSigningKeyExpiry::new(0, identity)?);
+            }
+        }
+        let expected_activation_generation = prior
+            .as_ref()
+            .map(OidcSigningActivationStoreRecord::activation_generation);
+        let next_generation = expected_activation_generation
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                OidcError::SigningError("OIDC activation generation is exhausted".to_string())
+            })?;
+        let next = OidcSigningActivationStoreRecord::new(
+            issuer.clone(),
+            expected.generation(),
+            next_generation,
+            OidcSigningActivationStatus::Active,
+            prior.as_ref().map_or(
+                0,
+                OidcSigningActivationStoreRecord::maximum_id_token_expires_at,
+            ),
+            key_id_maximum_id_token_expires_at,
+        )?;
+        let committed =
+            dependencies
+                .store
+                .compare_and_set(cx, expected_activation_generation, next.clone())?;
+        if committed != next {
+            return Err(OidcError::SigningError(
+                "OIDC activation store returned a mismatched CAS record".to_string(),
+            ));
+        }
+
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
+        let (published, previous_active) = match state {
+            OidcIdTokenSigningState::Published(published) if !rotating => (published, None),
+            OidcIdTokenSigningState::Rotating {
+                active,
+                successor: OidcIdTokenSigningSuccessor::Published(published),
+            } if rotating => (published, Some(active)),
+            state => {
+                *slot = state;
+                return Err(OidcError::SigningError(
+                    "OIDC signing activation changed while its canary was in flight".to_string(),
+                ));
+            }
+        };
+        if published.pending.binding != binding
+            || published.publication_generation != publication_generation
+            || published.pending.key_ring.generation() != expected.generation()
+        {
+            *slot = match previous_active {
+                Some(active) => OidcIdTokenSigningState::Rotating {
+                    active,
+                    successor: OidcIdTokenSigningSuccessor::Published(published),
+                },
+                None => OidcIdTokenSigningState::Published(published),
+            };
+            return Err(OidcError::SigningError(
+                "OIDC signing activation publication changed while its canary was in flight"
+                    .to_string(),
+            ));
+        }
+        *slot = OidcIdTokenSigningState::Active(OidcIdTokenSigningActivation {
+            published,
+            receipt,
+            activation_generation: committed.activation_generation,
+            maximum_id_token_expires_at: committed.maximum_id_token_expires_at,
+            live_key_expiries: committed.key_id_maximum_id_token_expires_at().clone(),
+        });
+        Ok(())
+    }
+
+    /// Closes issuance and enters `Retiring` only after the recorded maximum
+    /// lifetime of every ID token signed by this generation.  Verification
+    /// material remains available to the public JWKS route while retirement is
+    /// observed; callers must install a successor generation separately.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn retire_id_token_signing_generation(
+        &self,
+        cx: &Cx,
+        now_unix_seconds: i64,
+    ) -> Result<(), OidcError> {
+        let (dependencies, issuer, key_ring_generation, activation_generation) = {
+            let slot = self.signing_activation.read().map_err(|_| {
+                OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+            })?;
+            let OidcIdTokenSigningState::Active(active) = &*slot else {
+                return Err(OidcError::SigningError(
+                    "OIDC signing retirement requires an unrotated Active generation".to_string(),
+                ));
+            };
+            (
+                active
+                    .published
+                    .pending
+                    .dependencies
+                    .clone()
+                    .ok_or_else(|| {
+                        OidcError::SigningError(
+                            "OIDC active signer lost its durable activation dependencies"
+                                .to_string(),
+                        )
+                    })?,
+                active.published.pending.issuer.clone(),
+                active.published.pending.key_ring.generation(),
+                active.activation_generation,
+            )
+        };
+        let durable = fence_active_oidc_activation_store(
+            cx,
+            &dependencies,
+            &issuer,
+            key_ring_generation,
+            activation_generation,
+        )?;
+        if durable.maximum_id_token_expires_at() > now_unix_seconds {
+            return Err(OidcError::SigningError(
+                "OIDC signing key cannot retire before the durable maximum ID-token expiry"
+                    .to_string(),
+            ));
+        }
+        let next_generation = durable
+            .activation_generation()
+            .checked_add(1)
+            .ok_or_else(|| {
+                OidcError::SigningError(
+                    "OIDC durable activation generation is exhausted".to_string(),
+                )
+            })?;
+        let next = OidcSigningActivationStoreRecord::new(
+            issuer,
+            key_ring_generation,
+            next_generation,
+            OidcSigningActivationStatus::Retiring,
+            durable.maximum_id_token_expires_at(),
+            durable.key_id_maximum_id_token_expires_at().clone(),
+        )?;
+        let committed = dependencies.store.compare_and_set(
+            cx,
+            Some(durable.activation_generation()),
+            next.clone(),
+        )?;
+        if committed != next {
+            return Err(OidcError::SigningError(
+                "OIDC durable retirement CAS fence was lost".to_string(),
+            ));
+        }
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
+        let OidcIdTokenSigningState::Active(mut active) = state else {
+            *slot = state;
+            return Err(OidcError::SigningError(
+                "OIDC signing retirement requires an Active generation".to_string(),
+            ));
+        };
+        if active.activation_generation != durable.activation_generation()
+            || active.published.pending.key_ring.generation() != key_ring_generation
+        {
+            *slot = OidcIdTokenSigningState::Active(active);
+            return Err(OidcError::SigningError(
+                "OIDC signing activation changed before retirement".to_string(),
+            ));
+        }
+        active.activation_generation = committed.activation_generation();
+        active.maximum_id_token_expires_at = committed.maximum_id_token_expires_at();
+        *slot = OidcIdTokenSigningState::Retiring(active);
+        Ok(())
+    }
+
+    /// Returns exact public JWKS bytes only after their matching activation is
+    /// Active. A pending/publication read-back never exposes a usable signer.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn activated_jwks_document(&self) -> Result<Vec<u8>, OidcError> {
+        let slot = self.signing_activation.read().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let active = slot.active().ok_or_else(|| {
+            OidcError::SigningError("OIDC signing activation is not Active".to_string())
+        })?;
+        Ok(active.published.published_jwks.clone())
+    }
+
     /// Generates the discovery document.
     #[must_use]
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
-        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
+        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.as_str());
+        doc.grant_types_supported = self
+            .oauth
+            .supported_grant_types()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         doc.scopes_supported = self.config.supported_scopes.clone();
+        if self.oauth.config().allow_public_clients {
+            let base = base_url.trim_end_matches('/');
+            doc.registration_endpoint = Some(format!("{base}/register"));
+        }
         doc.claims_supported = Some(self.config.supported_claims.clone());
-        doc.id_token_signing_alg_values_supported =
-            vec![self.config.signing_algorithm.as_str().to_string()];
-        doc.jwks_uri = match self.config.signing_algorithm {
-            SigningAlgorithm::HS256 => None,
-            SigningAlgorithm::RS256 => Some(format!("{}/.well-known/jwks.json", base_url)),
-        };
+        // Discovery must describe this exact OAuthServer configuration, not
+        // merely the broad capabilities of DiscoveryDocument::new. Public
+        // clients authenticate token and revocation requests with client_id
+        // and no secret; confidential clients retain both secret methods.
+        if !self.oauth.config().allow_public_clients {
+            doc.token_endpoint_auth_methods_supported
+                .retain(|method| method != "none");
+            doc.revocation_endpoint_auth_methods_supported
+                .retain(|method| method != "none");
+        }
+        #[cfg(feature = "builtin-auth-server")]
+        if let Ok(slot) = self.signing_activation.read() {
+            if let (Some(_), Some(published)) = (slot.active(), slot.published()) {
+                doc.id_token_signing_alg_values_supported = vec!["RS256".to_string()];
+                doc.jwks_uri = Some(published.pending.advertised_jwks_uris[0].clone());
+            }
+        }
         doc
-    }
-
-    /// Returns the configured JSON Web Key Set (JWKS), if any.
-    ///
-    /// For HS256 this is typically `None`. For RS256 it is required and should be served at
-    /// `/.well-known/jwks.json` alongside the discovery document.
-    #[must_use]
-    pub fn jwks(&self) -> Option<serde_json::Value> {
-        self.config.jwks.clone()
     }
 
     // -------------------------------------------------------------------------
     // ID Token Issuance
     // -------------------------------------------------------------------------
 
-    /// Issues an ID token for the given access token.
+    /// Issues one OIDC ID-token candidate through the active external RS256
+    /// signer. The returned compact JWS is self-verified by the signer facade
+    /// and then verified again against the exact JWKS publication read-back.
     ///
-    /// This should be called after a successful token exchange when the
-    /// `openid` scope was requested.
-    pub fn issue_id_token(
+    /// This is intentionally asynchronous and accepts the caller's [`Cx`];
+    /// it never creates a runtime or substitutes an in-process signing key.
+    #[cfg(feature = "builtin-auth-server")]
+    pub async fn issue_id_token(
         &self,
-        access_token: &OAuthToken,
+        cx: &Cx,
+        access_token: &str,
         nonce: Option<&str>,
+        deadline: ExternalRs256SigningDeadline,
     ) -> Result<IdToken, OidcError> {
-        // Verify openid scope
-        if !access_token.scopes.iter().any(|s| s == "openid") {
-            return Err(OidcError::MissingOpenIdScope);
-        }
-
+        let access_token_credential = access_token;
+        let access_token = self.validated_oidc_access_token(access_token)?;
         let subject = access_token
             .subject
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
-
-        // Get user claims
+        validate_oidc_nonce(nonce)?;
         let user_claims = self.get_user_claims(subject, &access_token.scopes)?;
-
-        // Build ID token claims
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
+        let now = oidc_unix_timestamp()?;
+        let expires_in = access_token
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let expires_in = i64::try_from(expires_in).map_err(|_| {
+            OidcError::InvalidIdToken("access-token lifetime exceeds ID-token range".to_string())
+        })?;
+        let exp = now.checked_add(expires_in).ok_or_else(|| {
+            OidcError::InvalidIdToken("ID-token expiry exceeds timestamp range".to_string())
+        })?;
+        if exp <= now {
+            return Err(OidcError::InvalidIdToken(
+                "access token is expired before ID-token issuance".to_string(),
+            ));
+        }
         let claims = IdTokenClaims {
             iss: self.config.issuer.clone(),
-            sub: subject.clone(),
+            sub: subject.to_string(),
             aud: access_token.client_id.clone(),
-            exp: now + self.config.id_token_lifetime.as_secs() as i64,
+            exp,
             iat: now,
-            auth_time: Some(now),
-            nonce: nonce.map(String::from),
+            auth_time: None,
+            nonce: nonce.map(str::to_string),
             acr: None,
             amr: None,
-            azp: Some(access_token.client_id.clone()),
-            at_hash: Some(self.compute_at_hash(&access_token.token)),
+            azp: None,
+            at_hash: None,
             c_hash: None,
             user_claims,
         };
-
-        // Sign the token
-        let raw = self.sign_id_token(&claims)?;
-
-        let issued = IdToken { raw, claims };
-
-        // Cache the ID token
-        if let Ok(mut guard) = self.id_tokens.write() {
-            guard.insert(access_token.token.clone(), issued.clone());
+        let signing_claims = id_token_signing_claims(&claims)?;
+        let (
+            signer,
+            binding,
+            read_back_keys,
+            dependencies,
+            activation_generation,
+            key_ring_generation,
+        ) = {
+            let slot = self.signing_activation.read().map_err(|_| {
+                OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+            })?;
+            let activation = slot.active().ok_or_else(|| {
+                OidcError::SigningError("OIDC signing activation is required".to_string())
+            })?;
+            if activation.published.pending.issuer != self.config.issuer
+                || activation.published.pending.binding
+                    != activation
+                        .published
+                        .pending
+                        .key_ring
+                        .active_signer()
+                        .binding()
+                || !activation.receipt.applies_to(
+                    SigningActivationProfile::OidcIdToken,
+                    &self.config.issuer,
+                    &activation.published.pending.canonical_jwks,
+                    &activation.published.pending.advertised_jwks_uris,
+                    &activation.published.pending.advertised_jwks_origins,
+                )
+            {
+                return Err(OidcError::SigningError(
+                    "OIDC signing activation no longer matches the selected signer".to_string(),
+                ));
+            }
+            (
+                Arc::clone(activation.published.pending.key_ring.active_signer()),
+                activation.published.pending.binding,
+                AdmittedRsaJwks::from_json(&activation.published.published_jwks).map_err(|_| {
+                    OidcError::SigningError(
+                        "OIDC signing activation lost its public JWKS read-back".to_string(),
+                    )
+                })?,
+                activation
+                    .published
+                    .pending
+                    .dependencies
+                    .clone()
+                    .ok_or_else(|| {
+                        OidcError::SigningError(
+                            "OIDC active signer lost its durable activation dependencies"
+                                .to_string(),
+                        )
+                    })?,
+                activation.activation_generation,
+                activation.published.pending.key_ring.generation(),
+            )
+        };
+        let durable_before_sign = fence_active_oidc_activation_store(
+            cx,
+            &dependencies,
+            &self.config.issuer,
+            key_ring_generation,
+            activation_generation,
+        )?;
+        let signer_key_id = signer.key_id().to_string();
+        let signer_key_identity = signer
+            .canonical_public_jwks()
+            .map_err(|_| {
+                OidcError::SigningError(
+                    "OIDC active signer has no canonical public key identity".to_string(),
+                )
+            })?
+            .as_bytes()
+            .to_vec();
+        let signed = signer
+            .sign(cx, JwsSigningProfile::OidcIdToken, signing_claims, deadline)
+            .await
+            .map_err(OidcError::ExternalSigning)?;
+        if signed.binding() != binding {
+            return Err(OidcError::SigningError(
+                "external ID-token signing binding changed before exposure".to_string(),
+            ));
         }
-
-        Ok(issued)
-    }
-
-    /// Gets the ID token associated with an access token.
-    #[must_use]
-    pub fn get_id_token(&self, access_token: &str) -> Option<IdToken> {
-        self.id_tokens
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(access_token).cloned())
+        cx.checkpoint().map_err(|_| {
+            OidcError::SigningError("OIDC request cancelled after external signing".to_string())
+        })?;
+        let revalidated = self.validated_oidc_access_token(access_token_credential)?;
+        if !same_id_token_authorization(&access_token, &revalidated) {
+            return Err(OidcError::SigningError(
+                "OIDC access-token authorization changed during external signing".to_string(),
+            ));
+        }
+        let next_activation_generation = durable_before_sign
+            .activation_generation()
+            .checked_add(1)
+            .ok_or_else(|| {
+                OidcError::SigningError(
+                    "OIDC durable activation generation is exhausted".to_string(),
+                )
+            })?;
+        let maximum_id_token_expires_at =
+            durable_before_sign.maximum_id_token_expires_at().max(exp);
+        let mut key_id_maximum_id_token_expires_at = durable_before_sign
+            .key_id_maximum_id_token_expires_at()
+            .clone();
+        if key_id_maximum_id_token_expires_at
+            .get(&signer_key_id)
+            .is_some_and(|watermark| {
+                watermark.canonical_public_key_identity() != signer_key_identity.as_slice()
+            })
+        {
+            return Err(OidcError::SigningError(
+                "OIDC durable key identity changed before ID-token exposure".to_string(),
+            ));
+        }
+        let signer_expiry = key_id_maximum_id_token_expires_at
+            .get(&signer_key_id)
+            .map_or(exp, |watermark| watermark.expires_at().max(exp));
+        key_id_maximum_id_token_expires_at.insert(
+            signer_key_id,
+            OidcSigningKeyExpiry::new(signer_expiry, signer_key_identity)?,
+        );
+        let committed = OidcSigningActivationStoreRecord::new(
+            self.config.issuer.clone(),
+            key_ring_generation,
+            next_activation_generation,
+            OidcSigningActivationStatus::Active,
+            maximum_id_token_expires_at,
+            key_id_maximum_id_token_expires_at.clone(),
+        )?;
+        let committed = dependencies.store.compare_and_set(
+            cx,
+            Some(durable_before_sign.activation_generation()),
+            committed.clone(),
+        )?;
+        if committed
+            != OidcSigningActivationStoreRecord::new(
+                self.config.issuer.clone(),
+                key_ring_generation,
+                next_activation_generation,
+                OidcSigningActivationStatus::Active,
+                maximum_id_token_expires_at,
+                key_id_maximum_id_token_expires_at,
+            )?
+        {
+            return Err(OidcError::SigningError(
+                "OIDC durable activation fence changed while signing".to_string(),
+            ));
+        }
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let active = match &mut *slot {
+            OidcIdTokenSigningState::Active(active) => active,
+            OidcIdTokenSigningState::Rotating { active, .. } => active,
+            _ => {
+                return Err(OidcError::SigningError(
+                    "OIDC signing activation changed before ID-token exposure".to_string(),
+                ));
+            }
+        };
+        if active.activation_generation != durable_before_sign.activation_generation()
+            || active.published.pending.binding != binding
+            || active.published.pending.key_ring.generation() != key_ring_generation
+        {
+            return Err(OidcError::SigningError(
+                "OIDC signing activation was superseded before ID-token exposure".to_string(),
+            ));
+        }
+        active.activation_generation = committed.activation_generation();
+        active.maximum_id_token_expires_at = committed.maximum_id_token_expires_at();
+        active.live_key_expiries = committed.key_id_maximum_id_token_expires_at().clone();
+        drop(slot);
+        let raw = signed.into_compact_jws();
+        verify_compact_jws_rs256(&raw, &read_back_keys).map_err(|_| {
+            OidcError::SigningError("ID-token failed published-JWKS verification".to_string())
+        })?;
+        Ok(IdToken { raw, claims })
     }
 
     // -------------------------------------------------------------------------
@@ -880,20 +2185,7 @@ impl OidcProvider {
     ///
     /// Returns the user's claims filtered by the access token's scopes.
     pub fn userinfo(&self, access_token: &str) -> Result<UserClaims, OidcError> {
-        // Validate access token
-        let validated = self
-            .oauth
-            .validate_access_token(access_token)
-            .ok_or_else(|| {
-                OidcError::OAuth(OAuthError::InvalidGrant(
-                    "invalid or expired access token".to_string(),
-                ))
-            })?;
-
-        // Verify openid scope
-        if !validated.scopes.iter().any(|s| s == "openid") {
-            return Err(OidcError::MissingOpenIdScope);
-        }
+        let validated = self.validated_oidc_access_token(access_token)?;
 
         let subject = validated
             .subject
@@ -901,6 +2193,26 @@ impl OidcProvider {
             .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
 
         self.get_user_claims(subject, &validated.scopes)
+    }
+
+    fn validated_oidc_access_token(&self, access_token: &str) -> Result<OAuthToken, OidcError> {
+        let validated = self
+            .oauth
+            .validate_access_token(access_token)
+            .ok_or_else(|| {
+                OidcError::OAuth(OAuthError::InvalidGrant(
+                    "invalid, revoked, or expired OAuth access token".to_string(),
+                ))
+            })?;
+        if validated.is_refresh_token || validated.is_expired() {
+            return Err(OidcError::OAuth(OAuthError::InvalidGrant(
+                "invalid, revoked, or expired OAuth access token".to_string(),
+            )));
+        }
+        if !validated.scopes.iter().any(|scope| scope == "openid") {
+            return Err(OidcError::MissingOpenIdScope);
+        }
+        Ok(validated)
     }
 
     // -------------------------------------------------------------------------
@@ -924,120 +2236,14 @@ impl OidcProvider {
             }
         };
 
+        // The validated access token is the authority for user identity. A
+        // custom provider must never be able to substitute another subject's
+        // claims, even when it was queried with the correct key.
+        if claims.sub != subject {
+            return Err(OidcError::ClaimsSubjectMismatch);
+        }
+
         Ok(claims.filter_by_scopes(scopes))
-    }
-
-    fn sign_id_token(&self, claims: &IdTokenClaims) -> Result<String, OidcError> {
-        match self.config.signing_algorithm {
-            SigningAlgorithm::HS256 => {
-                let key = self.get_or_generate_signing_key()?;
-
-                // Build JWT (manual, minimal dependencies)
-                let header = serde_json::json!({
-                    "alg": "HS256",
-                    "typ": "JWT",
-                    "kid": self.config.key_id.as_deref().unwrap_or("default"),
-                });
-
-                let header_b64 = base64url_encode(&serde_json::to_vec(&header).map_err(|e| {
-                    OidcError::SigningError(format!("failed to serialize header: {e}"))
-                })?);
-
-                let claims_b64 = base64url_encode(&serde_json::to_vec(claims).map_err(|e| {
-                    OidcError::SigningError(format!("failed to serialize claims: {e}"))
-                })?);
-
-                let signing_input = format!("{header_b64}.{claims_b64}");
-
-                let signature = match &key {
-                    SigningKey::Hmac(secret) => hmac_sha256(&signing_input, secret)?,
-                    SigningKey::None => {
-                        return Err(OidcError::SigningError(
-                            "no signing key configured".to_string(),
-                        ));
-                    }
-                };
-
-                let signature_b64 = base64url_encode(&signature);
-                Ok(format!("{signing_input}.{signature_b64}"))
-            }
-            SigningAlgorithm::RS256 => {
-                #[cfg(feature = "jwt")]
-                {
-                    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-
-                    let pem = self.config.rsa_private_key_pem.as_ref().ok_or_else(|| {
-                        OidcError::SigningError("RS256 requires `rsa_private_key_pem`".to_string())
-                    })?;
-
-                    let kid = self.config.key_id.as_deref().ok_or_else(|| {
-                        OidcError::SigningError("RS256 requires `key_id` to be set".to_string())
-                    })?;
-
-                    let mut header = Header::new(Algorithm::RS256);
-                    header.typ = Some("JWT".to_string());
-                    header.kid = Some(kid.to_string());
-
-                    let key = EncodingKey::from_rsa_pem(pem).map_err(|e| {
-                        OidcError::SigningError(format!("failed to parse RSA private key PEM: {e}"))
-                    })?;
-
-                    encode(&header, claims, &key)
-                        .map_err(|e| OidcError::SigningError(format!("RS256 signing failed: {e}")))
-                }
-                #[cfg(not(feature = "jwt"))]
-                {
-                    Err(OidcError::SigningError(
-                        "RS256 requires the `fastmcp-server/jwt` feature".to_string(),
-                    ))
-                }
-            }
-        }
-    }
-
-    fn get_or_generate_signing_key(&self) -> Result<SigningKey, OidcError> {
-        let guard = self
-            .signing_key
-            .read()
-            .map_err(|_| OidcError::SigningError("failed to acquire read lock".to_string()))?;
-
-        match &*guard {
-            SigningKey::None => {
-                // Generate a random key
-                drop(guard);
-                let mut write_guard = self.signing_key.write().map_err(|_| {
-                    OidcError::SigningError("failed to acquire write lock".to_string())
-                })?;
-
-                // Double-check after acquiring write lock
-                if matches!(&*write_guard, SigningKey::None) {
-                    let key = generate_random_bytes(32)?;
-                    *write_guard = SigningKey::Hmac(key.clone());
-                    Ok(SigningKey::Hmac(key))
-                } else {
-                    Ok(write_guard.clone())
-                }
-            }
-            key => Ok(key.clone()),
-        }
-    }
-
-    fn compute_at_hash(&self, access_token: &str) -> String {
-        // at_hash is left half of hash of access token
-        let hash = simple_sha256(access_token.as_bytes());
-        base64url_encode(&hash[..16])
-    }
-
-    /// Removes expired ID tokens from cache.
-    pub fn cleanup_expired(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        if let Ok(mut guard) = self.id_tokens.write() {
-            guard.retain(|_, token| token.claims.exp > now);
-        }
     }
 }
 
@@ -1045,41 +2251,235 @@ impl OidcProvider {
 // Helper Functions
 // =============================================================================
 
-/// Base64url encodes bytes (no padding).
-fn base64url_encode(data: &[u8]) -> String {
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    URL_SAFE_NO_PAD.encode(data)
+#[cfg(feature = "builtin-auth-server")]
+fn validate_advertised_jwks_uri(
+    issuer: &str,
+    advertised_jwks_uri: &str,
+) -> Result<(String, String), OidcError> {
+    let issuer = Url::parse(issuer).map_err(|_| {
+        OidcError::SigningError("OIDC issuer cannot bind an advertised JWKS endpoint".to_string())
+    })?;
+    let endpoint = Url::parse(advertised_jwks_uri).map_err(|_| {
+        OidcError::SigningError("advertised JWKS endpoint is not an absolute HTTPS URL".to_string())
+    })?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(OidcError::SigningError(
+            "advertised JWKS endpoint is not a canonical HTTPS origin path".to_string(),
+        ));
+    }
+    let canonical_endpoint = endpoint.to_string();
+    if advertised_jwks_uri != canonical_endpoint {
+        return Err(OidcError::SigningError(
+            "advertised JWKS endpoint must use its exact canonical URI spelling".to_string(),
+        ));
+    }
+    let issuer_origin = issuer.origin().ascii_serialization();
+    let endpoint_origin = endpoint.origin().ascii_serialization();
+    if endpoint_origin != issuer_origin {
+        return Err(OidcError::SigningError(
+            "advertised JWKS endpoint origin does not match the OIDC issuer".to_string(),
+        ));
+    }
+    Ok((canonical_endpoint, endpoint_origin))
 }
 
-fn simple_sha256(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+#[cfg(feature = "builtin-auth-server")]
+fn same_id_token_authorization(left: &OAuthToken, right: &OAuthToken) -> bool {
+    left.client_id == right.client_id
+        && left.scopes == right.scopes
+        && left.resource == right.resource
+        && left.issued_at == right.issued_at
+        && left.expires_at == right.expires_at
+        && left.subject == right.subject
+        && left.token_type == right.token_type
+        && !left.is_refresh_token
+        && !right.is_refresh_token
 }
 
-fn hmac_sha256(message: &str, key: &[u8]) -> Result<[u8; 32], OidcError> {
-    use hmac::Mac;
-    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|e| OidcError::SigningError(format!("invalid HMAC key: {e}")))?;
-    mac.update(message.as_bytes());
-
-    let bytes = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+/// Loads and atomically reasserts the exact durable Active record before an
+/// external signing dispatch. Status transitions and all generation advances
+/// must change the CAS generation, so a stale process cannot overwrite a
+/// retire/revoke record with its old local activation.
+#[cfg(feature = "builtin-auth-server")]
+fn fence_active_oidc_activation_store(
+    cx: &Cx,
+    dependencies: &OidcSigningActivationDependencies,
+    issuer: &str,
+    key_ring_generation: u64,
+    activation_generation: u64,
+) -> Result<OidcSigningActivationStoreRecord, OidcError> {
+    let record = dependencies.store.load(cx, issuer)?.ok_or_else(|| {
+        OidcError::SigningError("OIDC durable activation record is absent".to_string())
+    })?;
+    if record.issuer() != issuer
+        || record.key_ring_generation() != key_ring_generation
+        || record.activation_generation() != activation_generation
+        || record.status() != OidcSigningActivationStatus::Active
+    {
+        return Err(OidcError::SigningError(
+            "OIDC durable activation record no longer authorizes this signer".to_string(),
+        ));
+    }
+    let fenced = dependencies.store.compare_and_set(
+        cx,
+        Some(record.activation_generation()),
+        record.clone(),
+    )?;
+    if fenced != record {
+        return Err(OidcError::SigningError(
+            "OIDC durable activation CAS fence was lost".to_string(),
+        ));
+    }
+    Ok(record)
 }
 
-/// Generates random bytes.
-fn generate_random_bytes(len: usize) -> Result<Vec<u8>, OidcError> {
-    let mut buf = vec![0u8; len];
-    getrandom::fill(&mut buf)
-        .map_err(|e| OidcError::SigningError(format!("secure random generation failed: {e}")))?;
-    Ok(buf)
+#[cfg(feature = "builtin-auth-server")]
+fn canonical_oidc_key_identity_matches(key_id: &str, identity: &[u8]) -> bool {
+    let canonical = serde_json::from_slice::<serde_json::Value>(identity)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok());
+    canonical.as_deref() == Some(identity)
+        && AdmittedRsaJwks::from_json(identity)
+            .is_ok_and(|keys| keys.len() == 1 && keys.contains_kid(key_id))
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_key_ring_public_identities(
+    key_ring: &Rs256PublicKeyRing,
+) -> Result<BTreeMap<String, Vec<u8>>, OidcError> {
+    let mut identities = BTreeMap::new();
+    for key_id in key_ring.key_ids() {
+        let identity = key_ring
+            .canonical_public_key_identity(&key_id)
+            .ok_or_else(|| {
+                OidcError::SigningError(
+                    "OIDC key ring has no canonical public key identity".to_string(),
+                )
+            })?
+            .as_bytes()
+            .to_vec();
+        if identities.insert(key_id, identity).is_some() {
+            return Err(OidcError::SigningError(
+                "OIDC key ring contains duplicate public key identifiers".to_string(),
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn validate_oidc_nonce(nonce: Option<&str>) -> Result<(), OidcError> {
+    if nonce.is_some_and(|nonce| {
+        nonce.is_empty()
+            || nonce.len() > MAX_OIDC_NONCE_BYTES
+            || nonce.bytes().any(|byte| byte.is_ascii_control())
+    }) {
+        return Err(OidcError::InvalidIdToken(
+            "OIDC nonce is outside admitted bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_signing_canary_claims() -> Result<BoundedJwsClaims, OidcError> {
+    BoundedJwsClaims::from_json_bytes(OIDC_SIGNING_CANARY_CLAIMS.as_bytes()).map_err(|_| {
+        OidcError::SigningError("OIDC signing canary claims are outside signer bounds".to_string())
+    })
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_unix_timestamp() -> Result<i64, OidcError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OidcError::InvalidIdToken("system clock predates Unix epoch".to_string()))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| OidcError::InvalidIdToken("system clock exceeds ID-token range".to_string()))
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn id_token_signing_claims(claims: &IdTokenClaims) -> Result<BoundedJwsClaims, OidcError> {
+    let mut value = serde_json::to_value(&claims.user_claims)
+        .map_err(|_| OidcError::InvalidIdToken("user claims cannot be serialized".to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        OidcError::InvalidIdToken("user claims must serialize as an object".to_string())
+    })?;
+    // A claims provider may supply arbitrary public profile claims, but it
+    // cannot overwrite the identity and lifetime facts that this server owns.
+    for name in [
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "auth_time",
+        "nonce",
+        "acr",
+        "amr",
+        "azp",
+        "at_hash",
+        "c_hash",
+    ] {
+        object.remove(name);
+    }
+    object.insert(
+        "iss".to_string(),
+        serde_json::Value::String(claims.iss.clone()),
+    );
+    object.insert(
+        "sub".to_string(),
+        serde_json::Value::String(claims.sub.clone()),
+    );
+    object.insert(
+        "aud".to_string(),
+        serde_json::Value::String(claims.aud.clone()),
+    );
+    object.insert("exp".to_string(), serde_json::Value::from(claims.exp));
+    object.insert("iat".to_string(), serde_json::Value::from(claims.iat));
+    if let Some(auth_time) = claims.auth_time {
+        object.insert("auth_time".to_string(), serde_json::Value::from(auth_time));
+    }
+    if let Some(nonce) = &claims.nonce {
+        object.insert(
+            "nonce".to_string(),
+            serde_json::Value::String(nonce.clone()),
+        );
+    }
+    if let Some(acr) = &claims.acr {
+        object.insert("acr".to_string(), serde_json::Value::String(acr.clone()));
+    }
+    if let Some(amr) = &claims.amr {
+        object.insert(
+            "amr".to_string(),
+            serde_json::to_value(amr).map_err(|_| {
+                OidcError::InvalidIdToken("authentication methods cannot be serialized".to_string())
+            })?,
+        );
+    }
+    if let Some(azp) = &claims.azp {
+        object.insert("azp".to_string(), serde_json::Value::String(azp.clone()));
+    }
+    if let Some(at_hash) = &claims.at_hash {
+        object.insert(
+            "at_hash".to_string(),
+            serde_json::Value::String(at_hash.clone()),
+        );
+    }
+    if let Some(c_hash) = &claims.c_hash {
+        object.insert(
+            "c_hash".to_string(),
+            serde_json::Value::String(c_hash.clone()),
+        );
+    }
+    BoundedJwsClaims::from_value(&value)
+        .map_err(|_| OidcError::InvalidIdToken("ID-token claims exceed signing bounds".to_string()))
 }
 
 // =============================================================================
@@ -1087,1328 +2487,1978 @@ fn generate_random_bytes(len: usize) -> Result<Vec<u8>, OidcError> {
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
+mod non_signing_tests {
     use super::*;
-    use crate::oauth::{
-        AuthorizationRequest, CodeChallengeMethod, OAuthClient, OAuthServerConfig, TokenRequest,
-    };
 
-    const TEST_CLIENT_ID: &str = "test-client";
-    const TEST_REDIRECT_URI: &str = "http://localhost:3000/callback";
-    const TEST_CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-
-    fn create_test_provider() -> OidcProvider {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        OidcProvider::with_defaults(oauth).expect("create provider")
+    #[test]
+    fn default_oidc_and_oauth_issuers_match() {
+        assert_eq!(
+            OidcProviderConfig::default().issuer,
+            OAuthServerConfig::default().issuer
+        );
     }
 
-    fn issue_token_via_auth_code(oauth: &OAuthServer, scopes: &[&str], subject: &str) -> String {
-        let mut client_builder =
-            OAuthClient::builder(TEST_CLIENT_ID).redirect_uri(TEST_REDIRECT_URI);
-        for scope in scopes {
-            client_builder = client_builder.scope(*scope);
-        }
-        let client = client_builder.build().expect("build client");
-        oauth.register_client(client).expect("register client");
+    #[test]
+    fn provider_requires_exact_safe_oauth_issuer_and_defaults_follow_custom_oauth() {
+        let oauth = Arc::new(
+            OAuthServer::try_new(OAuthServerConfig {
+                issuer: "https://issuer.example/tenant".to_string(),
+                ..OAuthServerConfig::default()
+            })
+            .unwrap(),
+        );
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).unwrap();
+        assert_eq!(provider.config().issuer, oauth.config().issuer);
+        assert_eq!(
+            provider.discovery_document("https://issuer.example").issuer,
+            oauth.config().issuer
+        );
 
-        let auth_request = AuthorizationRequest {
-            response_type: "code".to_string(),
-            client_id: TEST_CLIENT_ID.to_string(),
-            redirect_uri: TEST_REDIRECT_URI.to_string(),
-            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-            state: Some("state-123".to_string()),
-            code_challenge: TEST_CODE_VERIFIER.to_string(),
-            code_challenge_method: CodeChallengeMethod::Plain,
+        assert!(matches!(
+            OidcProvider::new(Arc::clone(&oauth), OidcProviderConfig::default()),
+            Err(OidcError::OAuth(OAuthError::ServerError(_)))
+        ));
+
+        let unsafe_config = OidcProviderConfig {
+            issuer: "http://issuer.example".to_string(),
+            ..OidcProviderConfig::default()
+        };
+        assert!(matches!(
+            OidcProvider::new(oauth, unsafe_config),
+            Err(OidcError::OAuth(OAuthError::ServerError(_)))
+        ));
+    }
+
+    #[test]
+    fn discovery_does_not_advertise_signing() {
+        let doc = DiscoveryDocument::new("https://issuer.example", "https://issuer.example");
+        assert_eq!(doc.id_token_signing_alg_values_supported.len(), 0);
+        assert!(doc.jwks_uri.is_none());
+        assert_eq!(
+            doc.code_challenge_methods_supported,
+            Some(vec!["S256".to_string()])
+        );
+        assert!(doc.authorization_response_iss_parameter_supported);
+        assert!(
+            doc.token_endpoint_auth_methods_supported
+                .iter()
+                .any(|method| method == "none")
+        );
+        assert!(
+            doc.revocation_endpoint_auth_methods_supported
+                .iter()
+                .any(|method| method == "none")
+        );
+        let wire = serde_json::to_value(&doc).unwrap();
+        assert_eq!(wire["authorization_response_iss_parameter_supported"], true);
+        assert_eq!(
+            wire["revocation_endpoint_auth_methods_supported"][0],
+            "none"
+        );
+    }
+
+    #[test]
+    fn discovery_auth_methods_follow_public_client_policy() {
+        for (allow_public_clients, expects_none) in [(true, true), (false, false)] {
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: "https://issuer.example".to_string(),
+                    allow_public_clients,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let provider = OidcProvider::with_defaults(oauth).unwrap();
+            let doc = provider.discovery_document("https://issuer.example");
+            assert_eq!(
+                doc.token_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "none"),
+                expects_none,
+            );
+            assert_eq!(
+                doc.revocation_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "none"),
+                expects_none,
+            );
+            assert!(
+                doc.token_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "client_secret_basic")
+            );
+            assert!(
+                doc.revocation_endpoint_auth_methods_supported
+                    .iter()
+                    .any(|method| method == "client_secret_basic")
+            );
+            assert!(doc.authorization_response_iss_parameter_supported);
+            assert_eq!(doc.registration_endpoint.is_some(), expects_none);
+            if let Some(endpoint) = &doc.registration_endpoint {
+                assert_eq!(endpoint, "https://issuer.example/register");
+            }
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn discovery_client_credentials_tracks_explicit_development_issuer_opt_in() {
+        for enabled in [false, true] {
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: "https://issuer.example".to_string(),
+                    allow_development_client_credentials: enabled,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let routes = crate::oauth::OAuthHttpRoutes::new(
+                Arc::clone(&oauth),
+                "https://issuer.example/oauth",
+            )
+            .unwrap();
+            let discovery = OidcProvider::with_defaults(oauth)
+                .unwrap()
+                .discovery_document(routes.public_endpoint_base());
+            assert_eq!(
+                discovery.grant_types_supported,
+                routes
+                    .authorization_server_metadata()
+                    .unwrap()
+                    .grant_types_supported
+            );
+            assert_eq!(
+                discovery
+                    .grant_types_supported
+                    .iter()
+                    .any(|grant| grant == "client_credentials"),
+                enabled
+            );
+            assert!(discovery.id_token_signing_alg_values_supported.is_empty());
+            assert!(discovery.jwks_uri.is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_advertises_the_served_routes_for_either_base_spelling() {
+        use crate::oauth::OAuthHttpRoutes;
+
+        // The two bases differ only in a trailing slash; both serve `/token`.
+        for base in ["https://issuer.example", "https://issuer.example/"] {
+            let oauth = Arc::new(
+                OAuthServer::try_new(OAuthServerConfig {
+                    issuer: base.to_string(),
+                    allow_public_clients: true,
+                    ..OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let routes = OAuthHttpRoutes::new(Arc::clone(&oauth), base).unwrap();
+            let doc = OidcProvider::with_defaults(oauth)
+                .unwrap()
+                .discovery_document(routes.public_endpoint_base());
+            let served = |path: &str| format!("https://issuer.example{path}");
+            assert_eq!(
+                doc.authorization_endpoint,
+                served(routes.authorization_path()),
+                "{base}"
+            );
+            assert_eq!(doc.token_endpoint, served(routes.token_path()), "{base}");
+            assert_eq!(
+                doc.revocation_endpoint,
+                Some(served(routes.revocation_path())),
+                "{base}"
+            );
+            assert_eq!(
+                doc.registration_endpoint,
+                routes.registration_path().map(served),
+                "{base}"
+            );
+        }
+    }
+
+    /// FND-01 surface 2, frozen case 4.
+    ///
+    /// **This case proves the absence of an advertised issuance path. It does
+    /// not prove the runtime refusal.** The two halves are deliberately
+    /// separate cases so a reader can tell which one carries the security
+    /// claim; see `signer_activation_tests::
+    /// issuance_without_activation_fails_closed_with_signing_error` for the
+    /// half that does.
+    ///
+    /// It is ungated because the frozen target map pins this case to
+    /// `oidc::non_signing_tests` on the `fastmcp-server` lib target, and that
+    /// module compiles under the crate's default features
+    /// (`default = ["legacy-2024-11-05"]`). Under those features
+    /// [`OidcProvider::issue_id_token`] does not exist at all — it is
+    /// `#[cfg(feature = "builtin-auth-server")]` — so there is no issuance
+    /// entry point here to refuse. That absence is a compile-time fact and
+    /// cannot be asserted at run time; what is asserted is its externally
+    /// observable consequence.
+    ///
+    /// What is proved: a provider that has activated no external signer
+    /// advertises no ID-token signing capability, so no relying party can be
+    /// induced to expect a signed ID token. This holds in *both* feature
+    /// configurations, because `discovery_document` populates
+    /// `id_token_signing_alg_values_supported` and `jwks_uri` only when an
+    /// activation is both active and published. The case therefore means the
+    /// same thing however the crate is built.
+    ///
+    /// This is distinct from `discovery_does_not_advertise_signing`, which
+    /// asserts the defaults of a bare [`DiscoveryDocument`]. This asserts what
+    /// a live provider actually advertises.
+    #[test]
+    fn issuance_fails_closed_without_external_signer() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default provider");
+
+        let discovery = provider.discovery_document("https://issuer.example");
+
+        assert!(
+            discovery.id_token_signing_alg_values_supported.is_empty(),
+            "a provider with no activated external signer must advertise no \
+             ID-token signing algorithm"
+        );
+        assert!(
+            discovery.jwks_uri.is_none(),
+            "a provider with no activated external signer must advertise no \
+             JWKS endpoint"
+        );
+    }
+
+    #[test]
+    fn user_claims_filter_by_scope() {
+        let claims = UserClaims::new("subject")
+            .with_name("Alice")
+            .with_email("alice@example.test")
+            .with_email_verified(true);
+        let filtered = claims.filter_by_scopes(&["openid".to_string()]);
+        assert_eq!(filtered.sub, "subject");
+        assert!(filtered.name.is_none());
+        assert!(filtered.email.is_none());
+    }
+
+    #[test]
+    fn claims_provider_cannot_substitute_a_different_subject() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
+        provider.set_claims_fn(|requested_subject| {
+            assert_eq!(requested_subject, "authenticated-subject");
+            Some(UserClaims::new("different-subject").with_email("different-subject@example.test"))
+        });
+
+        let error = provider
+            .get_user_claims(
+                "authenticated-subject",
+                &["openid".to_string(), "email".to_string()],
+            )
+            .expect_err("a claims provider must not substitute another identity");
+
+        assert!(matches!(error, OidcError::ClaimsSubjectMismatch));
+        assert!(!error.to_string().contains("authenticated-subject"));
+        assert!(!error.to_string().contains("different-subject"));
+    }
+
+    #[test]
+    fn oidc_debug_surfaces_redact_token_and_pii_canaries_without_changing_wire_data() {
+        const CANARY: &str = "oidc-debug-token-pii-canary";
+        let address = AddressClaim {
+            formatted: Some(CANARY.to_owned()),
+            street_address: Some(CANARY.to_owned()),
+            locality: Some(CANARY.to_owned()),
+            region: Some(CANARY.to_owned()),
+            postal_code: Some(CANARY.to_owned()),
+            country: Some(CANARY.to_owned()),
+        };
+        let mut user_claims = UserClaims::new(CANARY)
+            .with_name(CANARY)
+            .with_email(CANARY)
+            .with_email_verified(true)
+            .with_phone_number(CANARY)
+            .with_custom(CANARY, serde_json::json!(CANARY));
+        user_claims.preferred_username = Some(CANARY.to_owned());
+        user_claims.address = Some(address.clone());
+        let id_token_claims = IdTokenClaims {
+            iss: CANARY.to_owned(),
+            sub: CANARY.to_owned(),
+            aud: CANARY.to_owned(),
+            exp: 2,
+            iat: 1,
+            auth_time: Some(1),
+            nonce: Some(CANARY.to_owned()),
+            acr: Some(CANARY.to_owned()),
+            amr: Some(vec![CANARY.to_owned()]),
+            azp: Some(CANARY.to_owned()),
+            at_hash: Some(CANARY.to_owned()),
+            c_hash: Some(CANARY.to_owned()),
+            user_claims: user_claims.clone(),
         };
 
-        let (code, _redirect) = oauth
-            .authorize(&auth_request, Some(subject.to_string()))
-            .expect("authorize");
+        let wire = serde_json::to_value(&id_token_claims).unwrap();
+        assert_eq!(wire["nonce"], CANARY);
+        assert_eq!(wire["email"], CANARY);
+        assert_eq!(wire["phone_number"], CANARY);
+        assert_eq!(wire["address"]["formatted"], CANARY);
+        assert_eq!(wire[CANARY], CANARY);
+
+        let id_token = IdToken {
+            raw: CANARY.to_owned(),
+            claims: id_token_claims.clone(),
+        };
+        let provider = InMemoryClaimsProvider::new();
+        provider.set_claims(user_claims.clone());
+        let errors = [
+            OidcError::ClaimsNotFound(CANARY.to_owned()),
+            OidcError::SigningError(CANARY.to_owned()),
+            OidcError::InvalidIdToken(CANARY.to_owned()),
+        ];
+        let debug_outputs = [
+            format!("{address:?}"),
+            format!("{user_claims:?}"),
+            format!("{id_token_claims:?}"),
+            format!("{id_token:?}"),
+            format!("{provider:?}"),
+            format!("{:?}", errors[0]),
+            format!("{:?}", errors[1]),
+            format!("{:?}", errors[2]),
+        ];
+
+        for debug in debug_outputs {
+            assert!(
+                !debug.contains(CANARY),
+                "sensitive canary leaked through Debug: {debug}"
+            );
+            assert!(
+                debug.contains("_len") || debug.contains("_count") || debug.contains("_present"),
+                "Debug output lacked safe structural metadata: {debug}"
+            );
+        }
+
+        for display in errors.map(|error| error.to_string()) {
+            assert!(
+                !display.contains(CANARY),
+                "sensitive canary leaked through Display: {display}"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "builtin-auth-server"))]
+mod signer_activation_tests {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use base64::Engine as _;
+    use fastmcp_protocol::jose::{
+        AttestedRs256PublicKey, ExternalRs256OperationReceipt, ExternalRs256SignDisposition,
+        ExternalRs256SignerBackend, ExternalRs256SigningRequest, RawRs256Signature,
+        RedactedSignerProvenance,
+    };
+    use ring::rand::SystemRandom;
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+
+    use super::*;
+    use crate::oauth::{AuthorizationRequest, CodeChallengeMethod, OAuthClient, TokenRequest};
+
+    const TEST_CLIENT_ID: &str = "oidc-signing-test-client";
+    const TEST_REDIRECT_URI: &str = "http://127.0.0.1/oidc-callback";
+    const TEST_CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const TEST_CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    // This is a retained public RS256 verification vector; no private key is
+    // present here. Negative tests never ask their backend to produce a JWS.
+    const TEST_PUBLIC_MODULUS: &str = "jlHZ9nzuIuM4aiAQSAgEJMBaYS7qm7Z_3mtGYDdzReIkzxPHHr21oeXQyUJI89eQG13fsUdyoodcuh5kmndPCrODJekfr_zgor6sNspcB88iQEqEc9yf9YAf5v-cNH1Evh82KABuWb26LMaNAzZFR3BMhMEQ1FD6fLFGAbX76Drd5_UZ-1xcU07IXEc_9zvQvOwXckhO7P5Yil1fVzLTrHye_6zTbGWvdqi45095bKPnSqjrLBCTVrUW8o02Gi6mt7Ls9pZeWx2DXV8SqV06DdlqiovtKWRooQ1zV-v7BGsLsVk6T6d-8mNMGNrh0fpNb_5kdaHphAt_Ji6eE1wQPw";
+    const TEST_CANARY_COMPACT_JWS: &str = concat!(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeGVkLXJzMjU2In0.",
+        "eyJzdWIiOiJmaXhlZC12ZWN0b3IiLCJhdWQiOiJzZXJ2ZXItcG9saWN5LWxhdGVyIn0.",
+        "Oak9UDEtrL-pNcPIFw31uzuCoCTyXywF5i3jxDixd0gHonZYPFfSlyPwhNSTrqmlzPsL-wNFcDn1zFlug6Ae1vK_QaL-bZBSxq-lOrMDUI_5_3P_HUrngtZaNk8ru88-wdGByGm1jRZa-LfeoSkESHVKPIcQ_WT7wqhq1RX3ZrPiq9QkHFE8nWIgiIesu8DFOXsdN05rmOxHheCbDGRpf8cQAG0ZENpJvYugD-SX9Sg9Kds5HOlOt6csIQBexCeKM2rIrN0r7qCp6jx_0aevqU6rNr6oxCxCGoH3UZGJa5xRh2KeJ6NVBE9BpPW3Kdi3dEfKlKldjzlUW-zEREdeEw"
+    );
+    // Test-only PKCS#8 fixture for a simulated externally-custodied signer.
+    // This module alone is cfg(test); production accepts only an embedding
+    // supplied `ExternalRs256SignerBackend` and contains no private key path.
+    const TEST_DYNAMIC_PRIVATE_KEY_PKCS8_B64: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC2H073wfexUwbdJyzIgK9KMxPV7ocei0R/RIRJNKyENR9JlymRa1MJtEuHmR5gQaVB5UkHZTlumKxFvt5ahOWKVQYCi8Qmu9bb0MjcWGP7kasqmapZqIa0eZQX7ax4wk0i2sljuQHrIdZpfBwS2ZMpx9GoKlvLSyuC+XtpapLf3Rfz5o0PAT0Iq9QGtoKFeFGV048OTTVN+Kianun2MHy3qqAS+PXMS6Ld5DRHpGbbyvGNXXtVC6/QyR0nf5hCbKFd7i6oEYPUzaxXMkaSvAIQJ6hvcH7mkXJ9EDewTdhuVVnf6IxpRX+3w4mP0hwVXM62PHSgOjxYJoy1F1c1zBHpAgMBAAECggEAQsfCLgka6RO3vZoiyradEAkgqd5X/3QzvrMCCtHcvHG6MkLShDclcLaCx4r233bSwRHxMFwGri4fZUeywuBeRtYcaQyU9VsFUv8A2AM1TkbAy9Mi6tNn6X93NTr6diFRJYmyNPXe5Tg4Jd/Tb3oGg1h44T/+/tFmeBVBEot4pcsOqk/IeKaaEsbodSBH3bAHSuq/Pp6vwWSuzEAQoCa/SSvOJ8vwNX6xw0QDvR6PlMkfR1J5JM0zdhgZFBeWL1lTu5kJsH49ytAceCMlR/EodDSVIpYEiPJBggVFMoc3rkqeu6J0nS/TxBwyXDc/GVJn1uPna+53uV+s5Ljw39GErQKBgQDpfHnTE3tb8ph27dJ3OF1h2VjqVxB85OpXhOxhSzIo6qyZuqvt7hBVZTKo8BHWFkjK9/NzoC1MPcgUJLiBdqoI+YSnYOKkEDscRWFWQu4gSj4tmxYrvpF+HEaNw/khvcKtn8uIYKTa5Vp/5eMKT04fjthyuToIufX+6IEhZsjcdwKBgQDHru6m0u9Cv3/qDl5W7+oq7KP0I9KwHx690dcABVN+ICiXH0ZfY0QkTGP1ihtR794VqX9fofd+vGqlcl7WNULVh7J0hfYffjNP54yuW9DnM8OwuIPhamFcJST9IpphpGS6AuOaxrElS/BmM4J7IrCNqyt600MbBaV87m7Mear8nwKBgQDKXOE1aSA0rAkqoqsUO1zsLrWavYUDyl+1JPa+yK6bufGId7sFx5yOdtw2gYPj+oJyr/5ny38XIkDj/IORaairiJ9JdnZYXdztftCDNBUxFUfYvR61IUD2fUlFG4I0lURCuUltVN3s/nW2fieOSvfZ8DN3E0TSRWKI4TjyGyShtwKBgAjO+7IaPfm4zuC5T4oQPUk1dSoQ5ntkdAu1lQFoOr2ml4PLGmSc0WW0hPhQ5lGf/jEAcCD82RkbIK05tVtHsDIRMVsYibnr7EGLGlaasEVysCA8k3y/H5pb/Ry5iQvjn5nhBL9QIoJdrjYj8Y6TAizNrzZU2XH4tssjDXoxp8xLAoGARgFG1+rEzvAN+cBcYqBahxte52q6oZIB/haRnVx47O3lqBoKMsE5KQq4N1kiP14Ge+WmEs2MRXe9mZ1PNBFRZS/0+raba3yuz78SjQPo9l4MSxV53bAK73QFzaWicHPSeONcxyq8AXvSebcuIfZWGrmhImRnAtc3LZH/5aVWIrk=";
+    const TEST_DYNAMIC_PUBLIC_MODULUS: &str = "th9O98H3sVMG3ScsyICvSjMT1e6HHotEf0SESTSshDUfSZcpkWtTCbRLh5keYEGlQeVJB2U5bpisRb7eWoTlilUGAovEJrvW29DI3Fhj-5GrKpmqWaiGtHmUF-2seMJNItrJY7kB6yHWaXwcEtmTKcfRqCpby0srgvl7aWqS390X8-aNDwE9CKvUBraChXhRldOPDk01Tfiomp7p9jB8t6qgEvj1zEui3eQ0R6Rm28rxjV17VQuv0MkdJ3-YQmyhXe4uqBGD1M2sVzJGkrwCECeob3B-5pFyfRA3sE3YblVZ3-iMaUV_t8OJj9IcFVzOtjx0oDo8WCaMtRdXNcwR6Q";
+
+    struct TestOnlyDynamicRs256Backend {
+        calls: Arc<AtomicUsize>,
+        signing_inputs: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ExternalRs256SignerBackend for TestOnlyDynamicRs256Backend {
+        fn sign<'a>(
+            &'a self,
+            _: &'a Cx,
+            request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            Box::pin(async move {
+                let signing_input = request.input().with_bytes(|input| input.to_vec());
+                self.signing_inputs
+                    .lock()
+                    .expect("dynamic signer input capture lock")
+                    .push(signing_input.clone());
+                let private_key = base64::engine::general_purpose::STANDARD
+                    .decode(TEST_DYNAMIC_PRIVATE_KEY_PKCS8_B64)
+                    .expect("bounded test-only PKCS#8 fixture");
+                let key_pair = RsaKeyPair::from_pkcs8(&private_key)
+                    .expect("valid test-only external-custody key");
+                let mut signature = vec![0_u8; key_pair.public().modulus_len()];
+                key_pair
+                    .sign(
+                        &RSA_PKCS1_SHA256,
+                        &SystemRandom::new(),
+                        &signing_input,
+                        &mut signature,
+                    )
+                    .expect("real RS256 test signing succeeds");
+                let operation = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+                let receipt = ExternalRs256OperationReceipt::new(
+                    request.binding(),
+                    u64::try_from(operation).expect("bounded test operation count"),
+                    RedactedSignerProvenance::new("oidc-test-external-custody")
+                        .expect("bounded redacted test provenance"),
+                )
+                .expect("valid dynamic test signing receipt");
+                ExternalRs256SignDisposition::Dispatched(
+                    RawRs256Signature::from_bytes(signature)
+                        .expect("real RS256 fixture width is admitted"),
+                    receipt,
+                )
+            })
+        }
+    }
+
+    struct FixedCanaryBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn fixed_canary_disposition(
+        request: ExternalRs256SigningRequest,
+    ) -> ExternalRs256SignDisposition {
+        let (input, signature) = TEST_CANARY_COMPACT_JWS
+            .rsplit_once('.')
+            .expect("retained test canary has signature");
+        assert!(
+            request
+                .input()
+                .with_bytes(|bytes| bytes == input.as_bytes())
+        );
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .expect("retained public canary signature");
+        let receipt = ExternalRs256OperationReceipt::new(
+            request.binding(),
+            1,
+            RedactedSignerProvenance::new("oidc-public-canary-test")
+                .expect("bounded redacted test provenance"),
+        )
+        .expect("valid dispatched-operation receipt");
+        ExternalRs256SignDisposition::Dispatched(
+            RawRs256Signature::from_bytes(signature).expect("retained RS256 signature length"),
+            receipt,
+        )
+    }
+
+    impl ExternalRs256SignerBackend for FixedCanaryBackend {
+        fn sign<'a>(
+            &'a self,
+            _: &'a Cx,
+            request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                fixed_canary_disposition(request)
+            })
+        }
+    }
+
+    struct UnexpectedBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    /// Test-only external verifier.  It models an embedding-owned observation
+    /// boundary; production native HTTP tests use a loopback implementation.
+    struct FixedReadBackVerifier {
+        bytes: Vec<u8>,
+        generation: u64,
+        origin: &'static str,
+    }
+
+    impl OidcJwksReadBackVerifier for FixedReadBackVerifier {
+        fn read_back<'a>(
+            &'a self,
+            _: &'a Cx,
+            endpoints: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<JwksEndpointReadBack>, OidcError>> + Send + 'a>>
+        {
+            let bytes = self.bytes.clone();
+            let generation = self.generation;
+            Box::pin(async move {
+                endpoints
+                    .iter()
+                    .map(|uri| {
+                        JwksEndpointReadBack::new(
+                            uri.clone(),
+                            self.origin,
+                            bytes.clone(),
+                            generation,
+                        )
+                        .map_err(|_| {
+                            OidcError::SigningError("test verifier evidence failed".to_string())
+                        })
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    struct MutableReadBackVerifier {
+        evidence: Mutex<(Vec<u8>, u64, &'static str)>,
+    }
+
+    impl MutableReadBackVerifier {
+        fn set(&self, bytes: Vec<u8>, generation: u64) {
+            *self
+                .evidence
+                .lock()
+                .expect("mutable verifier evidence lock") =
+                (bytes, generation, "https://fastmcp.invalid");
+        }
+    }
+
+    impl OidcJwksReadBackVerifier for MutableReadBackVerifier {
+        fn read_back<'a>(
+            &'a self,
+            _: &'a Cx,
+            endpoints: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<JwksEndpointReadBack>, OidcError>> + Send + 'a>>
+        {
+            let (bytes, generation, origin) = self
+                .evidence
+                .lock()
+                .expect("mutable verifier evidence lock")
+                .clone();
+            Box::pin(async move {
+                endpoints
+                    .iter()
+                    .map(|uri| {
+                        JwksEndpointReadBack::new(uri.clone(), origin, bytes.clone(), generation)
+                            .map_err(|_| {
+                                OidcError::SigningError(
+                                    "mutable verifier evidence failed".to_string(),
+                                )
+                            })
+                    })
+                    .collect()
+            })
+        }
+    }
+
+    /// In-repo durable-store contract fixture: two providers can share one
+    /// store across simulated process replacement and exercise CAS fencing.
+    #[derive(Default)]
+    struct TestDurableActivationStore {
+        record: Mutex<Option<OidcSigningActivationStoreRecord>>,
+    }
+
+    impl OidcSigningActivationStore for TestDurableActivationStore {
+        fn load(
+            &self,
+            cx: &Cx,
+            issuer: &str,
+        ) -> Result<Option<OidcSigningActivationStoreRecord>, OidcError> {
+            cx.checkpoint().map_err(|_| {
+                OidcError::SigningError("test activation store cancelled".to_string())
+            })?;
+            Ok(self
+                .record
+                .lock()
+                .map_err(|_| {
+                    OidcError::SigningError("test activation store unavailable".to_string())
+                })?
+                .clone()
+                .filter(|record| record.issuer() == issuer))
+        }
+
+        fn compare_and_set(
+            &self,
+            cx: &Cx,
+            expected_generation: Option<u64>,
+            next: OidcSigningActivationStoreRecord,
+        ) -> Result<OidcSigningActivationStoreRecord, OidcError> {
+            cx.checkpoint().map_err(|_| {
+                OidcError::SigningError("test activation store cancelled".to_string())
+            })?;
+            let mut record = self.record.lock().map_err(|_| {
+                OidcError::SigningError("test activation store unavailable".to_string())
+            })?;
+            if record
+                .as_ref()
+                .map(OidcSigningActivationStoreRecord::activation_generation)
+                != expected_generation
+            {
+                return Err(OidcError::SigningError(
+                    "test activation CAS lost".to_string(),
+                ));
+            }
+            *record = Some(next.clone());
+            Ok(next)
+        }
+    }
+
+    impl ExternalRs256SignerBackend for UnexpectedBackend {
+        fn sign<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                panic!("a rejected OIDC issuance must not dispatch external signing")
+            })
+        }
+    }
+
+    struct CancellationAfterDispatchBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExternalRs256SignerBackend for CancellationAfterDispatchBackend {
+        fn sign<'a>(
+            &'a self,
+            cx: &'a Cx,
+            request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                cx.set_cancel_requested(true);
+                let receipt = ExternalRs256OperationReceipt::new(
+                    request.binding(),
+                    1,
+                    RedactedSignerProvenance::new("oidc-cancellation-test")
+                        .expect("bounded redacted test provenance"),
+                )
+                .expect("valid dispatched-operation receipt");
+                // This is intentionally not a signature: cancellation must
+                // consume the dispatched attempt before any JWS can exist.
+                ExternalRs256SignDisposition::Dispatched(
+                    RawRs256Signature::from_bytes(vec![0_u8; 256])
+                        .expect("bounded cancellation-path bytes"),
+                    receipt,
+                )
+            })
+        }
+    }
+
+    struct CancelIdTokenAfterSigningBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExternalRs256SignerBackend for CancelIdTokenAfterSigningBackend {
+        fn sign<'a>(
+            &'a self,
+            cx: &'a Cx,
+            request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                let is_canary = request.input().with_bytes(|input| {
+                    TEST_CANARY_COMPACT_JWS
+                        .rsplit_once('.')
+                        .is_some_and(|(canary_input, _)| input == canary_input.as_bytes())
+                });
+                if is_canary {
+                    return fixed_canary_disposition(request);
+                }
+                cx.set_cancel_requested(true);
+                let receipt = ExternalRs256OperationReceipt::new(
+                    request.binding(),
+                    2,
+                    RedactedSignerProvenance::new("oidc-id-token-cancel-test")
+                        .expect("bounded redacted test provenance"),
+                )
+                .expect("valid dispatched-operation receipt");
+                ExternalRs256SignDisposition::Dispatched(
+                    RawRs256Signature::from_bytes(vec![0_u8; 256])
+                        .expect("bounded cancellation-path bytes"),
+                    receipt,
+                )
+            })
+        }
+    }
+
+    fn test_signer_with_binding(
+        backend: Arc<dyn ExternalRs256SignerBackend>,
+        binding: Rs256SigningBinding,
+    ) -> Arc<ExternalRs256Signer> {
+        test_signer_with_kid_and_binding(backend, "fixed-rs256", binding)
+    }
+
+    fn test_signer_with_kid_and_binding(
+        backend: Arc<dyn ExternalRs256SignerBackend>,
+        kid: &str,
+        binding: Rs256SigningBinding,
+    ) -> Arc<ExternalRs256Signer> {
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(TEST_PUBLIC_MODULUS)
+            .expect("retained public verification modulus");
+        let key = AttestedRs256PublicKey::admit(
+            kid,
+            modulus,
+            binding,
+            RedactedSignerProvenance::new("oidc-test-adapter")
+                .expect("bounded redacted test provenance"),
+        )
+        .expect("retained public verification key admits");
+        Arc::new(ExternalRs256Signer::new(backend, key))
+    }
+
+    fn test_signer(backend: Arc<dyn ExternalRs256SignerBackend>) -> Arc<ExternalRs256Signer> {
+        let binding =
+            Rs256SigningBinding::new(11, 12, 13, 14).expect("nonzero external signer generations");
+        test_signer_with_binding(backend, binding)
+    }
+
+    fn dynamic_test_signer(
+        backend: Arc<dyn ExternalRs256SignerBackend>,
+    ) -> Arc<ExternalRs256Signer> {
+        dynamic_test_signer_with_kid(
+            backend,
+            "dynamic-external-rs256",
+            Rs256SigningBinding::new(21, 22, 23, 24).expect("nonzero dynamic signer generations"),
+        )
+    }
+
+    fn dynamic_test_signer_with_kid(
+        backend: Arc<dyn ExternalRs256SignerBackend>,
+        kid: &str,
+        binding: Rs256SigningBinding,
+    ) -> Arc<ExternalRs256Signer> {
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(TEST_DYNAMIC_PUBLIC_MODULUS)
+            .expect("test-only external-custody public modulus");
+        let key = AttestedRs256PublicKey::admit(
+            kid,
+            modulus,
+            binding,
+            RedactedSignerProvenance::new("oidc-dynamic-test-adapter")
+                .expect("bounded redacted test provenance"),
+        )
+        .expect("test-only external-custody key admits");
+        Arc::new(ExternalRs256Signer::new(backend, key))
+    }
+
+    fn issue_access_token(scopes: &[&str]) -> (Arc<OAuthServer>, crate::oauth::TokenResponse) {
+        let oauth = Arc::new(OAuthServer::with_defaults());
         oauth
+            .register_client(
+                OAuthClient::builder(TEST_CLIENT_ID)
+                    .redirect_uri(TEST_REDIRECT_URI)
+                    .scopes(scopes.iter().copied())
+                    .build()
+                    .expect("valid test client"),
+            )
+            .expect("register test client");
+        let (code, _) = oauth
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: TEST_CLIENT_ID.to_string(),
+                redirect_uri: TEST_REDIRECT_URI.to_string(),
+                scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+                resource: None,
+                state: Some("oidc-test-state".to_string()),
+                code_challenge: TEST_CODE_CHALLENGE.to_string(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
+            .expect("authorize test access token");
+        let response = oauth
             .token(&TokenRequest {
                 grant_type: "authorization_code".to_string(),
                 code: Some(code),
                 redirect_uri: Some(TEST_REDIRECT_URI.to_string()),
                 client_id: TEST_CLIENT_ID.to_string(),
                 client_secret: None,
+                client_authentication_method: crate::oauth::TokenEndpointAuthMethod::None,
                 code_verifier: Some(TEST_CODE_VERIFIER.to_string()),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
-            .expect("exchange token")
-            .access_token
+            .expect("exchange test access token");
+        (oauth, response)
     }
 
     #[test]
-    fn test_user_claims_builder() {
-        let claims = UserClaims::new("user123")
-            .with_name("John Doe")
-            .with_email("john@example.com")
-            .with_email_verified(true)
-            .with_preferred_username("johnd");
-
-        assert_eq!(claims.sub, "user123");
-        assert_eq!(claims.name, Some("John Doe".to_string()));
-        assert_eq!(claims.email, Some("john@example.com".to_string()));
-        assert_eq!(claims.email_verified, Some(true));
-        assert_eq!(claims.preferred_username, Some("johnd".to_string()));
-    }
-
-    #[test]
-    fn test_claims_filter_by_scopes() {
-        let claims = UserClaims::new("user123")
-            .with_name("John Doe")
-            .with_email("john@example.com")
-            .with_phone_number("+1234567890");
-
-        // Only openid scope - just sub
-        let filtered = claims.filter_by_scopes(&["openid".to_string()]);
-        assert_eq!(filtered.sub, "user123");
-        assert!(filtered.name.is_none());
-        assert!(filtered.email.is_none());
-
-        // Profile scope
-        let filtered = claims.filter_by_scopes(&["openid".to_string(), "profile".to_string()]);
-        assert_eq!(filtered.name, Some("John Doe".to_string()));
-        assert!(filtered.email.is_none());
-
-        // Email scope
-        let filtered = claims.filter_by_scopes(&["openid".to_string(), "email".to_string()]);
-        assert!(filtered.name.is_none());
-        assert_eq!(filtered.email, Some("john@example.com".to_string()));
-
-        // All scopes
-        let filtered = claims.filter_by_scopes(&[
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-            "phone".to_string(),
-        ]);
-        assert_eq!(filtered.name, Some("John Doe".to_string()));
-        assert_eq!(filtered.email, Some("john@example.com".to_string()));
-        assert_eq!(filtered.phone_number, Some("+1234567890".to_string()));
-    }
-
-    #[test]
-    fn test_discovery_document() {
-        let provider = create_test_provider();
-        let doc = provider.discovery_document("https://example.com");
-
-        assert_eq!(doc.issuer, "fastmcp");
-        assert_eq!(doc.authorization_endpoint, "https://example.com/authorize");
-        assert_eq!(doc.token_endpoint, "https://example.com/token");
-        assert!(doc.jwks_uri.is_none(), "HS256 must not publish jwks_uri");
-        assert!(doc.scopes_supported.contains(&"openid".to_string()));
-        assert!(doc.response_types_supported.contains(&"code".to_string()));
-    }
-
-    #[test]
-    #[cfg(not(feature = "jwt"))]
-    fn test_rs256_requires_jwt_feature() {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        let mut config = OidcProviderConfig::default();
-        config.signing_algorithm = SigningAlgorithm::RS256;
-        config.key_id = Some("test-kid".to_string());
-        config.rsa_private_key_pem = Some(b"dummy".to_vec());
-        config.jwks = Some(serde_json::json!({
-            "keys": [{
-                "kty": "RSA",
-                "kid": "test-kid",
-                "n": "x",
-                "e": "AQAB"
-            }]
+    fn durable_key_expiry_record_is_publicly_constructible_and_bounded() {
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::new(AtomicUsize::new(0)),
         }));
+        let watermark = OidcSigningKeyExpiry::new(
+            99,
+            signer
+                .canonical_public_jwks()
+                .expect("canonical public identity")
+                .as_bytes()
+                .to_vec(),
+        )
+        .expect("bounded public watermark");
+        let record = OidcSigningActivationStoreRecord::new(
+            "https://fastmcp.invalid/",
+            1,
+            1,
+            OidcSigningActivationStatus::Active,
+            99,
+            BTreeMap::from([("fixed-rs256".to_string(), watermark.clone())]),
+        )
+        .expect("embedding-owned durable store can reconstruct a record");
+        assert_eq!(
+            record
+                .key_id_maximum_id_token_expires_at()
+                .get("fixed-rs256")
+                .map(OidcSigningKeyExpiry::expires_at),
+            Some(99),
+        );
 
-        let res = OidcProvider::new(oauth, config);
+        let too_many = (0..=fastmcp_protocol::jose::MAX_JWKS_KEYS)
+            .map(|index| (format!("key-{index}"), watermark.clone()))
+            .collect();
         assert!(
-            res.is_err(),
-            "expected RS256 to be rejected without jwt feature"
+            OidcSigningActivationStoreRecord::new(
+                "https://fastmcp.invalid/",
+                1,
+                1,
+                OidcSigningActivationStatus::Active,
+                99,
+                too_many,
+            )
+            .is_err()
         );
     }
 
-    #[test]
-    #[cfg(feature = "jwt")]
-    fn test_rs256_rejects_invalid_pem() {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        let mut config = OidcProviderConfig::default();
-        config.signing_algorithm = SigningAlgorithm::RS256;
-        config.key_id = Some("test-kid".to_string());
-        config.rsa_private_key_pem = Some(b"not a pem".to_vec());
-        config.jwks = Some(serde_json::json!({
-            "keys": [{
-                "kty": "RSA",
-                "kid": "test-kid",
-                "n": "x",
-                "e": "AQAB"
-            }]
-        }));
-
-        let res = OidcProvider::new(oauth, config);
-        assert!(res.is_err(), "expected invalid PEM to be rejected");
+    fn provider_with_published_jwks(
+        oauth: Arc<OAuthServer>,
+        signer: Arc<ExternalRs256Signer>,
+    ) -> OidcProvider {
+        provider_with_published_jwks_observed_generation(oauth, signer, None)
     }
 
-    #[test]
-    fn test_in_memory_claims_provider() {
-        let provider = InMemoryClaimsProvider::new();
-
-        let claims = UserClaims::new("user123")
-            .with_name("John Doe")
-            .with_email("john@example.com");
-
-        provider.set_claims(claims);
-
-        let retrieved = provider.get_claims("user123");
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().name, Some("John Doe".to_string()));
-
-        assert!(provider.get_claims("nonexistent").is_none());
-
-        provider.remove_claims("user123");
-        assert!(provider.get_claims("user123").is_none());
+    fn provider_with_published_jwks_observed_generation(
+        oauth: Arc<OAuthServer>,
+        signer: Arc<ExternalRs256Signer>,
+        observed_generation: Option<u64>,
+    ) -> OidcProvider {
+        let signer_ring_generation = signer.binding().ring_generation();
+        let key_ring = Rs256PublicKeyRing::new(signer, Vec::new(), signer_ring_generation)
+            .expect("single signer test key ring");
+        provider_with_published_key_ring_observed_generation(oauth, key_ring, observed_generation)
     }
 
-    #[test]
-    fn test_fn_claims_provider() {
-        let provider = FnClaimsProvider::new(|subject| {
-            if subject == "user123" {
-                Some(UserClaims::new(subject).with_name("John Doe"))
-            } else {
-                None
-            }
-        });
-
-        let claims = provider.get_claims("user123");
-        assert!(claims.is_some());
-        assert_eq!(claims.unwrap().name, Some("John Doe".to_string()));
-
-        assert!(provider.get_claims("other").is_none());
-    }
-
-    #[test]
-    fn test_signing_algorithm() {
-        assert_eq!(SigningAlgorithm::HS256.as_str(), "HS256");
-        assert_eq!(SigningAlgorithm::RS256.as_str(), "RS256");
-    }
-
-    #[test]
-    fn test_oidc_error_display() {
-        let err = OidcError::MissingOpenIdScope;
-        assert_eq!(err.to_string(), "missing 'openid' scope");
-
-        let err = OidcError::ClaimsNotFound("user123".to_string());
-        assert!(err.to_string().contains("user123"));
-    }
-
-    #[test]
-    fn test_base64url_encode() {
-        assert_eq!(base64url_encode(b""), "");
-        assert_eq!(base64url_encode(b"f"), "Zg");
-        assert_eq!(base64url_encode(b"fo"), "Zm8");
-        assert_eq!(base64url_encode(b"foo"), "Zm9v");
-    }
-
-    #[test]
-    fn test_id_token_issuance() {
-        let provider = create_test_provider();
-
-        // Set up claims provider
-        let claims_provider = InMemoryClaimsProvider::new();
-        claims_provider.set_claims(
-            UserClaims::new("user123")
-                .with_name("John Doe")
-                .with_email("john@example.com"),
-        );
-        provider.set_claims_provider(claims_provider);
-
-        // Set signing key
-        provider.set_hmac_key(b"test-secret-key");
-
-        let oauth_at = provider
-            .oauth()
-            .validate_access_token(&issue_token_via_auth_code(
-                provider.oauth().as_ref(),
-                &["openid", "profile", "email"],
-                "user123",
-            ))
-            .expect("valid access token");
-
-        let result = provider.issue_id_token(&oauth_at, Some("nonce123"));
-        let issued = result.expect("issue id token");
-        assert!(!issued.raw.is_empty());
-        assert!(issued.raw.contains('.'));
-        assert_eq!(issued.claims.sub, "user123");
-        assert_eq!(issued.claims.aud, TEST_CLIENT_ID);
-        assert_eq!(issued.claims.nonce, Some("nonce123".to_string()));
-        assert_eq!(issued.claims.user_claims.name, Some("John Doe".to_string()));
-    }
-
-    #[test]
-    fn test_id_token_requires_openid_scope() {
-        let provider = create_test_provider();
-        let oauth_at = provider
-            .oauth()
-            .validate_access_token(&issue_token_via_auth_code(
-                provider.oauth().as_ref(),
-                &["profile"],
-                "user123",
-            ))
-            .expect("valid access token");
-
-        let result = provider.issue_id_token(&oauth_at, None);
-        assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
-    }
-
-    #[test]
-    fn test_userinfo() {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-
-        let provider = OidcProvider::with_defaults(oauth).expect("create provider");
-
-        // Set up claims
-        let claims_store = InMemoryClaimsProvider::new();
-        claims_store.set_claims(UserClaims::new("user123").with_name("John Doe"));
-        provider.set_claims_provider(claims_store);
-
-        let result = provider.userinfo(&issue_token_via_auth_code(
-            provider.oauth().as_ref(),
-            &["openid", "profile"],
-            "user123",
-        ));
-        assert!(result.is_ok());
-
-        let claims = result.unwrap();
-        assert_eq!(claims.sub, "user123");
-        assert_eq!(claims.name, Some("John Doe".to_string()));
-    }
-
-    #[test]
-    fn test_address_claim() {
-        let address = AddressClaim {
-            formatted: Some("123 Main St, City, ST 12345".to_string()),
-            street_address: Some("123 Main St".to_string()),
-            locality: Some("City".to_string()),
-            region: Some("ST".to_string()),
-            postal_code: Some("12345".to_string()),
-            country: Some("US".to_string()),
-        };
-
-        let json = serde_json::to_string(&address).unwrap();
-        assert!(json.contains("formatted"));
-        assert!(json.contains("street_address"));
-    }
-
-    #[test]
-    fn test_custom_claims() {
-        let claims = UserClaims::new("user123")
-            .with_custom("custom_field", serde_json::json!("custom_value"))
-            .with_custom("roles", serde_json::json!(["admin", "user"]));
-
-        assert_eq!(
-            claims.custom.get("custom_field"),
-            Some(&serde_json::json!("custom_value"))
-        );
-        assert_eq!(
-            claims.custom.get("roles"),
-            Some(&serde_json::json!(["admin", "user"]))
-        );
-    }
-
-    // ── OidcProviderConfig ─────────────────────────────────────────
-
-    #[test]
-    fn config_default_values() {
-        let cfg = OidcProviderConfig::default();
-        assert_eq!(cfg.issuer, "fastmcp");
-        assert_eq!(cfg.id_token_lifetime, Duration::from_secs(3600));
-        assert_eq!(cfg.signing_algorithm, SigningAlgorithm::HS256);
-        assert!(cfg.key_id.is_none());
-        assert!(cfg.rsa_private_key_pem.is_none());
-        assert!(cfg.jwks.is_none());
-        assert!(cfg.supported_claims.contains(&"sub".to_string()));
-        assert!(cfg.supported_claims.contains(&"email".to_string()));
-        assert!(cfg.supported_scopes.contains(&"openid".to_string()));
-        assert!(cfg.supported_scopes.contains(&"profile".to_string()));
-    }
-
-    #[test]
-    fn config_debug() {
-        let cfg = OidcProviderConfig::default();
-        let debug = format!("{:?}", cfg);
-        assert!(debug.contains("fastmcp"));
-        assert!(debug.contains("HS256"));
-    }
-
-    #[test]
-    fn config_clone() {
-        let cfg = OidcProviderConfig::default();
-        let cloned = cfg.clone();
-        assert_eq!(cloned.issuer, cfg.issuer);
-        assert_eq!(cloned.signing_algorithm, cfg.signing_algorithm);
-    }
-
-    // ── SigningAlgorithm ───────────────────────────────────────────
-
-    #[test]
-    fn signing_algorithm_copy() {
-        let alg = SigningAlgorithm::HS256;
-        let copied = alg;
-        assert_eq!(alg, copied);
-    }
-
-    #[test]
-    fn signing_algorithm_eq() {
-        assert_eq!(SigningAlgorithm::HS256, SigningAlgorithm::HS256);
-        assert_eq!(SigningAlgorithm::RS256, SigningAlgorithm::RS256);
-        assert_ne!(SigningAlgorithm::HS256, SigningAlgorithm::RS256);
-    }
-
-    #[test]
-    fn signing_algorithm_debug() {
-        let debug = format!("{:?}", SigningAlgorithm::RS256);
-        assert!(debug.contains("RS256"));
-    }
-
-    #[test]
-    fn signing_algorithm_clone() {
-        let alg = SigningAlgorithm::RS256;
-        let cloned = alg.clone();
-        assert_eq!(alg, cloned);
-    }
-
-    // ── UserClaims additional builders ─────────────────────────────
-
-    #[test]
-    fn user_claims_with_given_name() {
-        let claims = UserClaims::new("u").with_given_name("Jane");
-        assert_eq!(claims.given_name, Some("Jane".to_string()));
-    }
-
-    #[test]
-    fn user_claims_with_family_name() {
-        let claims = UserClaims::new("u").with_family_name("Smith");
-        assert_eq!(claims.family_name, Some("Smith".to_string()));
-    }
-
-    #[test]
-    fn user_claims_with_phone_number() {
-        let claims = UserClaims::new("u").with_phone_number("+15551234567");
-        assert_eq!(claims.phone_number, Some("+15551234567".to_string()));
-    }
-
-    #[test]
-    fn user_claims_with_updated_at() {
-        let claims = UserClaims::new("u").with_updated_at(1700000000);
-        assert_eq!(claims.updated_at, Some(1700000000));
-    }
-
-    #[test]
-    fn user_claims_with_picture() {
-        let claims = UserClaims::new("u").with_picture("https://example.com/pic.jpg");
-        assert_eq!(
-            claims.picture,
-            Some("https://example.com/pic.jpg".to_string())
-        );
-    }
-
-    #[test]
-    fn user_claims_debug() {
-        let claims = UserClaims::new("dbg-user");
-        let debug = format!("{:?}", claims);
-        assert!(debug.contains("dbg-user"));
-    }
-
-    #[test]
-    fn user_claims_clone() {
-        let claims = UserClaims::new("u1").with_name("Alice");
-        let cloned = claims.clone();
-        assert_eq!(cloned.sub, "u1");
-        assert_eq!(cloned.name, Some("Alice".to_string()));
-    }
-
-    #[test]
-    fn user_claims_default() {
-        let claims = UserClaims::default();
-        assert_eq!(claims.sub, "");
-        assert!(claims.name.is_none());
-        assert!(claims.email.is_none());
-        assert!(claims.custom.is_empty());
-    }
-
-    #[test]
-    fn user_claims_serde_roundtrip() {
-        let claims = UserClaims::new("serde-user")
-            .with_name("Test")
-            .with_email("test@example.com")
-            .with_email_verified(true)
-            .with_given_name("T")
-            .with_family_name("Est")
-            .with_phone_number("+1")
-            .with_updated_at(123)
-            .with_picture("http://pic")
-            .with_preferred_username("tester")
-            .with_custom("role", serde_json::json!("admin"));
-
-        let json = serde_json::to_string(&claims).unwrap();
-        let deserialized: UserClaims = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.sub, "serde-user");
-        assert_eq!(deserialized.name, Some("Test".to_string()));
-        assert_eq!(deserialized.email, Some("test@example.com".to_string()));
-        assert_eq!(deserialized.email_verified, Some(true));
-        assert_eq!(deserialized.given_name, Some("T".to_string()));
-        assert_eq!(deserialized.family_name, Some("Est".to_string()));
-        assert_eq!(deserialized.phone_number, Some("+1".to_string()));
-        assert_eq!(deserialized.updated_at, Some(123));
-        assert_eq!(deserialized.picture, Some("http://pic".to_string()));
-        assert_eq!(deserialized.preferred_username, Some("tester".to_string()));
-        assert_eq!(
-            deserialized.custom.get("role"),
-            Some(&serde_json::json!("admin"))
-        );
-    }
-
-    #[test]
-    fn user_claims_serde_skip_nones() {
-        let claims = UserClaims::new("minimal");
-        let json = serde_json::to_string(&claims).unwrap();
-        // None fields should be skipped
-        assert!(!json.contains("name"));
-        assert!(!json.contains("email"));
-        assert!(!json.contains("phone_number"));
-        assert!(json.contains("sub"));
-    }
-
-    #[test]
-    fn filter_by_scopes_address() {
-        let address = AddressClaim {
-            formatted: Some("123 Main St".to_string()),
-            ..Default::default()
-        };
-        let claims = UserClaims {
-            sub: "u1".to_string(),
-            address: Some(address),
-            name: Some("Name".to_string()),
-            ..Default::default()
-        };
-
-        // Only address scope
-        let filtered = claims.filter_by_scopes(&["address".to_string()]);
-        assert!(filtered.address.is_some());
-        assert!(filtered.name.is_none());
-
-        // Without address scope
-        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
-        assert!(filtered.address.is_none());
-        assert!(filtered.name.is_some());
-    }
-
-    #[test]
-    fn filter_by_scopes_phone_verified() {
-        let claims = UserClaims {
-            sub: "u1".to_string(),
-            phone_number: Some("+1".to_string()),
-            phone_number_verified: Some(true),
-            ..Default::default()
-        };
-
-        let filtered = claims.filter_by_scopes(&["phone".to_string()]);
-        assert_eq!(filtered.phone_number, Some("+1".to_string()));
-        assert_eq!(filtered.phone_number_verified, Some(true));
-
-        let filtered = claims.filter_by_scopes(&["email".to_string()]);
-        assert!(filtered.phone_number.is_none());
-        assert!(filtered.phone_number_verified.is_none());
-    }
-
-    // ── AddressClaim ───────────────────────────────────────────────
-
-    #[test]
-    fn address_claim_default() {
-        let addr = AddressClaim::default();
-        assert!(addr.formatted.is_none());
-        assert!(addr.street_address.is_none());
-        assert!(addr.locality.is_none());
-        assert!(addr.region.is_none());
-        assert!(addr.postal_code.is_none());
-        assert!(addr.country.is_none());
-    }
-
-    #[test]
-    fn address_claim_debug() {
-        let addr = AddressClaim {
-            country: Some("US".to_string()),
-            ..Default::default()
-        };
-        let debug = format!("{:?}", addr);
-        assert!(debug.contains("US"));
-    }
-
-    #[test]
-    fn address_claim_clone() {
-        let addr = AddressClaim {
-            locality: Some("NYC".to_string()),
-            ..Default::default()
-        };
-        let cloned = addr.clone();
-        assert_eq!(cloned.locality, Some("NYC".to_string()));
-    }
-
-    #[test]
-    fn address_claim_serde_roundtrip() {
-        let addr = AddressClaim {
-            formatted: Some("123 Main St, City, ST 12345, US".to_string()),
-            street_address: Some("123 Main St".to_string()),
-            locality: Some("City".to_string()),
-            region: Some("ST".to_string()),
-            postal_code: Some("12345".to_string()),
-            country: Some("US".to_string()),
-        };
-
-        let json = serde_json::to_string(&addr).unwrap();
-        let deserialized: AddressClaim = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.formatted, addr.formatted);
-        assert_eq!(deserialized.country, addr.country);
-    }
-
-    #[test]
-    fn address_claim_serde_skip_nones() {
-        let addr = AddressClaim {
-            country: Some("US".to_string()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&addr).unwrap();
-        assert!(json.contains("country"));
-        assert!(!json.contains("formatted"));
-        assert!(!json.contains("street_address"));
-    }
-
-    // ── IdTokenClaims ──────────────────────────────────────────────
-
-    #[test]
-    fn id_token_claims_debug() {
-        let claims = IdTokenClaims {
-            iss: "iss".to_string(),
-            sub: "sub".to_string(),
-            aud: "aud".to_string(),
-            exp: 999,
-            iat: 100,
-            auth_time: None,
-            nonce: None,
-            acr: None,
-            amr: None,
-            azp: None,
-            at_hash: None,
-            c_hash: None,
-            user_claims: UserClaims::new("sub"),
-        };
-        let debug = format!("{:?}", claims);
-        assert!(debug.contains("iss"));
-        assert!(debug.contains("sub"));
-    }
-
-    #[test]
-    fn id_token_claims_clone() {
-        let claims = IdTokenClaims {
-            iss: "issuer".to_string(),
-            sub: "subject".to_string(),
-            aud: "audience".to_string(),
-            exp: 999,
-            iat: 100,
-            auth_time: Some(100),
-            nonce: Some("n".to_string()),
-            acr: Some("1".to_string()),
-            amr: Some(vec!["pwd".to_string()]),
-            azp: Some("azp".to_string()),
-            at_hash: Some("hash".to_string()),
-            c_hash: Some("chash".to_string()),
-            user_claims: UserClaims::new("subject"),
-        };
-        let cloned = claims.clone();
-        assert_eq!(cloned.iss, "issuer");
-        assert_eq!(cloned.nonce, Some("n".to_string()));
-        assert_eq!(cloned.amr, Some(vec!["pwd".to_string()]));
-    }
-
-    #[test]
-    fn id_token_claims_serialization() {
-        // Note: IdTokenClaims.sub and user_claims.sub overlap due to
-        // #[serde(flatten)], so we test serialization output rather than
-        // a full roundtrip.
-        let claims = IdTokenClaims {
-            iss: "fastmcp".to_string(),
-            sub: "user1".to_string(),
-            aud: "client1".to_string(),
-            exp: 1700001000,
-            iat: 1700000000,
-            auth_time: Some(1700000000),
-            nonce: Some("abc".to_string()),
-            acr: None,
-            amr: None,
-            azp: Some("client1".to_string()),
-            at_hash: Some("h".to_string()),
-            c_hash: None,
-            user_claims: UserClaims::new("user1").with_name("Test"),
-        };
-        let json = serde_json::to_string(&claims).unwrap();
-        assert!(json.contains("\"iss\":\"fastmcp\""));
-        assert!(json.contains("\"aud\":\"client1\""));
-        assert!(json.contains("\"exp\":1700001000"));
-        assert!(json.contains("\"nonce\":\"abc\""));
-        assert!(json.contains("\"name\":\"Test\""));
-    }
-
-    #[test]
-    fn id_token_claims_serde_skip_nones() {
-        let claims = IdTokenClaims {
-            iss: "i".to_string(),
-            sub: "s".to_string(),
-            aud: "a".to_string(),
-            exp: 1,
-            iat: 0,
-            auth_time: None,
-            nonce: None,
-            acr: None,
-            amr: None,
-            azp: None,
-            at_hash: None,
-            c_hash: None,
-            user_claims: UserClaims::new("s"),
-        };
-        let json = serde_json::to_string(&claims).unwrap();
-        assert!(!json.contains("nonce"));
-        assert!(!json.contains("auth_time"));
-        assert!(!json.contains("acr"));
-    }
-
-    // ── IdToken ────────────────────────────────────────────────────
-
-    #[test]
-    fn id_token_debug() {
-        let claims = IdTokenClaims {
-            iss: "i".to_string(),
-            sub: "s".to_string(),
-            aud: "a".to_string(),
-            exp: 1,
-            iat: 0,
-            auth_time: None,
-            nonce: None,
-            acr: None,
-            amr: None,
-            azp: None,
-            at_hash: None,
-            c_hash: None,
-            user_claims: UserClaims::new("s"),
-        };
-        let token = IdToken {
-            raw: "header.payload.sig".to_string(),
-            claims,
-        };
-        let debug = format!("{:?}", token);
-        assert!(debug.contains("header.payload.sig"));
-    }
-
-    #[test]
-    fn id_token_clone() {
-        let claims = IdTokenClaims {
-            iss: "i".to_string(),
-            sub: "s".to_string(),
-            aud: "a".to_string(),
-            exp: 1,
-            iat: 0,
-            auth_time: None,
-            nonce: None,
-            acr: None,
-            amr: None,
-            azp: None,
-            at_hash: None,
-            c_hash: None,
-            user_claims: UserClaims::new("s"),
-        };
-        let token = IdToken {
-            raw: "jwt-token".to_string(),
-            claims,
-        };
-        let cloned = token.clone();
-        assert_eq!(cloned.raw, "jwt-token");
-        assert_eq!(cloned.claims.sub, "s");
-    }
-
-    // ── DiscoveryDocument ──────────────────────────────────────────
-
-    #[test]
-    fn discovery_document_new_defaults() {
-        let doc = DiscoveryDocument::new("https://issuer.example", "https://api.example");
-        assert_eq!(doc.issuer, "https://issuer.example");
-        assert_eq!(doc.authorization_endpoint, "https://api.example/authorize");
-        assert_eq!(doc.token_endpoint, "https://api.example/token");
-        assert_eq!(
-            doc.userinfo_endpoint,
-            Some("https://api.example/userinfo".to_string())
-        );
-        assert_eq!(
-            doc.revocation_endpoint,
-            Some("https://api.example/revoke".to_string())
-        );
-        assert!(doc.jwks_uri.is_none());
-        assert!(doc.registration_endpoint.is_none());
-        assert!(doc.scopes_supported.contains(&"openid".to_string()));
-        assert_eq!(doc.response_types_supported, vec!["code"]);
-        assert_eq!(
-            doc.response_modes_supported,
-            Some(vec!["query".to_string()])
-        );
-        assert!(
-            doc.grant_types_supported
-                .contains(&"authorization_code".to_string())
-        );
-        assert!(
-            doc.grant_types_supported
-                .contains(&"refresh_token".to_string())
-        );
-        assert_eq!(doc.subject_types_supported, vec!["public"]);
-        assert_eq!(doc.id_token_signing_alg_values_supported, vec!["HS256"]);
-        assert!(
-            doc.token_endpoint_auth_methods_supported
-                .contains(&"client_secret_post".to_string())
-        );
-        assert!(doc.claims_supported.is_some());
-        assert!(
-            doc.code_challenge_methods_supported
-                .as_ref()
-                .unwrap()
-                .contains(&"S256".to_string())
-        );
-    }
-
-    #[test]
-    fn discovery_document_debug() {
-        let doc = DiscoveryDocument::new("iss", "http://base");
-        let debug = format!("{:?}", doc);
-        assert!(debug.contains("iss"));
-    }
-
-    #[test]
-    fn discovery_document_clone() {
-        let doc = DiscoveryDocument::new("iss", "http://base");
-        let cloned = doc.clone();
-        assert_eq!(cloned.issuer, "iss");
-        assert_eq!(cloned.token_endpoint, doc.token_endpoint);
-    }
-
-    #[test]
-    fn discovery_document_serde_roundtrip() {
-        let doc = DiscoveryDocument::new("iss", "http://base");
-        let json = serde_json::to_string(&doc).unwrap();
-        let deserialized: DiscoveryDocument = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.issuer, "iss");
-        assert_eq!(deserialized.token_endpoint, "http://base/token");
-        assert_eq!(
-            deserialized.userinfo_endpoint,
-            Some("http://base/userinfo".to_string())
-        );
-    }
-
-    // ── OidcError ──────────────────────────────────────────────────
-
-    #[test]
-    fn oidc_error_oauth_display() {
-        let inner = OAuthError::InvalidClient("bad".to_string());
-        let err = OidcError::OAuth(inner);
-        let msg = err.to_string();
-        assert!(msg.contains("OAuth error"));
-        assert!(msg.contains("bad"));
-    }
-
-    #[test]
-    fn oidc_error_signing_error_display() {
-        let err = OidcError::SigningError("key problem".to_string());
-        assert!(err.to_string().contains("signing error"));
-        assert!(err.to_string().contains("key problem"));
-    }
-
-    #[test]
-    fn oidc_error_invalid_id_token_display() {
-        let err = OidcError::InvalidIdToken("malformed".to_string());
-        assert!(err.to_string().contains("invalid ID token"));
-        assert!(err.to_string().contains("malformed"));
-    }
-
-    #[test]
-    fn oidc_error_debug() {
-        let err = OidcError::MissingOpenIdScope;
-        let debug = format!("{:?}", err);
-        assert!(debug.contains("MissingOpenIdScope"));
-    }
-
-    #[test]
-    fn oidc_error_clone() {
-        let err = OidcError::ClaimsNotFound("u".to_string());
-        let cloned = err.clone();
-        assert!(cloned.to_string().contains('u'));
-    }
-
-    #[test]
-    fn oidc_error_std_error() {
-        let err = OidcError::SigningError("x".to_string());
-        let std_err: &dyn std::error::Error = &err;
-        assert!(std_err.to_string().contains('x'));
-    }
-
-    #[test]
-    fn oidc_error_from_oauth_error() {
-        let oauth_err = OAuthError::InvalidGrant("expired".to_string());
-        let oidc_err: OidcError = oauth_err.into();
-        match &oidc_err {
-            OidcError::OAuth(inner) => {
-                assert!(inner.to_string().contains("expired"));
-            }
-            _ => panic!("expected OAuth variant"),
-        }
-    }
-
-    // ── OidcProvider ───────────────────────────────────────────────
-
-    #[test]
-    fn provider_config_accessor() {
-        let provider = create_test_provider();
-        let cfg = provider.config();
-        assert_eq!(cfg.issuer, "fastmcp");
-        assert_eq!(cfg.signing_algorithm, SigningAlgorithm::HS256);
-    }
-
-    #[test]
-    fn provider_oauth_accessor() {
-        let provider = create_test_provider();
-        let _oauth = provider.oauth();
-        // Just check it returns without panic
-    }
-
-    #[test]
-    fn provider_set_hmac_key() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"my-secret");
-        // Verify it works by issuing a token (the key gets used during signing)
-        let claims_store = InMemoryClaimsProvider::new();
-        claims_store.set_claims(UserClaims::new("user1"));
-        provider.set_claims_provider(claims_store);
-
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "user1");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let result = provider.issue_id_token(&oauth_token, None);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn provider_set_claims_fn() {
-        let provider = create_test_provider();
-        provider.set_claims_fn(|sub| Some(UserClaims::new(sub).with_name("FnUser")));
-        provider.set_hmac_key(b"secret");
-
-        let at =
-            issue_token_via_auth_code(provider.oauth().as_ref(), &["openid", "profile"], "fn-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
-        assert_eq!(id_token.claims.user_claims.name, Some("FnUser".to_string()));
-    }
-
-    #[test]
-    fn provider_jwks_hs256_returns_none() {
-        let provider = create_test_provider();
-        assert!(provider.jwks().is_none());
-    }
-
-    #[test]
-    fn provider_get_id_token_nonexistent() {
-        let provider = create_test_provider();
-        assert!(provider.get_id_token("nonexistent-token").is_none());
-    }
-
-    #[test]
-    fn provider_get_id_token_after_issue() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"key123");
-        let claims_store = InMemoryClaimsProvider::new();
-        claims_store.set_claims(UserClaims::new("cached-user"));
-        provider.set_claims_provider(claims_store);
-
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "cached-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+    fn provider_with_published_key_ring_observed_generation(
+        oauth: Arc<OAuthServer>,
+        key_ring: Rs256PublicKeyRing,
+        observed_generation: Option<u64>,
+    ) -> OidcProvider {
+        let provider = OidcProvider::with_defaults(oauth).expect("OIDC provider");
+        let canonical = key_ring
+            .canonical_public_jwks()
+            .expect("canonical external public JWKS");
         provider
-            .issue_id_token(&oauth_token, Some("nonce1"))
-            .unwrap();
-
-        // Should be retrievable via get_id_token
-        let retrieved = provider.get_id_token(&at);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().claims.sub, "cached-user");
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: canonical.as_bytes().to_vec(),
+                    generation: observed_generation.unwrap_or(key_ring.generation()),
+                    origin: "https://fastmcp.invalid",
+                }),
+                Arc::new(TestDurableActivationStore::default()),
+            )
+            .expect("install external verifier and durable activation store");
+        provider
+            .begin_id_token_signing_key_ring_activation(
+                key_ring,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            )
+            .expect("begin OIDC signer publication");
+        provider
+            .publish_id_token_signing_key_ring_jwks(canonical)
+            .expect("publish exact canonical JWKS");
+        provider
     }
 
-    #[test]
-    fn provider_cleanup_expired() {
-        let provider = create_test_provider();
-        // cleanup_expired should run without panic even with empty cache
-        provider.cleanup_expired();
-    }
-
-    #[test]
-    fn provider_issue_id_token_no_claims_provider() {
-        // Without a claims provider, should use default UserClaims (just sub)
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"key");
-
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "default-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
-        assert_eq!(id_token.claims.sub, "default-user");
-        // No claims provider → default claims (no name, email, etc.)
-        assert!(id_token.claims.user_claims.name.is_none());
-    }
-
-    #[test]
-    fn provider_issue_id_token_claims_not_found() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"key");
-        // Set claims provider that has no user "missing-user"
-        let claims_store = InMemoryClaimsProvider::new();
-        claims_store.set_claims(UserClaims::new("other-user"));
-        provider.set_claims_provider(claims_store);
-
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "missing-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let result = provider.issue_id_token(&oauth_token, None);
-        assert!(matches!(result, Err(OidcError::ClaimsNotFound(_))));
-    }
-
-    #[test]
-    fn provider_discovery_document_overrides_scopes_and_claims() {
-        let mut config = OidcProviderConfig::default();
-        config.supported_scopes = vec!["openid".to_string(), "custom".to_string()];
-        config.supported_claims = vec!["sub".to_string(), "custom_field".to_string()];
-
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        let provider = OidcProvider::new(oauth, config).unwrap();
-        let doc = provider.discovery_document("https://api");
-
-        assert!(doc.scopes_supported.contains(&"custom".to_string()));
-        assert!(!doc.scopes_supported.contains(&"profile".to_string()));
+    fn activate_provider(provider: &OidcProvider) -> Result<(), OidcError> {
         assert!(
-            doc.claims_supported
-                .as_ref()
-                .unwrap()
-                .contains(&"custom_field".to_string())
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .is_ok()
+        );
+        let cx = Cx::for_testing();
+        fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()))
+    }
+
+    fn signing_deadline() -> ExternalRs256SigningDeadline {
+        ExternalRs256SigningDeadline::new(std::time::Duration::from_secs(1))
+            .expect("bounded test deadline")
+    }
+
+    /// FND-01 surface 2, the security half of frozen case 4.
+    ///
+    /// **This is the case that proves the fail-closed security claim.** Its
+    /// ungated sibling, `non_signing_tests::
+    /// issuance_fails_closed_without_external_signer`, proves only that an
+    /// unactivated provider advertises no signing capability; it cannot reach
+    /// this refusal because [`OidcProvider::issue_id_token`] does not exist
+    /// under the crate's default features.
+    ///
+    /// Surface identity, stated explicitly because the feature is part of it:
+    /// package `fastmcp-server`, lib target, module
+    /// `oidc::signer_activation_tests`, cfg
+    /// `all(test, feature = "builtin-auth-server")`. The behaviour under test
+    /// does not exist without that feature, so this case is a different
+    /// surface from its ungated sibling rather than a relocation of it.
+    ///
+    /// What is proved: a provider that has activated no external signer
+    /// refuses to issue an ID token, and refuses *at the signing-activation
+    /// boundary*. The boundary assertion is the point of the case — reaching
+    /// an access-token or claims refusal first would leave the fail-closed
+    /// property unproven while the test still passed green.
+    #[test]
+    fn issuance_without_activation_fails_closed_with_signing_error() {
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        // Deliberately `with_defaults`: no signer is begun, published, or
+        // activated, so the activation slot is empty at issuance time.
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("default provider");
+        let cx = Cx::for_testing();
+
+        let error = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ))
+        .expect_err("issuance must fail closed without an activated external signer");
+
+        // The credential itself is valid and openid-scoped, and a default
+        // provider's claims lookup succeeds, so the only refusal this call can
+        // reach is the signing-activation one. Asserting the exact boundary
+        // keeps the case from passing for an unrelated reason.
+        assert!(
+            matches!(&error, OidcError::SigningError(message) if message.contains("activation")),
+            "expected the signing-activation refusal, saw {error:?}"
         );
     }
 
     #[test]
-    fn provider_issue_id_token_jwt_structure() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"secret");
+    fn forged_revoked_refresh_and_non_openid_credentials_never_dispatch_signing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let refresh = issued
+            .refresh_token
+            .as_deref()
+            .expect("refresh credential")
+            .to_string();
+        let provider = provider_with_published_jwks(Arc::clone(&oauth), signer);
+        let cx = Cx::for_testing();
+        let refresh_result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &refresh,
+            None,
+            signing_deadline(),
+        ));
+        assert!(matches!(
+            refresh_result,
+            Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
+        ));
+        oauth
+            .revoke(
+                &issued.access_token,
+                TEST_CLIENT_ID,
+                None,
+                crate::oauth::TokenEndpointAuthMethod::None,
+            )
+            .expect("revoke owned access credential");
 
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "jwt-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
-
-        // JWT must have 3 parts
-        let parts: Vec<&str> = id_token.raw.split('.').collect();
-        assert_eq!(parts.len(), 3);
-        // Each part is non-empty
-        assert!(!parts[0].is_empty());
-        assert!(!parts[1].is_empty());
-        assert!(!parts[2].is_empty());
-    }
-
-    #[test]
-    fn provider_issue_id_token_auto_generates_key() {
-        // Without set_hmac_key, should auto-generate a key
-        let provider = create_test_provider();
-
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "auto-key-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let result = provider.issue_id_token(&oauth_token, None);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn provider_userinfo_invalid_token() {
-        let provider = create_test_provider();
-        let result = provider.userinfo("invalid-access-token");
-        assert!(matches!(result, Err(OidcError::OAuth(_))));
-    }
-
-    #[test]
-    fn provider_userinfo_without_openid_scope() {
-        let provider = create_test_provider();
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["profile"], "no-openid");
-        let result = provider.userinfo(&at);
-        assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
-    }
-
-    // ── Arc<dyn ClaimsProvider> delegation ──────────────────────────
-
-    #[test]
-    fn arc_claims_provider_delegation() {
-        let inner = InMemoryClaimsProvider::new();
-        inner.set_claims(UserClaims::new("arc-user").with_name("ArcUser"));
-        let arc_provider: Arc<dyn ClaimsProvider> = Arc::new(inner);
-
-        // Arc<dyn ClaimsProvider> should delegate
-        let claims = arc_provider.get_claims("arc-user");
-        assert!(claims.is_some());
-        assert_eq!(claims.unwrap().name, Some("ArcUser".to_string()));
-
-        assert!(arc_provider.get_claims("missing").is_none());
-    }
-
-    // ── InMemoryClaimsProvider ──────────────────────────────────────
-
-    #[test]
-    fn in_memory_claims_provider_debug() {
-        let provider = InMemoryClaimsProvider::new();
-        let debug = format!("{:?}", provider);
-        assert!(debug.contains("InMemoryClaimsProvider"));
-    }
-
-    #[test]
-    fn in_memory_claims_provider_default() {
-        let provider = InMemoryClaimsProvider::default();
-        assert!(provider.get_claims("any").is_none());
-    }
-
-    #[test]
-    fn in_memory_claims_provider_overwrite() {
-        let provider = InMemoryClaimsProvider::new();
-        provider.set_claims(UserClaims::new("u1").with_name("First"));
-        provider.set_claims(UserClaims::new("u1").with_name("Second"));
-        let claims = provider.get_claims("u1").unwrap();
-        assert_eq!(claims.name, Some("Second".to_string()));
-    }
-
-    // ── Helper functions ────────────────────────────────────────────
-
-    #[test]
-    fn simple_sha256_deterministic() {
-        let hash1 = simple_sha256(b"hello world");
-        let hash2 = simple_sha256(b"hello world");
-        assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 32);
-
-        // Different input → different hash
-        let hash3 = simple_sha256(b"different");
-        assert_ne!(hash1, hash3);
-    }
-
-    #[test]
-    fn hmac_sha256_deterministic() {
-        let sig1 = hmac_sha256("message", b"key").unwrap();
-        let sig2 = hmac_sha256("message", b"key").unwrap();
-        assert_eq!(sig1, sig2);
-        assert_eq!(sig1.len(), 32);
-    }
-
-    #[test]
-    fn hmac_sha256_different_keys() {
-        let sig1 = hmac_sha256("msg", b"key1").unwrap();
-        let sig2 = hmac_sha256("msg", b"key2").unwrap();
-        assert_ne!(sig1, sig2);
-    }
-
-    #[test]
-    fn hmac_sha256_different_messages() {
-        let sig1 = hmac_sha256("msg1", b"key").unwrap();
-        let sig2 = hmac_sha256("msg2", b"key").unwrap();
-        assert_ne!(sig1, sig2);
-    }
-
-    #[test]
-    fn generate_random_bytes_length() {
-        let bytes = generate_random_bytes(16).unwrap();
-        assert_eq!(bytes.len(), 16);
-
-        let bytes = generate_random_bytes(64).unwrap();
-        assert_eq!(bytes.len(), 64);
-    }
-
-    #[test]
-    fn generate_random_bytes_unique() {
-        let a = generate_random_bytes(32).unwrap();
-        let b = generate_random_bytes(32).unwrap();
-        // Probabilistically, two random 32-byte sequences should differ
-        assert_ne!(a, b);
-    }
-
-    // ── validate_oidc_config ───────────────────────────────────────
-
-    #[test]
-    fn validate_config_hs256_always_ok() {
-        let config = OidcProviderConfig::default();
-        assert!(validate_oidc_config(&config).is_ok());
-    }
-
-    #[test]
-    #[cfg(not(feature = "jwt"))]
-    fn validate_config_rs256_without_jwt_feature() {
-        let mut config = OidcProviderConfig::default();
-        config.signing_algorithm = SigningAlgorithm::RS256;
-        let result = validate_oidc_config(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("jwt"));
-    }
-
-    // ── SigningKey ──────────────────────────────────────────────────
-
-    #[test]
-    fn signing_key_default_is_none() {
-        let key = SigningKey::default();
-        assert!(matches!(key, SigningKey::None));
-    }
-
-    #[test]
-    fn signing_key_clone() {
-        let key = SigningKey::Hmac(vec![1, 2, 3]);
-        let cloned = key.clone();
-        match cloned {
-            SigningKey::Hmac(bytes) => assert_eq!(bytes, vec![1, 2, 3]),
-            SigningKey::None => panic!("expected Hmac"),
+        for credential in ["forged-opaque-credential".to_string(), issued.access_token] {
+            let cx = Cx::for_testing();
+            let result = fastmcp_core::block_on(provider.issue_id_token(
+                &cx,
+                &credential,
+                None,
+                signing_deadline(),
+            ));
+            assert!(matches!(
+                result,
+                Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
+            ));
         }
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&[]);
+        let provider = provider_with_published_jwks(oauth, signer);
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ));
+        assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn userinfo_claims_not_found() {
-        let provider = create_test_provider();
-        // Set a claims provider that only knows about "other-user"
-        let store = InMemoryClaimsProvider::new();
-        store.set_claims(UserClaims::new("other-user"));
-        provider.set_claims_provider(store);
-
-        let at = issue_token_via_auth_code(
-            provider.oauth().as_ref(),
-            &["openid", "profile"],
-            "missing-user",
-        );
-        let result = provider.userinfo(&at);
-        assert!(matches!(result, Err(OidcError::ClaimsNotFound(_))));
-    }
-
-    #[test]
-    fn filter_by_scopes_profile_all_fields() {
-        let claims = UserClaims {
-            sub: "u".to_string(),
-            name: Some("N".to_string()),
-            given_name: Some("G".to_string()),
-            family_name: Some("F".to_string()),
-            middle_name: Some("M".to_string()),
-            nickname: Some("Nick".to_string()),
-            preferred_username: Some("Pref".to_string()),
-            profile: Some("http://profile".to_string()),
-            picture: Some("http://pic".to_string()),
-            website: Some("http://web".to_string()),
-            gender: Some("other".to_string()),
-            birthdate: Some("2000-01-01".to_string()),
-            zoneinfo: Some("UTC".to_string()),
-            locale: Some("en-US".to_string()),
-            updated_at: Some(12345),
-            ..Default::default()
-        };
-
-        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
-        assert_eq!(filtered.name, Some("N".to_string()));
-        assert_eq!(filtered.given_name, Some("G".to_string()));
-        assert_eq!(filtered.family_name, Some("F".to_string()));
-        assert_eq!(filtered.middle_name, Some("M".to_string()));
-        assert_eq!(filtered.nickname, Some("Nick".to_string()));
-        assert_eq!(filtered.preferred_username, Some("Pref".to_string()));
-        assert_eq!(filtered.profile, Some("http://profile".to_string()));
-        assert_eq!(filtered.picture, Some("http://pic".to_string()));
-        assert_eq!(filtered.website, Some("http://web".to_string()));
-        assert_eq!(filtered.gender, Some("other".to_string()));
-        assert_eq!(filtered.birthdate, Some("2000-01-01".to_string()));
-        assert_eq!(filtered.zoneinfo, Some("UTC".to_string()));
-        assert_eq!(filtered.locale, Some("en-US".to_string()));
-        assert_eq!(filtered.updated_at, Some(12345));
-    }
-
-    #[test]
-    fn filter_by_scopes_does_not_include_custom_claims() {
-        let claims = UserClaims::new("u")
-            .with_name("Name")
-            .with_custom("role", serde_json::json!("admin"));
-
-        let filtered = claims.filter_by_scopes(&["profile".to_string()]);
-        assert_eq!(filtered.name, Some("Name".to_string()));
+    fn rh5_one_field_wrong_read_back_origin_cannot_commit_activation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let store = Arc::new(TestDurableActivationStore::default());
+        let provider = OidcProvider::with_defaults(Arc::new(OAuthServer::with_defaults()))
+            .expect("OIDC provider");
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical external public JWKS");
+        provider
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: canonical.as_bytes().to_vec(),
+                    generation: signer.binding().ring_generation(),
+                    // Only this receipt field differs from the configured
+                    // endpoint: the verifier attests a sibling origin.
+                    origin: "https://fastmcp.invalid.evil",
+                }),
+                store.clone(),
+            )
+            .expect("install test verifier and durable store");
+        provider
+            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("begin pending activation");
+        provider
+            .publish_id_token_signing_jwks(canonical)
+            .expect("publish exact canonical JWKS");
+        assert!(matches!(
+            fastmcp_core::block_on(
+                provider.activate_id_token_signing(&Cx::for_testing(), signing_deadline(),)
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert!(provider.activated_jwks_document().is_err());
         assert!(
-            filtered.custom.is_empty(),
-            "custom claims should not pass through scope filtering"
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("durable store remains readable")
+                .is_none()
         );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn issue_id_token_fields_populated() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"key");
+    fn rh5_no_publish_never_serves_or_activates_a_pending_signer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let provider = OidcProvider::with_defaults(Arc::new(OAuthServer::with_defaults()))
+            .expect("OIDC provider");
+        provider
+            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("begin Pending activation");
 
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "field-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
-        let id_token = provider.issue_id_token(&oauth_token, None).unwrap();
-
-        assert_eq!(id_token.claims.iss, "fastmcp");
-        assert_eq!(id_token.claims.aud, TEST_CLIENT_ID);
-        assert_eq!(id_token.claims.azp, Some(TEST_CLIENT_ID.to_string()));
-        assert!(id_token.claims.at_hash.is_some());
-        assert!(id_token.claims.auth_time.is_some());
-        assert!(id_token.claims.nonce.is_none());
-        assert!(id_token.claims.exp > id_token.claims.iat);
-    }
-
-    #[test]
-    fn base64url_encode_url_safe_characters() {
-        // Bytes 0xFB, 0xFF, 0xFE produce +//+ in standard base64,
-        // but base64url should use - and _ instead.
-        let encoded = base64url_encode(&[0xFB, 0xFF, 0xFE]);
         assert!(
-            !encoded.contains('+') && !encoded.contains('/'),
-            "base64url must not contain + or /: {encoded}"
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .is_err()
+        );
+        assert!(matches!(
+            fastmcp_core::block_on(
+                provider.activate_id_token_signing(&Cx::for_testing(), signing_deadline(),)
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert!(provider.activated_jwks_document().is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rh5_stale_signer_generation_cannot_publish_or_activate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pending_signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let stale_signer = test_signer_with_binding(
+            Arc::new(UnexpectedBackend {
+                calls: Arc::clone(&calls),
+            }),
+            Rs256SigningBinding::new(11, 12, 14, 14).expect("different well-formed key generation"),
+        );
+        let provider = OidcProvider::with_defaults(Arc::new(OAuthServer::with_defaults()))
+            .expect("OIDC provider");
+        provider
+            .begin_id_token_signing_activation(pending_signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("begin pending activation");
+        let stale_canonical = stale_signer
+            .canonical_public_jwks()
+            .expect("stale signer canonical JWKS");
+        assert!(matches!(
+            provider.publish_id_token_signing_jwks(stale_canonical),
+            Err(OidcError::SigningError(_))
+        ));
+        assert!(
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .is_err()
+        );
+        assert!(provider.activated_jwks_document().is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rh5_one_field_stale_read_back_generation_cannot_commit_durable_activation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical public JWKS");
+        let store = Arc::new(TestDurableActivationStore::default());
+        let provider = OidcProvider::with_defaults(Arc::new(OAuthServer::with_defaults()))
+            .expect("OIDC provider");
+        provider
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: canonical.as_bytes().to_vec(),
+                    // This is the only changed receipt field: the advertised
+                    // key-ring generation is 14, while read-back says 12.
+                    generation: 12,
+                    origin: "https://fastmcp.invalid",
+                }),
+                store.clone(),
+            )
+            .expect("install verifier and durable activation store");
+        provider
+            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("begin pending activation");
+        provider
+            .publish_id_token_signing_jwks(canonical)
+            .expect("publish exact public JWKS");
+
+        let cx = Cx::for_testing();
+        assert!(matches!(
+            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline())),
+            Err(OidcError::SigningError(_))
+        ));
+        assert!(provider.activated_jwks_document().is_err());
+        assert!(
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("durable store remains readable")
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn external_read_back_receipt_and_canary_verification_activate_exact_signer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical public JWKS");
+        let provider = provider_with_published_jwks(
+            Arc::new(OAuthServer::with_defaults()),
+            Arc::clone(&signer),
+        );
+
+        assert_eq!(
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .expect("bound public JWKS read-back"),
+            canonical.as_bytes(),
+        );
+        let cx = Cx::for_testing();
+        assert!(
+            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()))
+                .is_ok()
+        );
+        assert_eq!(
+            provider.activated_jwks_document().expect("active JWKS"),
+            canonical.as_bytes()
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn durable_revocation_fences_id_token_before_external_signing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical public JWKS");
+        let store = Arc::new(TestDurableActivationStore::default());
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("OIDC provider");
+        provider
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: canonical.as_bytes().to_vec(),
+                    generation: signer.binding().ring_generation(),
+                    origin: "https://fastmcp.invalid",
+                }),
+                store.clone(),
+            )
+            .expect("install activation dependencies");
+        provider
+            .begin_id_token_signing_activation(signer, "https://fastmcp.invalid/oidc/jwks")
+            .expect("begin pending activation");
+        provider
+            .publish_id_token_signing_jwks(canonical)
+            .expect("publish canonical JWKS");
+        activate_provider(&provider).expect("activate signer before durable revocation");
+        let prior = store
+            .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+            .expect("load active durable record")
+            .expect("active durable record");
+        let revoked = OidcSigningActivationStoreRecord::new(
+            prior.issuer().to_string(),
+            prior.key_ring_generation(),
+            prior
+                .activation_generation()
+                .checked_add(1)
+                .expect("bounded test generation"),
+            OidcSigningActivationStatus::Revoked,
+            prior.maximum_id_token_expires_at(),
+            prior.key_id_maximum_id_token_expires_at().clone(),
+        )
+        .expect("bounded revoked durable record");
+        *store.record.lock().expect("test durable store lock") = Some(revoked);
+
+        let result = fastmcp_core::block_on(provider.issue_id_token(
+            &Cx::for_testing(),
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ));
+        assert!(matches!(result, Err(OidcError::SigningError(_))));
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "only activation canary dispatched"
+        );
+    }
+
+    #[test]
+    fn activated_external_custody_backend_issues_dynamic_verified_id_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let signer =
+            dynamic_test_signer(Arc::clone(&backend) as Arc<dyn ExternalRs256SignerBackend>);
+        let retained = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let key_ring = Rs256PublicKeyRing::new(signer, vec![retained], 24)
+            .expect("dynamic active signer retains one published verification key");
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let expected_subject = oauth
+            .validate_access_token(&issued.access_token)
+            .expect("test access token remains open")
+            .subject
+            .expect("OIDC access token carries a subject");
+        let provider = provider_with_published_key_ring_observed_generation(
+            Arc::clone(&oauth),
+            key_ring,
+            None,
+        );
+        activate_provider(&provider).expect("dynamic external signer activates through read-back");
+
+        let token = fastmcp_core::block_on(provider.issue_id_token(
+            &Cx::for_testing(),
+            &issued.access_token,
+            Some("dynamic-nonce"),
+            signing_deadline(),
+        ))
+        .expect("active externally-custodied signer issues a compact ID token");
+        let public_jwks = provider
+            .activated_jwks_document()
+            .expect("published overlapping JWKS remains active");
+        let read_back_keys =
+            AdmittedRsaJwks::from_json(&public_jwks).expect("published JWKS admits");
+        assert_eq!(
+            read_back_keys.len(),
+            2,
+            "active plus retained public key overlap"
+        );
+        let verified = verify_compact_jws_rs256(&token.raw, &read_back_keys)
+            .expect("dynamic compact ID token verifies against published JWKS");
+        let payload = verified.claims();
+
+        assert_eq!(token.claims.iss, provider.config().issuer);
+        assert_eq!(token.claims.sub, expected_subject);
+        assert_eq!(token.claims.aud, TEST_CLIENT_ID);
+        assert_eq!(
+            payload.get("iss"),
+            Some(&serde_json::json!(token.claims.iss))
+        );
+        assert_eq!(
+            payload.get("sub"),
+            Some(&serde_json::json!(token.claims.sub))
+        );
+        assert_eq!(payload.get("aud"), Some(&serde_json::json!(TEST_CLIENT_ID)));
+        assert_eq!(
+            payload.get("iat"),
+            Some(&serde_json::json!(token.claims.iat))
+        );
+        assert_eq!(
+            payload.get("exp"),
+            Some(&serde_json::json!(token.claims.exp))
+        );
+        assert_eq!(
+            payload.get("nonce"),
+            Some(&serde_json::json!("dynamic-nonce"))
+        );
+        assert!(token.claims.exp > token.claims.iat);
+
+        let signing_input = token
+            .raw
+            .rsplit_once('.')
+            .expect("compact ID token has a signature")
+            .0;
+        let captured_inputs = backend
+            .signing_inputs
+            .lock()
+            .expect("dynamic signer input capture lock");
+        assert_eq!(
+            captured_inputs.len(),
+            2,
+            "one canary plus one ID-token operation"
+        );
+        assert_eq!(captured_inputs[1], signing_input.as_bytes());
+        assert_ne!(captured_inputs[0], captured_inputs[1]);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn active_generation_rotates_through_published_successor_with_public_overlap() {
+        let active_calls = Arc::new(AtomicUsize::new(0));
+        let active = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&active_calls),
+        }));
+        let initial_jwks = active
+            .canonical_public_jwks()
+            .expect("initial canonical JWKS");
+        let verifier = Arc::new(MutableReadBackVerifier {
+            evidence: Mutex::new((
+                initial_jwks.as_bytes().to_vec(),
+                active.binding().ring_generation(),
+                "https://fastmcp.invalid",
+            )),
+        });
+        let provider = OidcProvider::with_defaults(Arc::new(OAuthServer::with_defaults()))
+            .expect("OIDC provider");
+        provider
+            .set_id_token_signing_activation_dependencies(
+                verifier.clone(),
+                Arc::new(TestDurableActivationStore::default()),
+            )
+            .expect("install mutable read-back verifier");
+        provider
+            .begin_id_token_signing_activation(
+                Arc::clone(&active),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("begin initial Pending activation");
+        provider
+            .publish_id_token_signing_jwks(initial_jwks)
+            .expect("publish initial public JWKS");
+        activate_provider(&provider).expect("initial external signer activates");
+
+        let successor_calls = Arc::new(AtomicUsize::new(0));
+        let successor_backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&successor_calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let successor = dynamic_test_signer(
+            Arc::clone(&successor_backend) as Arc<dyn ExternalRs256SignerBackend>
+        );
+        let successor_ring = Rs256PublicKeyRing::new(successor, vec![active], 24)
+            .expect("successor ring retains active verification key");
+        let successor_jwks = successor_ring
+            .canonical_public_jwks()
+            .expect("successor canonical overlapping JWKS");
+        provider
+            .begin_id_token_signing_key_ring_rotation(
+                successor_ring,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            )
+            .expect("Active generation accepts a successor Pending transition");
+        verifier.set(
+            successor_jwks.as_bytes().to_vec(),
+            successor_jwks.generation(),
+        );
+        provider
+            .publish_id_token_signing_key_ring_jwks(successor_jwks)
+            .expect("successor reaches Published with public overlap");
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &provider
+                    .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                    .expect("published successor JWKS"),
+            )
+            .expect("published successor JWKS admits")
+            .len(),
+            2,
+        );
+        activate_provider(&provider).expect("successor becomes Active after external read-back");
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &provider
+                    .activated_jwks_document()
+                    .expect("active successor JWKS"),
+            )
+            .expect("active successor JWKS admits")
+            .len(),
+            2,
+        );
+        assert_eq!(active_calls.load(Ordering::Acquire), 1);
+        assert_eq!(successor_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn rh5_second_rotation_retains_older_live_key_and_carries_durable_expiry() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial_backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&initial_calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let initial = dynamic_test_signer_with_kid(
+            Arc::clone(&initial_backend) as Arc<dyn ExternalRs256SignerBackend>,
+            "dynamic-old",
+            Rs256SigningBinding::new(21, 22, 23, 24).expect("initial dynamic signer generations"),
+        );
+        let initial_jwks = initial
+            .canonical_public_jwks()
+            .expect("initial dynamic JWKS");
+        let verifier = Arc::new(MutableReadBackVerifier {
+            evidence: Mutex::new((
+                initial_jwks.as_bytes().to_vec(),
+                initial.binding().ring_generation(),
+                "https://fastmcp.invalid",
+            )),
+        });
+        let store = Arc::new(TestDurableActivationStore::default());
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("OIDC provider");
+        provider
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
+            .expect("install mutable verifier and durable store");
+        provider
+            .begin_id_token_signing_activation(
+                Arc::clone(&initial),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("begin initial activation");
+        provider
+            .publish_id_token_signing_jwks(initial_jwks)
+            .expect("publish initial dynamic JWKS");
+        activate_provider(&provider).expect("activate initial dynamic signer");
+        let issued_token = fastmcp_core::block_on(provider.issue_id_token(
+            &Cx::for_testing(),
+            &issued.access_token,
+            Some("rotation-live-key"),
+            signing_deadline(),
+        ))
+        .expect("issue token under the oldest key");
+
+        let middle_calls = Arc::new(AtomicUsize::new(0));
+        let middle = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&middle_calls),
+        }));
+        let first_successor =
+            Rs256PublicKeyRing::new(Arc::clone(&middle), vec![Arc::clone(&initial)], 25)
+                .expect("first successor retains the issued-token key");
+        let first_successor_jwks = first_successor
+            .canonical_public_jwks()
+            .expect("first successor JWKS");
+        provider
+            .begin_id_token_signing_key_ring_rotation(
+                first_successor,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            )
+            .expect("first successor begins from Active");
+        verifier.set(
+            first_successor_jwks.as_bytes().to_vec(),
+            first_successor_jwks.generation(),
+        );
+        provider
+            .publish_id_token_signing_key_ring_jwks(first_successor_jwks)
+            .expect("first successor publishes overlap");
+        activate_provider(&provider).expect("first successor activates");
+
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let final_backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&final_calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let final_signer = dynamic_test_signer_with_kid(
+            Arc::clone(&final_backend) as Arc<dyn ExternalRs256SignerBackend>,
+            "dynamic-successor",
+            Rs256SigningBinding::new(31, 32, 33, 34).expect("final dynamic signer generations"),
+        );
+        let drops_oldest =
+            Rs256PublicKeyRing::new(Arc::clone(&final_signer), vec![Arc::clone(&middle)], 26)
+                .expect("well-formed but incomplete second successor");
+        assert!(matches!(
+            provider.begin_id_token_signing_key_ring_rotation(
+                drops_oldest,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert_eq!(final_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &provider
+                    .activated_jwks_document()
+                    .expect("rejected successor leaves active JWKS unchanged"),
+            )
+            .expect("unchanged active JWKS admits")
+            .len(),
+            2,
         );
         assert!(
-            encoded.contains('-') || encoded.contains('_'),
-            "base64url should use URL-safe chars: {encoded}"
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("read unchanged durable record")
+                .expect("active durable record remains present")
+                .maximum_id_token_expires_at()
+                >= issued_token.claims.exp
+        );
+
+        let final_successor = Rs256PublicKeyRing::new(
+            final_signer,
+            vec![Arc::clone(&middle), Arc::clone(&initial)],
+            26,
+        )
+        .expect("second successor retains every still-live key");
+        let final_jwks = final_successor
+            .canonical_public_jwks()
+            .expect("second successor JWKS");
+        provider
+            .begin_id_token_signing_key_ring_rotation(
+                final_successor,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            )
+            .expect("second successor admits only with the oldest key retained");
+        verifier.set(final_jwks.as_bytes().to_vec(), final_jwks.generation());
+        provider
+            .publish_id_token_signing_key_ring_jwks(final_jwks)
+            .expect("second successor publishes all live keys");
+        activate_provider(&provider).expect("second successor activates");
+
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &provider
+                    .activated_jwks_document()
+                    .expect("second successor active JWKS"),
+            )
+            .expect("second successor JWKS admits")
+            .len(),
+            3,
+        );
+        assert!(
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("read durable record")
+                .expect("durable active record")
+                .maximum_id_token_expires_at()
+                >= issued_token.claims.exp
+        );
+        assert_eq!(initial_calls.load(Ordering::Acquire), 2);
+        assert_eq!(middle_calls.load(Ordering::Acquire), 1);
+        assert_eq!(final_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn rh5_restart_rebuilds_durable_live_key_expiry_before_rotation() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let initial_backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&initial_calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let initial = dynamic_test_signer_with_kid(
+            Arc::clone(&initial_backend) as Arc<dyn ExternalRs256SignerBackend>,
+            "restart-live-old",
+            Rs256SigningBinding::new(41, 42, 43, 44).expect("initial generations"),
+        );
+        let initial_jwks = initial
+            .canonical_public_jwks()
+            .expect("initial canonical JWKS");
+        let verifier = Arc::new(MutableReadBackVerifier {
+            evidence: Mutex::new((
+                initial_jwks.as_bytes().to_vec(),
+                initial.binding().ring_generation(),
+                "https://fastmcp.invalid",
+            )),
+        });
+        let store = Arc::new(TestDurableActivationStore::default());
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let first = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("first provider");
+        first
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
+            .expect("first activation dependencies");
+        first
+            .begin_id_token_signing_activation(
+                Arc::clone(&initial),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("begin first activation");
+        first
+            .publish_id_token_signing_jwks(initial_jwks)
+            .expect("publish first JWKS");
+        activate_provider(&first).expect("activate first signer");
+        let token = fastmcp_core::block_on(first.issue_id_token(
+            &Cx::for_testing(),
+            &issued.access_token,
+            Some("restart-live-key"),
+            signing_deadline(),
+        ))
+        .expect("old key signs an ID token before restart");
+        let before_restart = store
+            .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+            .expect("load first durable record")
+            .expect("first durable record");
+        assert_eq!(
+            before_restart
+                .key_id_maximum_id_token_expires_at()
+                .get("restart-live-old")
+                .map(OidcSigningKeyExpiry::expires_at),
+            Some(token.claims.exp),
+        );
+
+        let restarted = OidcProvider::with_defaults(oauth).expect("restarted provider");
+        restarted
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
+            .expect("restart activation dependencies");
+        restarted
+            .begin_id_token_signing_activation(
+                Arc::clone(&initial),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("restart begins Pending rather than restoring memory");
+        restarted
+            .publish_id_token_signing_jwks(
+                initial
+                    .canonical_public_jwks()
+                    .expect("restart canonical JWKS"),
+            )
+            .expect("restart republishes exact JWKS");
+        activate_provider(&restarted).expect("restart read-back rebuilds durable live keys");
+        let after_restart = store
+            .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+            .expect("load restart durable record")
+            .expect("restart durable record");
+        assert_eq!(
+            after_restart
+                .key_id_maximum_id_token_expires_at()
+                .get("restart-live-old")
+                .map(OidcSigningKeyExpiry::expires_at),
+            Some(token.claims.exp),
+        );
+
+        let successor_calls = Arc::new(AtomicUsize::new(0));
+        let successor = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&successor_calls),
+        }));
+        let drops_live_old = Rs256PublicKeyRing::new(Arc::clone(&successor), Vec::new(), 45)
+            .expect("well-formed restart successor with the old live key omitted");
+        assert!(matches!(
+            restarted.begin_id_token_signing_key_ring_rotation(
+                drops_live_old,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert_eq!(successor_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("load durable state after omitted-key rotation"),
+            Some(after_restart.clone()),
+        );
+        let substituted_live_old = test_signer_with_kid_and_binding(
+            Arc::new(FixedCanaryBackend {
+                calls: Arc::clone(&successor_calls),
+            }),
+            "restart-live-old",
+            Rs256SigningBinding::new(51, 52, 53, 54).expect("same-kid substitute generations"),
+        );
+        assert_eq!(substituted_live_old.key_id(), initial.key_id());
+        assert_ne!(
+            substituted_live_old
+                .canonical_public_jwks()
+                .expect("same-kid substitute identity")
+                .as_bytes(),
+            initial
+                .canonical_public_jwks()
+                .expect("durable old-key identity")
+                .as_bytes(),
+        );
+        let substitutes_live_old =
+            Rs256PublicKeyRing::new(Arc::clone(&successor), vec![substituted_live_old], 45)
+                .expect("well-formed successor that changes only old RSA material");
+        assert!(matches!(
+            restarted.begin_id_token_signing_key_ring_rotation(
+                substitutes_live_old,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert_eq!(successor_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &restarted
+                    .activated_jwks_document()
+                    .expect("failed restart rotation leaves active JWKS unchanged"),
+            )
+            .expect("unchanged restart JWKS admits")
+            .len(),
+            1,
+        );
+        assert_eq!(
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("load durable state after rejected rotation"),
+            Some(after_restart.clone()),
+        );
+
+        let retains_live_old = Rs256PublicKeyRing::new(successor, vec![initial], 45)
+            .expect("successor retains restart-live verification key");
+        let successor_jwks = retains_live_old
+            .canonical_public_jwks()
+            .expect("successor overlap JWKS");
+        restarted
+            .begin_id_token_signing_key_ring_rotation(
+                retains_live_old,
+                vec!["https://fastmcp.invalid/oidc/jwks".to_string()],
+            )
+            .expect("durably retained live key admits successor rotation");
+        verifier.set(
+            successor_jwks.as_bytes().to_vec(),
+            successor_jwks.generation(),
+        );
+        restarted
+            .publish_id_token_signing_key_ring_jwks(successor_jwks)
+            .expect("publish restart successor overlap");
+        activate_provider(&restarted).expect("activate restart successor with retained old key");
+        let after_successor = store
+            .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+            .expect("load successor durable record")
+            .expect("successor durable record");
+        assert_eq!(
+            after_successor
+                .key_id_maximum_id_token_expires_at()
+                .get("restart-live-old")
+                .map(OidcSigningKeyExpiry::expires_at),
+            Some(token.claims.exp),
+        );
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                &restarted
+                    .activated_jwks_document()
+                    .expect("restart successor active JWKS"),
+            )
+            .expect("restart successor JWKS admits")
+            .len(),
+            2,
         );
     }
 
     #[test]
-    fn discovery_document_serde_skip_nones() {
-        let mut doc = DiscoveryDocument::new("iss", "http://base");
-        doc.jwks_uri = None;
-        doc.registration_endpoint = None;
-        let json = serde_json::to_string(&doc).unwrap();
-        assert!(!json.contains("jwks_uri"));
-        assert!(!json.contains("registration_endpoint"));
-        // Present optional fields should be in the JSON
-        assert!(json.contains("userinfo_endpoint"));
-        assert!(json.contains("revocation_endpoint"));
+    fn cancellation_after_canary_dispatch_exposes_no_active_signer() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(CancellationAfterDispatchBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let provider = provider_with_published_jwks(Arc::new(OAuthServer::with_defaults()), signer);
+        assert!(
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .is_ok()
+        );
+        let cx = Cx::for_testing();
+
+        let result =
+            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()));
+        assert!(matches!(
+            result,
+            Err(OidcError::ExternalSigning(
+                JwsSigningError::CancelledAfterDispatch(_)
+            ))
+        ));
+        assert!(cx.is_cancel_requested());
+        assert!(provider.activated_jwks_document().is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn issue_id_token_with_nonce_round_trips() {
-        let provider = create_test_provider();
-        provider.set_hmac_key(b"key");
+    fn cancellation_after_id_token_signing_exposes_no_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(CancelIdTokenAfterSigningBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let provider = provider_with_published_jwks(oauth, signer);
+        activate_provider(&provider).expect("canary activation remains valid");
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ));
+        assert!(matches!(
+            result,
+            Err(OidcError::ExternalSigning(
+                JwsSigningError::CancelledAfterDispatch(_)
+            ))
+        ));
+        assert!(cx.is_cancel_requested());
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
 
-        let at = issue_token_via_auth_code(provider.oauth().as_ref(), &["openid"], "nonce-rt-user");
-        let oauth_token = provider.oauth().validate_access_token(&at).unwrap();
+    #[test]
+    fn retirement_refuses_live_tokens_then_closes_issuance_while_retaining_public_jwks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(TestOnlyDynamicRs256Backend {
+            calls: Arc::clone(&calls),
+            signing_inputs: Mutex::new(Vec::new()),
+        });
+        let signer =
+            dynamic_test_signer(Arc::clone(&backend) as Arc<dyn ExternalRs256SignerBackend>);
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let provider = provider_with_published_jwks(oauth, signer);
+        activate_provider(&provider).expect("activate external signer generation");
+        let token = fastmcp_core::block_on(provider.issue_id_token(
+            &Cx::for_testing(),
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ))
+        .expect("issue ID token to establish durable retirement fence");
+        assert!(
+            provider
+                .retire_id_token_signing_generation(&Cx::for_testing(), token.claims.exp - 1)
+                .is_err()
+        );
+        provider
+            .retire_id_token_signing_generation(&Cx::for_testing(), token.claims.exp)
+            .expect("retire only after maximum token expiry");
+        assert!(provider.activated_jwks_document().is_err());
+        assert!(
+            provider
+                .published_jwks_document("https://fastmcp.invalid/oidc/jwks")
+                .is_ok()
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+    }
 
-        // With nonce
-        let with = provider
-            .issue_id_token(&oauth_token, Some("my-nonce"))
-            .unwrap();
-        assert_eq!(with.claims.nonce, Some("my-nonce".to_string()));
+    #[test]
+    fn durable_store_fences_restart_reactivation_without_restoring_active_memory() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(FixedCanaryBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let jwks = signer
+            .canonical_public_jwks()
+            .expect("canonical public JWKS")
+            .as_bytes()
+            .to_vec();
+        let store = Arc::new(TestDurableActivationStore::default());
+        let oauth = Arc::new(OAuthServer::with_defaults());
 
-        // Verify the nonce appears in the raw JWT payload
-        let parts: Vec<&str> = with.raw.split('.').collect();
-        use base64::Engine;
-        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
-        assert_eq!(payload["nonce"], "my-nonce");
+        let first = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("first provider");
+        first
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: jwks.clone(),
+                    generation: signer.binding().ring_generation(),
+                    origin: "https://fastmcp.invalid",
+                }),
+                store.clone(),
+            )
+            .expect("first dependencies");
+        first
+            .begin_id_token_signing_activation(
+                Arc::clone(&signer),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("first pending");
+        first
+            .publish_id_token_signing_jwks(
+                signer
+                    .canonical_public_jwks()
+                    .expect("first canonical JWKS"),
+            )
+            .expect("first publication");
+        fastmcp_core::block_on(
+            first.activate_id_token_signing(&Cx::for_testing(), signing_deadline()),
+        )
+        .expect("first activation");
+
+        let restarted = OidcProvider::with_defaults(oauth).expect("fresh-process provider");
+        assert!(restarted.activated_jwks_document().is_err());
+        restarted
+            .set_id_token_signing_activation_dependencies(
+                Arc::new(FixedReadBackVerifier {
+                    bytes: jwks,
+                    generation: signer.binding().ring_generation(),
+                    origin: "https://fastmcp.invalid",
+                }),
+                store.clone(),
+            )
+            .expect("restart dependencies");
+        restarted
+            .begin_id_token_signing_activation(
+                Arc::clone(&signer),
+                "https://fastmcp.invalid/oidc/jwks",
+            )
+            .expect("restart pending");
+        restarted
+            .publish_id_token_signing_jwks(
+                signer
+                    .canonical_public_jwks()
+                    .expect("restart canonical JWKS"),
+            )
+            .expect("restart publication");
+        fastmcp_core::block_on(
+            restarted.activate_id_token_signing(&Cx::for_testing(), signing_deadline()),
+        )
+        .expect("fresh read-back and CAS are required after restart");
+        assert_eq!(
+            store
+                .load(&Cx::for_testing(), "https://fastmcp.invalid/")
+                .expect("durable store read")
+                .expect("durable activation record")
+                .activation_generation(),
+            2,
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 }

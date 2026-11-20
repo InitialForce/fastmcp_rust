@@ -9,12 +9,12 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example notes_server
+//! cargo run -p fastmcp-rust --example notes_server
 //! ```
 //!
 //! Test with MCP Inspector:
 //! ```bash
-//! npx @anthropic-ai/mcp-inspector cargo run --example notes_server
+//! npx @modelcontextprotocol/inspector cargo run -p fastmcp-rust --example notes_server
 //! ```
 
 #![allow(clippy::needless_pass_by_value)]
@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fastmcp_rust::modern::ServerBuilder;
 use fastmcp_rust::prelude::*;
 
 // ============================================================================
@@ -372,7 +373,7 @@ fn summarize_notes(_ctx: &McpContext, notes_content: String) -> Vec<PromptMessag
 // ============================================================================
 
 fn main() {
-    Server::new("notes-server", "1.0.0")
+    let server = ServerBuilder::new("notes-server", "1.0.0")
         // CRUD operations
         .tool(CreateNote)
         .tool(GetNote)
@@ -397,6 +398,14 @@ fn main() {
              use 'list_notes' to see all, 'search_notes' to find specific content, and \
              'notes_by_tag' to filter by tag. Check 'notes://help' resource for full documentation.",
         )
+        .build();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("stdio reactor"))
+        .blocking_threads(0, 16)
         .build()
-        .run_stdio();
+        .expect("application-owned runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::current().expect("application caller context");
+        server.run_stdio_with_cx(&cx).await;
+    });
 }

@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `fastmcp_rust::client::websocket_experimental`
+ --> tests/trybuild/websocket/client_namespace_escape.rs:1:27
+  |
+1 | use fastmcp_rust::client::websocket_experimental::AsyncWsClientTransport;
+  |                           ^^^^^^^^^^^^^^^^^^^^^^ could not find `websocket_experimental` in `client`

@@ -1,14 +1,16 @@
 //! Test context wrapper for asupersync integration.
 //!
-//! Provides a convenient wrapper around `Cx::for_testing()` with
+//! Provides a convenient wrapper around a FastMCP runtime-provided `Cx` with
 //! helper methods for common test scenarios.
 
-use asupersync::{Budget, Cx};
+use std::time::Duration;
+
+use asupersync::{Budget, Cx, time::wall_now};
 use fastmcp_core::{McpContext, SessionState};
 
 /// Test context wrapper providing convenient testing utilities.
 ///
-/// Wraps `Cx::for_testing()` and provides helper methods for:
+/// Wraps the caller's `Cx` and provides helper methods for:
 /// - Budget/timeout configuration
 /// - Creating `McpContext` instances
 /// - Running async operations with cleanup
@@ -16,11 +18,11 @@ use fastmcp_core::{McpContext, SessionState};
 /// # Example
 ///
 /// ```ignore
-/// let ctx = TestContext::new();
+/// let ctx = TestContext::new(cx.clone());
 /// let mcp_ctx = ctx.mcp_context(1);  // Request ID 1
 ///
 /// // With custom budget
-/// let ctx = TestContext::new().with_budget_secs(30);
+/// let ctx = TestContext::new(cx.clone()).with_budget_secs(30);
 /// ```
 #[derive(Clone)]
 pub struct TestContext {
@@ -41,24 +43,21 @@ impl std::fmt::Debug for TestContext {
     }
 }
 
-impl Default for TestContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TestContext {
-    /// Creates a new test context using `Cx::for_testing()`.
+    /// Creates a test context over the caller's `cx`.
+    ///
+    /// The caller supplies the context: a library helper that built one would
+    /// have to create or enter a runtime of its own (FND-04).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let ctx = TestContext::new();
+    /// let ctx = TestContext::new(cx.clone());
     /// ```
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(cx: Cx) -> Self {
         Self {
-            cx: Cx::for_testing(),
+            cx,
             budget: None,
             session_state: None,
         }
@@ -73,11 +72,11 @@ impl TestContext {
     /// # Example
     ///
     /// ```ignore
-    /// let ctx = TestContext::new().with_budget_secs(5);
+    /// let ctx = TestContext::new(cx.clone()).with_budget_secs(5);
     /// ```
     #[must_use]
     pub fn with_budget_secs(mut self, secs: u64) -> Self {
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::new().with_timeout(wall_now(), Duration::from_secs(secs)));
         self
     }
 
@@ -88,9 +87,7 @@ impl TestContext {
     /// * `ms` - Timeout in milliseconds
     #[must_use]
     pub fn with_budget_ms(mut self, ms: u64) -> Self {
-        // Convert ms to secs (rounded up)
-        let secs = (ms + 999) / 1000;
-        self.budget = Some(Budget::with_deadline_secs(secs));
+        self.budget = Some(Budget::new().with_timeout(wall_now(), Duration::from_millis(ms)));
         self
     }
 
@@ -102,8 +99,8 @@ impl TestContext {
     ///
     /// ```ignore
     /// let state = SessionState::new();
-    /// let ctx1 = TestContext::new().with_session_state(state.clone());
-    /// let ctx2 = TestContext::new().with_session_state(state.clone());
+    /// let ctx1 = TestContext::new(cx.clone()).with_session_state(state.clone());
+    /// let ctx2 = TestContext::new(cx.clone()).with_session_state(state.clone());
     /// // Both contexts share the same session state
     /// ```
     #[must_use]
@@ -139,7 +136,7 @@ impl TestContext {
     /// # Example
     ///
     /// ```ignore
-    /// let ctx = TestContext::new();
+    /// let ctx = TestContext::new(cx.clone());
     /// let mcp_ctx = ctx.mcp_context(1);
     ///
     /// // Use in handler testing
@@ -189,27 +186,27 @@ mod tests {
 
     #[test]
     fn test_context_creation() {
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         assert!(ctx.budget().is_none());
         assert!(!ctx.is_cancelled());
     }
 
     #[test]
     fn test_context_with_budget() {
-        let ctx = TestContext::new().with_budget_secs(10);
+        let ctx = TestContext::new(Cx::for_testing()).with_budget_secs(10);
         assert!(ctx.budget().is_some());
     }
 
     #[test]
     fn test_context_with_session_state() {
         let state = SessionState::new();
-        let ctx = TestContext::new().with_session_state(state);
+        let ctx = TestContext::new(Cx::for_testing()).with_session_state(state);
         assert!(ctx.session_state.is_some());
     }
 
     #[test]
     fn test_mcp_context_creation() {
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         let mcp_ctx = ctx.mcp_context(42);
         assert_eq!(mcp_ctx.request_id(), 42);
     }
@@ -220,14 +217,14 @@ mod tests {
 
         // First context sets a value
         {
-            let ctx = TestContext::new().with_session_state(state.clone());
+            let ctx = TestContext::new(Cx::for_testing()).with_session_state(state.clone());
             let mcp_ctx = ctx.mcp_context(1);
             mcp_ctx.set_state("test_key", "test_value".to_string());
         }
 
         // Second context can read the value
         {
-            let ctx = TestContext::new().with_session_state(state.clone());
+            let ctx = TestContext::new(Cx::for_testing()).with_session_state(state.clone());
             let mcp_ctx = ctx.mcp_context(2);
             let value: Option<String> = mcp_ctx.get_state("test_key");
             assert_eq!(value, Some("test_value".to_string()));
@@ -236,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_not_cancelled() {
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         assert!(ctx.checkpoint().is_ok());
     }
 
@@ -244,18 +241,37 @@ mod tests {
     // Additional coverage tests (bd-1fnm)
     // =========================================================================
 
+    /// Constructing inside a running bridge must not enter a second one. The
+    /// old constructor fetched its context with `block_on`, which panics as a
+    /// nested bridge here.
     #[test]
-    fn default_matches_new() {
-        let def = TestContext::default();
-        let new = TestContext::new();
-        assert!(def.budget().is_none());
-        assert!(new.budget().is_none());
-        assert!(!def.is_cancelled());
+    fn new_inside_an_active_bridge_runs_on_the_callers_cx() {
+        let (ctx, caller) = fastmcp_core::block_on(async {
+            let caller = Cx::current().expect("the bridge installs a current cx");
+            (TestContext::new(caller.clone()), caller)
+        });
+        assert!(!ctx.is_cancelled());
+        caller.set_cancel_requested(true);
+        assert!(
+            ctx.is_cancelled(),
+            "the context holds the caller's cx itself, so the caller's cancel reaches it"
+        );
+    }
+
+    #[test]
+    fn new_with_an_independent_cx_does_not_share_the_callers_cancel() {
+        let caller = Cx::for_testing();
+        let ctx = TestContext::new(Cx::for_testing());
+        caller.set_cancel_requested(true);
+        assert!(
+            !ctx.is_cancelled(),
+            "CONTROL: a different cx is not cancelled by the caller's"
+        );
     }
 
     #[test]
     fn debug_output() {
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         let debug = format!("{ctx:?}");
         assert!(debug.contains("TestContext"));
         assert!(debug.contains("has_budget"));
@@ -264,20 +280,20 @@ mod tests {
 
     #[test]
     fn clone_produces_independent_context() {
-        let ctx = TestContext::new().with_budget_secs(30);
+        let ctx = TestContext::new(Cx::for_testing()).with_budget_secs(30);
         let cloned = ctx.clone();
         assert!(cloned.budget().is_some());
     }
 
     #[test]
     fn with_budget_ms_sets_budget() {
-        let ctx = TestContext::new().with_budget_ms(5000);
+        let ctx = TestContext::new(Cx::for_testing()).with_budget_ms(5000);
         assert!(ctx.budget().is_some());
     }
 
     #[test]
     fn cx_and_cx_clone_accessors() {
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         let _cx_ref = ctx.cx();
         let _cx_owned = ctx.cx_clone();
     }
@@ -285,7 +301,7 @@ mod tests {
     #[test]
     fn mcp_context_with_state_method() {
         let state = SessionState::new();
-        let ctx = TestContext::new();
+        let ctx = TestContext::new(Cx::for_testing());
         let mcp_ctx = ctx.mcp_context_with_state(99, state);
         assert_eq!(mcp_ctx.request_id(), 99);
     }

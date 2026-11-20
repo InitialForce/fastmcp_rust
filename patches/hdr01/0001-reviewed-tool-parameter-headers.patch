@@ -1,0 +1,1016 @@
+diff --git a/crates/fastmcp-client/src/http_executor.rs b/crates/fastmcp-client/src/http_executor.rs
+--- a/crates/fastmcp-client/src/http_executor.rs
++++ b/crates/fastmcp-client/src/http_executor.rs
+@@ -4,4 +4,7 @@
+ //! negotiation, and the public response stream surface. It neither retries an
+ //! MCP request nor follows redirects.
+ 
++/// Explicitly reviewed, resource-bound tool parameter headers.
++pub mod parameter_headers;
++
+ use std::collections::{BTreeMap, HashMap, VecDeque};
+@@ -351,6 +354,8 @@
+     protocol_version: String,
+     method: String,
+     name: Option<String>,
++    name_header: Option<String>,
+     authorization: Option<String>,
++    parameter_headers: Option<Vec<(String, String)>>,
+     include_method_header: bool,
+ }
+@@ -364,4 +369,5 @@
+             .field("method", &self.method)
+             .field("name", &self.name)
+             .field("body_bytes", &self.body.len())
++            .field("parameter_header_count", &self.parameter_headers.as_ref().map_or(0, Vec::len))
+             .field("include_method_header", &self.include_method_header)
+@@ -390,16 +396,35 @@
+         if [target.as_str(), protocol_version.as_str(), method.as_str()]
+             .into_iter()
+-            .chain(name.as_deref())
+             .any(contains_header_control)
++            || name.as_deref().is_some_and(|name| {
++                if protocol_version == fastmcp_protocol::FINAL_PROTOCOL_VERSION {
++                    name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
++                } else {
++                    contains_header_control(name)
++                }
++            })
+         {
+             return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+         }
++        // Preserve the logical name for exact body/header identity checks.
++        // The sentinel convention belongs to final HTTP: legacy construction
++        // retains its existing validation and verbatim header spelling.
++        let name_header = if protocol_version == fastmcp_protocol::FINAL_PROTOCOL_VERSION {
++            name.as_deref()
++                .map(fastmcp_protocol::http_headers::encode_mcp_header_value)
++                .transpose()
++                .map_err(|_| ModernHttpExecutorError::InvalidRequestMetadata)?
++        } else {
++            name.clone()
++        };
+         Ok(Self {
+             target,
+             body,
+             protocol_version,
+             method,
+             name,
++            name_header,
+             authorization: None,
++            parameter_headers: None,
+             include_method_header: true,
+         })
+@@ -434,4 +459,6 @@
+             method: String::new(),
+             name: None,
++            name_header: None,
+             authorization: None,
++            parameter_headers: None,
+             include_method_header: false,
+@@ -475,3 +502,3 @@
+-    /// Builds the fixed, uncoded MCP request headers.
++    /// Builds the admitted MCP request headers, including opted-in mirrors.
+     ///
+     /// `Accept-Encoding` explicitly requests the canonical identity coding;
+@@ -507,7 +534,10 @@
+         if self.include_method_header {
+             headers.push(("Mcp-Method".to_owned(), self.method.clone()));
+         }
+-        if let Some(name) = &self.name {
++        if let Some(name) = &self.name_header {
+             headers.push(("Mcp-Name".to_owned(), name.clone()));
+         }
++        if let Some(parameters) = &self.parameter_headers {
++            headers.extend(parameters.iter().cloned());
++        }
+         let authorization = match credential {
+diff --git a/crates/fastmcp-client/src/http_auth/rpc.rs b/crates/fastmcp-client/src/http_auth/rpc.rs
+--- a/crates/fastmcp-client/src/http_auth/rpc.rs
++++ b/crates/fastmcp-client/src/http_auth/rpc.rs
+@@ -8,4 +8,4 @@
+ //! This explicit modern-only core-call API does not negotiate extensions,
+-//! project schema-derived custom headers, cache results, or automatically
+-//! retry an input-required result. Use the returned typed
+-//! `input_required` branch to implement an explicit host continuation policy.
++//! cache results, or automatically retry an input-required result. Reviewed
++//! schema-derived parameter headers are an explicit opt-in in [`tool_headers`].
++//! Use the returned typed `input_required` branch for host continuation policy.
+@@ -46,4 +46,6 @@
+ pub mod resource;
+ /// Request-owned, bounded core subscription streams over managed OAuth.
+ pub mod subscription;
++/// Explicit parameter-header disclosure with ordinary managed call ownership.
++pub mod tool_headers;
+ 
+diff --git a/crates/fastmcp-client/src/http_auth/rpc/interaction.rs b/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
+--- a/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
++++ b/crates/fastmcp-client/src/http_auth/rpc/interaction.rs
+@@ -15,3 +15,4 @@
+ use std::fmt;
+ use std::future::Future;
++use std::sync::Arc;
+ 
+@@ -28,5 +29,7 @@
+ use super::{
+     ManagedCoreCall, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits,
+-    ManagedOAuthSession, bounded_wait, call_deadline, check_call, prepare,
++    ManagedOAuthSession, bounded_wait, call_deadline, check_call,
+ };
++use super::tool_headers::ManagedToolHeaderError;
++use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
+ 
+@@ -95,3 +98,4 @@
+     Closed,
++    Headers(ToolHeaderDispatchError),
+     Core(ManagedCoreError),
+ }
+@@ -112,3 +116,4 @@
+             Self::AbortedByHost => "managed interaction aborted by its host",
+             Self::Closed => "managed interaction is closed",
++            Self::Headers(error) => return fmt::Display::fmt(error, f),
+             Self::Core(error) => return fmt::Display::fmt(error, f),
+@@ -123,3 +128,12 @@
+     fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
+ }
+ 
++impl From<ManagedToolHeaderError> for ManagedInteractionError {
++    fn from(error: ManagedToolHeaderError) -> Self {
++        match error {
++            ManagedToolHeaderError::Headers(error) => Self::Headers(error),
++            ManagedToolHeaderError::Core(error) => Self::Core(error),
++        }
++    }
++}
++
+@@ -159,4 +173,5 @@
+ pub struct ManagedInteraction {
+     session: ManagedOAuthSession,
+     original: CoreRequest,
++    header_review: Option<Arc<ReviewedToolHeaders>>,
+     step: Option<Step>,
+@@ -212,19 +227,37 @@
+         limits: ManagedInteractionLimits,
++    ) -> Result<ManagedInteraction, ManagedInteractionError> {
++        self.start_core_interaction_configured(
++            cx, cancellation, request, request_id, limits, None,
++        ).await
++    }
++
++    // Configuration is immutable before the first POST. Only the explicit
++    // reviewed API and schema-bound client can install a disclosure plan.
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) async fn start_core_interaction_configured(
++        &self,
++        cx: &Cx,
++        cancellation: &McpRequestCancellation,
++        request: CoreRequest,
++        request_id: RequestId,
++        limits: ManagedInteractionLimits,
++        header_review: Option<Arc<ReviewedToolHeaders>>,
+     ) -> Result<ManagedInteraction, ManagedInteractionError> {
+         let deadline = call_deadline(cx, cancellation, limits.core.timeout)?;
+         validate_initial(&request)?;
+-        let (wire, decoder) = prepare(
+-            self.resource().as_str(), request.clone(), request_id.clone(), limits.core,
+-        )?;
++        let mut operation = ManagedInteraction {
++            session: self.clone(), original: request, header_review, step: None,
++            cancellation: cancellation.clone(), deadline, limits,
++            used_ids: vec![request_id.clone()], continuations: 0, input_responses: 0,
++            response_bytes: 0, notifications: 0, generation: 0,
++        };
++        let (wire, decoder) = operation.prepare_request(operation.original.clone(), request_id)?;
+         let response = bounded_wait(cx, cancellation, deadline, async {
+             self.execute_with_cancellation(cx, cancellation, &wire).await.map_err(ManagedCoreError::from)
+         }).await?;
+         let call = ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)?;
+-        let generation = call.credential_generation();
+-        Ok(ManagedInteraction {
+-            session: self.clone(), original: request, step: Some(Step::Reading(Box::new(call))),
+-            cancellation: cancellation.clone(), deadline, limits, used_ids: vec![request_id],
+-            continuations: 0, input_responses: 0, response_bytes: 0, notifications: 0, generation,
+-        })
++        operation.generation = call.credential_generation();
++        operation.step = Some(Step::Reading(Box::new(call)));
++        Ok(operation)
+     }
+ }
+@@ -450,7 +483,5 @@
+         // All fallible local validation happens before consuming the challenge.
+         let count = responses.as_ref().map_or(0, FinalInputResponses::len);
+         let next = continuation_request_selected(&self.original, input, responses, selection)?;
+-        let (wire, mut decoder) = prepare(
+-            self.session.resource().as_str(), next, request_id.clone(), self.limits.core,
+-        )?;
++        let (wire, mut decoder) = self.prepare_request(next, request_id.clone())?;
+         decoder.bytes = self.response_bytes;
+@@ -476,2 +507,16 @@
++    // Initial dispatch, ordinary resume and explicit journal recovery all use
++    // this same owner-bound preparation. No continuation can drop the review
++    // or accept a replacement schema, target or argument map from the host.
++    fn prepare_request(
++        &self,
++        request: CoreRequest,
++        request_id: RequestId,
++    ) -> Result<(crate::http_executor::ModernHttpRequest, super::CoreDecoder), ManagedInteractionError> {
++        Ok(super::tool_headers::prepare_optional(
++            self.session.resource().as_str(), request, request_id, self.limits.core,
++            self.header_review.as_deref(),
++        )?)
++    }
++
+     fn check(&mut self, cx: &Cx) -> Result<(), ManagedInteractionError> {
+         let deadline = cx.budget().deadline.map_or(self.deadline, |caller| caller.min(self.deadline));
+diff --git a/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs b/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
+--- a/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
++++ b/crates/fastmcp-client/src/http_auth/rpc/interaction/recovery.rs
+@@ -15,4 +15,4 @@
+     ManagedInteraction, ManagedInteractionError, ManagedInteractionEvent, Step,
+     admit_challenge, admit_fresh_id, bounded_wait, continuation_request_selected,
+-    input_required, prepare,
++    input_required,
+ };
+@@ -168,4 +168,4 @@
+         // Check the complete retained request before handing out the owner.
+         // This ID is used only for encoding admission, never dispatch/history.
+-        let _ = prepare(self.session.resource().as_str(), request.clone(), RequestId::Number(0), self.limits.core)?;
++        let _ = self.prepare_request(request.clone(), RequestId::Number(0))?;
+         self.step = None;
+@@ -265,4 +265,4 @@
+         let reserved = reserve_frame(self.interaction.response_bytes, core.frame_bytes, core.total_bytes)?;
+         let request = self.request.as_ref().ok_or(ContinuationRecoveryError::WrongPhase)?.clone();
+-        let (wire, mut decoder) = prepare(self.interaction.session.resource().as_str(), request, request_id.clone(), core)?;
++        let (wire, mut decoder) = self.interaction.prepare_request(request, request_id.clone())?;
+         decoder.bytes = self.interaction.response_bytes;
+diff --git a/crates/fastmcp-client/src/http_executor/parameter_headers.rs b/crates/fastmcp-client/src/http_executor/parameter_headers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..72abe993311cdae0408cdc4d18557c3ec5bb6e51
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_executor/parameter_headers.rs
+@@ -0,0 +1,192 @@
++//! Explicitly reviewed, resource-bound tool parameter-header dispatch.
++//!
++//! A schema describes projection, never permission to disclose arguments. The
++//! host must approve every compiled binding before this module will retain a
++//! plan. Projection reads the immutable outgoing JSON-RPC bytes, not a separate
++//! argument map. No schema lookup, credential acquisition, retry or I/O occurs.
++//!
++//! The host owns catalog freshness and disclosure policy. A changed definition
++//! or policy requires a new review; retaining a plan does not make it current.
++//! This module does not authorize execution or validate the entire invocation.
++
++use std::fmt;
++
++use fastmcp_core::CanonicalHttpUrl;
++use fastmcp_protocol::http_headers::{
++    AdmittedToolHeaderSchema, MAX_MCP_HEADER_VALUE_BYTES, McpHeaderError,
++    ParameterHeaderBinding,
++};
++use fastmcp_protocol::protocol_policy::ProtocolEra;
++use fastmcp_protocol::{
++    CoreRequest, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
++    JsonRpcMessage, decode_strict_jsonrpc_message,
++};
++use serde_json::Value;
++
++use super::ModernHttpRequest;
++
++/// Hard ceiling for duplicate-aware admission of the exact outgoing body.
++pub const MAX_TOOL_HEADER_REQUEST_BYTES: usize = 8 * 1024 * 1024;
++
++/// Diagnostics never retain a resource, schema, binding, or argument value.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ToolHeaderDispatchError {
++    InvalidBinding,
++    DisclosureDenied,
++    TargetMismatch,
++    OperationMismatch,
++    AlreadyProjected,
++    InvalidRequest,
++    RequestTooLarge,
++    Projection(McpHeaderError),
++}
++
++impl fmt::Display for ToolHeaderDispatchError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::InvalidBinding => "invalid tool-header resource or name binding",
++            Self::DisclosureDenied => "tool parameter-header disclosure was not approved",
++            Self::TargetMismatch => "tool-header plan belongs to a different HTTPS resource",
++            Self::OperationMismatch => "tool-header plan does not match the request operation",
++            Self::AlreadyProjected => "tool parameter headers were already installed",
++            Self::InvalidRequest => "tool-header projection requires an admitted final tool request",
++            Self::RequestTooLarge => "tool-header request exceeds the source-byte limit",
++            Self::Projection(error) => return fmt::Display::fmt(error, f),
++        })
++    }
++}
++
++impl std::error::Error for ToolHeaderDispatchError {}
++
++impl From<McpHeaderError> for ToolHeaderDispatchError {
++    fn from(error: McpHeaderError) -> Self { Self::Projection(error) }
++}
++
++/// Immutable approval of one exact tool schema at one canonical HTTPS resource.
++///
++/// No arbitrary header map can be installed. The complete source is admitted
++/// before the first review callback. Rejecting any binding rejects the plan,
++/// including previously approved siblings. Unannotated arguments remain body
++/// data. This value is deliberately neither Clone nor serializable; an owner
++/// may explicitly share it through an Arc without sharing invocation data.
++pub struct ReviewedToolHeaders {
++    resource: CanonicalHttpUrl,
++    tool_name: String,
++    schema: AdmittedToolHeaderSchema,
++}
++
++impl ReviewedToolHeaders {
++    /// The callback reviews an exact property path, field name and primitive
++    /// type. It receives no invocation values and must apply the host's local
++    /// disclosure policy rather than trusting server annotations as consent.
++    pub fn new(
++        resource: CanonicalHttpUrl,
++        tool_name: impl Into<String>,
++        schema: Value,
++        mut review: impl FnMut(&ParameterHeaderBinding) -> bool,
++    ) -> Result<Self, ToolHeaderDispatchError> {
++        let tool_name = tool_name.into();
++        if resource.scheme() != "https"
++            || resource.has_userinfo()
++            || resource.fragment().is_some()
++            || resource.as_str().len() > MAX_MCP_HEADER_VALUE_BYTES
++            || tool_name.is_empty()
++            || tool_name.len() > MAX_MCP_HEADER_VALUE_BYTES
++            || tool_name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
++        {
++            return Err(ToolHeaderDispatchError::InvalidBinding);
++        }
++        if schema.get("type").and_then(Value::as_str) != Some("object") {
++            return Err(McpHeaderError::InvalidSchema.into());
++        }
++        let schema = AdmittedToolHeaderSchema::admit(schema)?;
++        for binding in schema.header_plan().bindings() {
++            if !review(binding) {
++                return Err(ToolHeaderDispatchError::DisclosureDenied);
++            }
++        }
++        Ok(Self { resource, tool_name, schema })
++    }
++
++    pub fn resource(&self) -> &CanonicalHttpUrl { &self.resource }
++    pub fn tool_name(&self) -> &str { &self.tool_name }
++    pub fn schema(&self) -> &Value { self.schema.schema() }
++    pub fn bindings(&self) -> &[ParameterHeaderBinding] { self.schema.header_plan().bindings() }
++
++    fn project_request(
++        &self,
++        request: &ModernHttpRequest,
++    ) -> Result<Vec<(String, String)>, ToolHeaderDispatchError> {
++        if request.parameter_headers.is_some() {
++            return Err(ToolHeaderDispatchError::AlreadyProjected);
++        }
++        let target = CanonicalHttpUrl::parse(request.target())
++            .map_err(|_| ToolHeaderDispatchError::TargetMismatch)?;
++        if target != self.resource {
++            return Err(ToolHeaderDispatchError::TargetMismatch);
++        }
++        if !request.include_method_header
++            || request.protocol_version != FINAL_PROTOCOL_VERSION
++            || request.method != "tools/call"
++            || request.name.as_deref() != Some(self.tool_name.as_str())
++        {
++            return Err(ToolHeaderDispatchError::OperationMismatch);
++        }
++        if request.body().len() > MAX_TOOL_HEADER_REQUEST_BYTES {
++            return Err(ToolHeaderDispatchError::RequestTooLarge);
++        }
++        let message = decode_strict_jsonrpc_message(request.body(), MAX_TOOL_HEADER_REQUEST_BYTES)
++            .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
++        let JsonRpcMessage::Request(envelope) = message else {
++            return Err(ToolHeaderDispatchError::InvalidRequest);
++        };
++        if envelope.id.is_none() || envelope.method != request.method {
++            return Err(ToolHeaderDispatchError::InvalidRequest);
++        }
++        let params = envelope.params.as_ref().and_then(Value::as_object)
++            .ok_or(ToolHeaderDispatchError::InvalidRequest)?;
++        if params.get("name").and_then(Value::as_str) != Some(self.tool_name.as_str()) {
++            return Err(ToolHeaderDispatchError::OperationMismatch);
++        }
++        if params.get("_meta").and_then(|meta| meta.get(FINAL_PROTOCOL_VERSION_META_KEY))
++            .and_then(Value::as_str) != Some(FINAL_PROTOCOL_VERSION)
++        {
++            return Err(ToolHeaderDispatchError::InvalidRequest);
++        }
++        // Raw duplicate/batch admission precedes typed method/metadata admission.
++        // Neither decoder rewrites the immutable body which the executor sends.
++        let _ = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", envelope.params.as_ref())
++            .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
++        Ok(self.schema.header_plan().project(params.get("arguments"))?.into_fields())
++    }
++}
++
++impl fmt::Debug for ReviewedToolHeaders {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ReviewedToolHeaders")
++            .field("binding_count", &self.bindings().len())
++            .finish_non_exhaustive()
++    }
++}
++
++impl ModernHttpRequest {
++    /// Atomically installs reviewed fields from this request's exact body.
++    /// An empty projection also seals the request against replacing its plan.
++    /// Body bytes, credentials and routing identity are not replaced.
++    ///
++    /// Execute the returned request through the existing native/managed APIs.
++    /// Their authentication, TLS, cancellation and response bounds remain in
++    /// force. Explicit `headers()` output contains disclosed values, just as
++    /// it can already contain a credential, and must not be logged casually.
++    pub fn with_reviewed_tool_headers(
++        mut self,
++        reviewed: &ReviewedToolHeaders,
++    ) -> Result<Self, ToolHeaderDispatchError> {
++        let headers = reviewed.project_request(&self)?;
++        self.parameter_headers = Some(headers);
++        Ok(self)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs b/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..53b33fb9049e0a9a028292f097a775557c6f384a
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_executor/parameter_headers/tests.rs
+@@ -0,0 +1,268 @@
++use super::*;
++
++#[test]
++fn name_sentinel_encoding_does_not_change_legacy_request_headers() {
++    let name = "=?base64?YWJj?=";
++    for version in ["2024-11-05", "2025-06-18"] {
++        let request = ModernHttpRequest::new(
++            "https://tools.example/mcp", b"{}".to_vec(), version,
++            "tools/call", Some(name.to_owned()),
++        ).unwrap();
++        let fields = request.headers();
++        assert_eq!(fields.iter().find(|(field, _)| field == "Mcp-Name").unwrap().1, name);
++        assert!(!fields.iter().any(|(field, _)| field.starts_with("Mcp-Param-")));
++    }
++    let request = ModernHttpRequest::new(
++        "https://tools.example/mcp", b"{}".to_vec(), FINAL_PROTOCOL_VERSION,
++        "tools/call", Some(name.to_owned()),
++    ).unwrap();
++    let fields = request.headers();
++    assert_eq!(fields.iter().find(|(field, _)| field == "Mcp-Name").unwrap().1,
++        fastmcp_protocol::http_headers::encode_mcp_header_value(name).unwrap());
++    assert_eq!(request.body(), b"{}");
++}
++
++use crate::http_auth::BoundBearerCredential;
++use fastmcp_protocol::http_headers::{
++    MAX_PARAMETER_HEADER_INTEGER, ParameterHeaderType, decode_mcp_header_value,
++};
++use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
++use serde_json::json;
++
++const TARGET: &str = "https://tools.example/mcp";
++
++fn schema() -> Value {
++    json!({"type":"object", "properties":{
++        "region":{"type":"string","x-mcp-header":"Region"},
++        "count":{"type":"integer","x-mcp-header":"Count"},
++        "verbose":{"type":"boolean","x-mcp-header":"Verbose"},
++        "options":{"type":"object","properties":{
++            "a/b~.0":{"type":"string","x-mcp-header":"Nested"}
++        }}
++    }})
++}
++
++fn plan() -> ReviewedToolHeaders {
++    ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", schema(), |_| true).unwrap()
++}
++
++fn body(arguments: Option<Value>) -> Vec<u8> {
++    let mut params = json!({
++        "name":"lookup", "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
++    });
++    if let Some(arguments) = arguments { params["arguments"] = arguments; }
++    serde_json::to_vec(&json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":params})).unwrap()
++}
++
++fn wire(target: &str, body: Vec<u8>) -> ModernHttpRequest {
++    ModernHttpRequest::new(target, body, FINAL_PROTOCOL_VERSION, "tools/call", Some("lookup".to_owned())).unwrap()
++}
++
++fn parameters(request: &ModernHttpRequest) -> Vec<(String, String)> {
++    let mut fields: Vec<_> = request.headers().into_iter()
++        .filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
++    fields.sort();
++    fields
++}
++
++#[test]
++fn native_projection_uses_exact_paths_and_leaves_the_actual_body_unchanged() {
++    let review = plan();
++    let before = body(Some(json!({"region":"eu", "count":2, "verbose":false,
++        "options":{"a/b~.0":"nested"}, "private":"body-only-canary"})));
++    let before = [b" \n".as_slice(), before.as_slice(), b"\n ".as_slice()].concat();
++    let request = wire(TARGET, before.clone()).with_reviewed_tool_headers(&review).unwrap();
++    assert_eq!(request.body(), before);
++    assert_eq!(parameters(&request), vec![
++        ("Mcp-Param-Count".to_owned(), "2".to_owned()),
++        ("Mcp-Param-Nested".to_owned(), "nested".to_owned()),
++        ("Mcp-Param-Region".to_owned(), "eu".to_owned()),
++        ("Mcp-Param-Verbose".to_owned(), "false".to_owned()),
++    ]);
++    assert_eq!(review.schema(), &schema());
++    assert!(!format!("{request:?} {review:?}").contains("body-only-canary"));
++    assert!(!request.headers().iter().any(|(_, value)| value.contains("body-only-canary")));
++}
++
++#[test]
++fn review_is_explicit_and_partial_approval_does_not_install_a_plan() {
++    let mut visited = Vec::new();
++    let result = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", schema(), |binding| {
++        visited.push((binding.property_path().to_vec(), binding.parameter_type()));
++        binding.header_name() != "Mcp-Param-Region"
++    });
++    assert!(matches!(result, Err(ToolHeaderDispatchError::DisclosureDenied)));
++    assert!(!visited.is_empty());
++    assert!(visited.iter().any(|(path, kind)| path == &["region".to_owned()] && *kind == ParameterHeaderType::String));
++    assert!(parameters(&wire(TARGET, body(Some(json!({"region":"eu"}))))).is_empty());
++}
++
++#[test]
++fn malformed_schema_is_rejected_before_any_review_callback() {
++    for source in [
++        json!({"type":"string"}),
++        json!({"type":"object","properties":{"x":{"type":"object","x-mcp-header":"X"}}}),
++        json!({"type":"object","properties":{
++            "x":{"type":"string","x-mcp-header":"Same"},
++            "y":{"type":"string","x-mcp-header":"same"}
++        }}),
++        json!({"type":"object","properties":{"x":{"type":"string","x-mcp-header":"X\r\nBad"}}}),
++    ] {
++        let mut calls = 0;
++        assert!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", source, |_| {
++            calls += 1;
++            true
++        }).is_err());
++        assert_eq!(calls, 0);
++    }
++}
++
++#[test]
++fn approved_values_with_unicode_controls_or_sentinels_remain_one_safe_field() {
++    for value in ["雪", " a ", "\t", "a\r\nInjected: yes", "\0", "=?base64?YWJj?=", "=?base64?="] {
++        let request = wire(TARGET, body(Some(json!({"region":value}))))
++            .with_reviewed_tool_headers(&plan()).unwrap();
++        let fields = parameters(&request);
++        assert_eq!(fields.len(), 1);
++        assert!(!fields[0].1.contains(['\r', '\n', '\0']));
++        assert_eq!(decode_mcp_header_value(fields[0].1.as_bytes()).unwrap(), value);
++    }
++}
++
++#[test]
++fn null_and_absent_fields_are_omitted_without_rewriting_arguments() {
++    for arguments in [None, Some(json!({})), Some(json!({"region":null,"options":null}))] {
++        let before = body(arguments);
++        let request = wire(TARGET, before.clone()).with_reviewed_tool_headers(&plan()).unwrap();
++        assert!(parameters(&request).is_empty());
++        assert_eq!(request.body(), before);
++        assert!(matches!(request.with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::AlreadyProjected)));
++    }
++}
++
++#[test]
++fn one_invalid_sibling_refuses_the_complete_projection() {
++    for arguments in [
++        json!({"region":"valid","count":"2"}),
++        json!({"region":"valid","count":MAX_PARAMETER_HEADER_INTEGER + 1}),
++        json!({"region":"valid","verbose":1}),
++        json!({"region":"valid","options":{"a/b~.0":42}}),
++    ] {
++        let original = wire(TARGET, body(Some(arguments)));
++        assert!(original.clone().with_reviewed_tool_headers(&plan()).is_err());
++        assert!(parameters(&original).is_empty());
++    }
++}
++
++#[test]
++fn binding_refuses_cleartext_userinfo_fragments_and_hostile_tool_names() {
++    for target in ["http://tools.example/mcp", "http://localhost/mcp", "https://user@tools.example/mcp", "https://tools.example/mcp#"] {
++        assert!(matches!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(target).unwrap(), "lookup", schema(), |_| true),
++            Err(ToolHeaderDispatchError::InvalidBinding)));
++    }
++    for name in ["", "bad\r\nname"] {
++        assert!(matches!(ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), name, schema(), |_| true),
++            Err(ToolHeaderDispatchError::InvalidBinding)));
++    }
++}
++
++#[test]
++fn a_plan_cannot_cross_an_endpoint_path_query_authority_or_scheme() {
++    let review = plan();
++    for target in ["https://other.example/mcp", "https://tools.example/other", "https://tools.example/mcp?q=1", "http://tools.example/mcp"] {
++        assert!(matches!(wire(target, body(None)).with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::TargetMismatch)));
++    }
++    assert!(wire("https://TOOLS.EXAMPLE:443/mcp", body(None)).with_reviewed_tool_headers(&review).is_ok());
++}
++
++#[test]
++fn wrong_operation_name_version_and_reverse_response_cannot_project() {
++    let review = plan();
++    for request in [
++        ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "prompts/get", Some("lookup".to_owned())).unwrap(),
++        ModernHttpRequest::new(TARGET, body(None), FINAL_PROTOCOL_VERSION, "tools/call", Some("other".to_owned())).unwrap(),
++        ModernHttpRequest::new(TARGET, body(None), "2024-11-05", "tools/call", Some("lookup".to_owned())).unwrap(),
++        ModernHttpRequest::for_jsonrpc_response(TARGET, FINAL_PROTOCOL_VERSION, br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec()).unwrap(),
++    ] {
++        assert!(matches!(request.with_reviewed_tool_headers(&review), Err(ToolHeaderDispatchError::OperationMismatch)));
++    }
++}
++
++#[test]
++fn inconsistent_raw_body_and_metadata_cannot_be_hidden_by_valid_routing_headers() {
++    let original: Value = serde_json::from_slice(&body(Some(json!({"region":"eu"})))).unwrap();
++    let mut variants = Vec::new();
++    let mut value = original.clone();
++    value["method"] = json!("prompts/get");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"]["name"] = json!("other");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"]["_meta"][FINAL_PROTOCOL_VERSION_META_KEY] = json!("2024-11-05");
++    variants.push(value);
++    let mut value = original.clone();
++    value["params"].as_object_mut().unwrap().remove("_meta");
++    variants.push(value);
++    let mut value = original;
++    value.as_object_mut().unwrap().remove("id");
++    variants.push(value);
++    for value in variants {
++        assert!(wire(TARGET, serde_json::to_vec(&value).unwrap()).with_reviewed_tool_headers(&plan()).is_err());
++    }
++}
++
++#[test]
++fn raw_duplicate_members_batches_and_trailing_documents_are_rejected() {
++    let valid = String::from_utf8(body(Some(json!({"region":"eu"})))).unwrap();
++    let duplicate_id = valid.replacen("\"id\":17", "\"id\":17,\"id\":17", 1);
++    let duplicate_argument = valid.replacen("\"region\":\"eu\"", "\"region\":\"eu\",\"region\":\"us\"", 1);
++    assert_ne!(duplicate_id, valid);
++    assert_ne!(duplicate_argument, valid);
++    for invalid in [duplicate_id, duplicate_argument, format!("[{valid}]"), format!("{valid}{valid}")] {
++        assert!(matches!(wire(TARGET, invalid.into_bytes()).with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::InvalidRequest)));
++    }
++}
++
++#[test]
++fn source_size_is_bounded_before_decoding_or_projection() {
++    let mut source = body(None);
++    source.resize(MAX_TOOL_HEADER_REQUEST_BYTES, b' ');
++    assert!(wire(TARGET, source.clone()).with_reviewed_tool_headers(&plan()).is_ok());
++    source.push(b' ');
++    assert!(matches!(wire(TARGET, source).with_reviewed_tool_headers(&plan()), Err(ToolHeaderDispatchError::RequestTooLarge)));
++}
++
++#[test]
++fn fresh_credential_serialization_retains_headers_without_reusing_old_authorization() {
++    let resource = CanonicalHttpUrl::parse(TARGET).unwrap();
++    let old = BoundBearerCredential::bind(resource.clone(), "old-test-credential").unwrap();
++    let fresh = BoundBearerCredential::bind(resource, "fresh-test-credential").unwrap();
++    let request = wire(TARGET, body(Some(json!({"region":"eu"}))))
++        .with_authorization(&old).with_reviewed_tool_headers(&plan()).unwrap();
++    let fields = request.headers_with_credential(Some(&fresh));
++    assert!(fields.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++    assert!(fields.iter().any(|(name, value)| name == "Authorization" && value == "Bearer fresh-test-credential"));
++    assert!(!fields.iter().any(|(_, value)| value.contains("old-test-credential")));
++    fresh.revoke();
++    let fields = request.headers_with_credential(Some(&fresh));
++    assert!(!fields.iter().any(|(name, _)| name == "Authorization"));
++    assert!(fields.iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++}
++
++#[test]
++fn mcp_name_encoding_preserves_logical_identity_and_keeps_wire_fields_safe() {
++    for name in ["lookup", "雪", " lookup ", "=?base64?YWJj?="] {
++        let mut document: Value = serde_json::from_slice(&body(None)).unwrap();
++        document["params"]["name"] = json!(name);
++        let source = serde_json::to_vec(&document).unwrap();
++        let review = ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), name, schema(), |_| true).unwrap();
++        let request = ModernHttpRequest::new(TARGET, source.clone(), FINAL_PROTOCOL_VERSION, "tools/call", Some(name.to_owned()))
++            .unwrap().with_reviewed_tool_headers(&review).unwrap();
++        let headers = request.headers();
++        let encoded = &headers.iter().find(|(key, _)| key == "Mcp-Name").unwrap().1;
++        assert_eq!(decode_mcp_header_value(encoded.as_bytes()).unwrap(), name);
++        assert_eq!(request.name.as_deref(), Some(name));
++        assert_eq!(request.body(), source);
++    }
++}
+diff --git a/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a092b04abe564767ad0f2367bfcdfef877ac481
+--- /dev/null
++++ b/crates/fastmcp-client/src/http_auth/rpc/tool_headers.rs
+@@ -0,0 +1,293 @@
++//! Explicit parameter-header disclosure through the managed OAuth call owner.
++//!
++//! Reuses the normal core codec, managed credential lifecycle, one-POST dispatch,
++//! incremental notifications and request-local cancellation. An annotation in a
++//! catalog is never sufficient to enable this API: the host supplies a reviewed
++//! plan bound to this resource and tool. Ordinary calls remain header-free.
++
++use std::fmt;
++use std::sync::Arc;
++
++use asupersync::Cx;
++use fastmcp_core::McpRequestCancellation;
++use fastmcp_protocol::{CoreRequest, RequestId};
++
++use super::{
++    CoreDecoder, ManagedCoreCall, ManagedCoreError, ManagedCoreLimits,
++    ManagedOAuthSession, bounded_wait, call_deadline, prepare,
++};
++use crate::http_executor::ModernHttpRequest;
++use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
++use super::interaction::{ManagedInteraction, ManagedInteractionError, ManagedInteractionLimits};
++
++/// Header admission and core transport errors contain no disclosed values.
++#[derive(Debug)]
++pub enum ManagedToolHeaderError {
++    Headers(ToolHeaderDispatchError),
++    Core(ManagedCoreError),
++}
++
++impl fmt::Display for ManagedToolHeaderError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Headers(error) => fmt::Display::fmt(error, f),
++            Self::Core(error) => fmt::Display::fmt(error, f),
++        }
++    }
++}
++
++impl std::error::Error for ManagedToolHeaderError {}
++impl From<ToolHeaderDispatchError> for ManagedToolHeaderError {
++    fn from(error: ToolHeaderDispatchError) -> Self { Self::Headers(error) }
++}
++impl From<ManagedCoreError> for ManagedToolHeaderError {
++    fn from(error: ManagedCoreError) -> Self { Self::Core(error) }
++}
++
++// One preparation path is shared by initial calls and explicit continuations.
++// It must run before credential acquisition and before consuming retry state.
++pub(crate) fn prepare_optional(
++    target: &str,
++    request: CoreRequest,
++    request_id: RequestId,
++    limits: ManagedCoreLimits,
++    reviewed: Option<&ReviewedToolHeaders>,
++) -> Result<(ModernHttpRequest, CoreDecoder), ManagedToolHeaderError> {
++    let (wire, decoder) = prepare(target, request, request_id, limits)?;
++    let wire = match reviewed {
++        Some(reviewed) => wire.with_reviewed_tool_headers(reviewed)?,
++        None => wire,
++    };
++    Ok((wire, decoder))
++}
++
++impl ManagedOAuthSession {
++    /// Starts an explicitly resumed operation with one immutable header review.
++    /// Original arguments are projected on the first POST, every continuation,
++    /// and any separately authorized journal recovery. Input answers and opaque
++    /// state never become a replacement schema or a source of routing fields.
++    pub async fn start_tool_interaction_with_headers(
++        &self,
++        cx: &Cx,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: Arc<ReviewedToolHeaders>,
++        limits: ManagedInteractionLimits,
++    ) -> Result<ManagedInteraction, ManagedInteractionError> {
++        self.start_tool_interaction_with_headers_and_cancellation(
++            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
++        ).await
++    }
++
++    /// Retains the original cancellation domain, deadline and review across
++    /// host pauses. A review grants disclosure only; it does not grant replay
++    /// authority or permission to run an input resolver.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn start_tool_interaction_with_headers_and_cancellation(
++        &self,
++        cx: &Cx,
++        cancellation: &McpRequestCancellation,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: Arc<ReviewedToolHeaders>,
++        limits: ManagedInteractionLimits,
++    ) -> Result<ManagedInteraction, ManagedInteractionError> {
++        self.start_core_interaction_configured(
++            cx, cancellation, request, request_id, limits, Some(reviewed),
++        ).await
++    }
++
++    /// Sends one tools/call with explicitly reviewed schema-derived headers.
++    /// All binding, body, field-type and byte checks run before renewal or I/O.
++    /// This returns the ordinary incremental core call; an input-required result
++    /// does not automatically trigger a continuation or an input resolver.
++    pub async fn request_tool_with_headers(
++        &self,
++        cx: &Cx,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: &ReviewedToolHeaders,
++        limits: ManagedCoreLimits,
++    ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
++        self.request_tool_with_headers_and_cancellation(
++            cx, &McpRequestCancellation::new(), request, request_id, reviewed, limits,
++        ).await
++    }
++
++    /// Retains one cancellation domain and absolute deadline through preparation,
++    /// credential renewal and every response read. No sibling is cancelled and
++    /// no side-effecting operation is replayed by this method.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn request_tool_with_headers_and_cancellation(
++        &self,
++        cx: &Cx,
++        cancellation: &McpRequestCancellation,
++        request: CoreRequest,
++        request_id: RequestId,
++        reviewed: &ReviewedToolHeaders,
++        limits: ManagedCoreLimits,
++    ) -> Result<ManagedCoreCall, ManagedToolHeaderError> {
++        let deadline = call_deadline(cx, cancellation, limits.timeout)?;
++        let (wire, decoder) = prepare_optional(
++            self.resource().as_str(), request, request_id, limits, Some(reviewed),
++        )?;
++        let response = bounded_wait(cx, cancellation, deadline, async {
++            self.execute_with_cancellation(cx, cancellation, &wire)
++                .await.map_err(ManagedCoreError::from)
++        }).await?;
++        ManagedCoreCall::from_response(response, decoder, cancellation.clone(), deadline)
++            .map_err(ManagedToolHeaderError::from)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use fastmcp_core::CanonicalHttpUrl;
++    use fastmcp_protocol::protocol_policy::ProtocolEra;
++    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
++    use serde_json::{Value, json};
++
++    const TARGET: &str = "https://tools.example/mcp";
++
++    fn review() -> ReviewedToolHeaders {
++        ReviewedToolHeaders::new(CanonicalHttpUrl::parse(TARGET).unwrap(), "lookup", json!({
++            "type":"object", "properties":{"region":{"type":"string","x-mcp-header":"Region"}},
++        }), |binding| binding.property_path() == ["region".to_owned()]
++            && binding.header_name() == "Mcp-Param-Region").unwrap()
++    }
++
++    fn request(method: &str, mut params: Value) -> CoreRequest {
++        params["_meta"] = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
++        CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap()
++    }
++
++    #[test]
++    fn managed_preparation_retains_the_core_decoder_and_exact_parameters() {
++        let request = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu","private":"body-only"}}));
++        let before = request.encode_params().unwrap().unwrap();
++        let (wire, decoder) = prepare_optional(TARGET, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())).unwrap();
++        let body: Value = serde_json::from_slice(wire.body()).unwrap();
++        assert_eq!(body["params"], before);
++        assert_eq!(body["id"], 17);
++        assert_eq!(decoder.request_id, RequestId::Number(17));
++        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++        assert!(!wire.headers().iter().any(|(_, value)| value.contains("body-only")));
++        assert!(!wire.headers().iter().any(|(name, _)| name == "Authorization"));
++    }
++
++    #[test]
++    fn invalid_binding_type_or_size_fails_during_local_preparation() {
++        let review = review();
++        for (target, request) in [
++            ("https://tools.example/other", request("tools/call", json!({"name":"lookup"}))),
++            (TARGET, request("tools/call", json!({"name":"other"}))),
++            (TARGET, request("tools/call", json!({"name":"lookup","arguments":{"region":42}}))),
++            (TARGET, request("tools/list", json!({}))),
++        ] {
++            assert!(prepare_optional(target, request, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review)).is_err());
++        }
++        let tiny = ManagedCoreLimits::new(1, 1024, 1024, 1, std::time::Duration::from_secs(1)).unwrap();
++        assert!(matches!(prepare_optional(TARGET, request("tools/call", json!({"name":"lookup"})), RequestId::Number(17), tiny, Some(&review)),
++            Err(ManagedToolHeaderError::Core(ManagedCoreError::RequestTooLarge))));
++    }
++
++    #[test]
++    fn header_opt_in_does_not_activate_extensions_or_change_ordinary_calls() {
++        let core = request("tools/call", json!({"name":"lookup","arguments":{"region":"eu"}}));
++        let (ordinary, _) = prepare_optional(TARGET, core.clone(), RequestId::Number(17), ManagedCoreLimits::default(), None).unwrap();
++        assert!(!ordinary.headers().iter().any(|(name, _)| name.starts_with("Mcp-Param-")));
++        let mut params = core.encode_params().unwrap().unwrap();
++        params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"] = json!({"io.modelcontextprotocol/tasks":{}});
++        let core = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
++        assert!(matches!(prepare_optional(TARGET, core, RequestId::Number(17), ManagedCoreLimits::default(), Some(&review())),
++            Err(ManagedToolHeaderError::Core(ManagedCoreError::UnsupportedRequest))));
++    }
++
++    fn challenge(original: &CoreRequest, state: Option<&str>) -> fastmcp_protocol::InputRequiredResult {
++        let mut value = json!({"resultType":"input_required", "inputRequests":{
++            "one":{"method":"roots/list"}, "two":{"method":"roots/list"}
++        }});
++        if let Some(state) = state { value["requestState"] = json!(state); }
++        let result = original.decode_result(&value.to_string()).unwrap();
++        super::super::interaction::input_required(&result).unwrap().clone()
++    }
++
++    fn continuation_source() -> CoreRequest {
++        let original = request("tools/call", json!({"name":"lookup", "arguments":{"region":"eu", "private":"body-only"}}));
++        let mut params = original.encode_params().unwrap().unwrap();
++        params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({"roots":{}});
++        CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap()
++    }
++
++    #[test]
++    fn full_and_partial_continuations_project_only_immutable_original_arguments() {
++        use super::super::interaction::{InputSelection, continuation_request_selected};
++        let original = continuation_source();
++        let before = original.encode_params().unwrap().unwrap();
++        let input = challenge(&original, Some("  opaque\0  "));
++        let review = review();
++        for (selection, answers) in [
++            (InputSelection::Complete, json!({"one":{"roots":[]},"two":{"roots":[]}})),
++            (InputSelection::Partial, json!({"two":{"roots":[]}})),
++        ] {
++            let next = continuation_request_selected(&original, &input,
++                Some(serde_json::from_value(answers.clone()).unwrap()), selection).unwrap();
++            let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
++            let encoded: Value = serde_json::from_slice(wire.body()).unwrap();
++            assert_eq!(encoded["params"]["arguments"], before["arguments"]);
++            assert_eq!(encoded["params"]["_meta"], before["_meta"]);
++            assert_eq!(encoded["params"]["inputResponses"], answers);
++            assert_eq!(encoded["params"]["requestState"], "  opaque\0  ");
++            let fields: Vec<_> = wire.headers().into_iter().filter(|(name, _)| name.starts_with("Mcp-Param-")).collect();
++            assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
++        }
++        assert_eq!(original.encode_params().unwrap().unwrap(), before);
++    }
++
++    #[test]
++    fn invalid_partial_answers_never_become_a_header_bearing_continuation() {
++        use super::super::interaction::{InputSelection, continuation_request_selected};
++        let original = continuation_source();
++        let before = original.encode_params().unwrap().unwrap();
++        for (input, answers) in [
++            (challenge(&original, None), json!({"one":{"roots":[]}})),
++            (challenge(&original, Some("state")), json!({"foreign":{"roots":[]}})),
++            (challenge(&original, Some("state")), json!({})),
++        ] {
++            assert!(continuation_request_selected(&original, &input,
++                Some(serde_json::from_value(answers).unwrap()), InputSelection::Partial).is_err());
++        }
++        assert_eq!(original.encode_params().unwrap().unwrap(), before);
++    }
++
++    #[test]
++    fn reply_recovery_changes_the_rpc_id_but_not_the_projected_headers_or_params() {
++        use super::super::interaction::continuation_request;
++        let original = continuation_source();
++        let input = challenge(&original, Some("journal-state"));
++        let answers = serde_json::from_value(json!({"one":{"roots":[]},"two":{"roots":[]}})).unwrap();
++        let request = continuation_request(&original, &input, Some(answers)).unwrap();
++        let review = review();
++        let (first, _) = prepare_optional(TARGET, request.clone(), RequestId::Number(18), ManagedCoreLimits::default(), Some(&review)).unwrap();
++        let (next, _) = prepare_optional(TARGET, request, RequestId::Number(19), ManagedCoreLimits::default(), Some(&review)).unwrap();
++        let first_body: Value = serde_json::from_slice(first.body()).unwrap();
++        let next_body: Value = serde_json::from_slice(next.body()).unwrap();
++        assert_ne!(first_body["id"], next_body["id"]);
++        assert_eq!(first_body["params"], next_body["params"]);
++        assert_eq!(first.headers(), next.headers());
++    }
++
++    #[test]
++    fn state_only_continuation_keeps_absence_and_still_projects_the_original_input() {
++        use super::super::interaction::{continuation_request, input_required};
++        let original = continuation_source();
++        let result = original.decode_result(r#"{"resultType":"input_required","requestState":""}"#).unwrap();
++        let next = continuation_request(&original, input_required(&result).unwrap(), None).unwrap();
++        let (wire, _) = prepare_optional(TARGET, next, RequestId::Number(18), ManagedCoreLimits::default(), Some(&review())).unwrap();
++        let value: Value = serde_json::from_slice(wire.body()).unwrap();
++        assert_eq!(value["params"]["requestState"], "");
++        assert!(value["params"].get("inputResponses").is_none());
++        assert!(wire.headers().iter().any(|(name, value)| name == "Mcp-Param-Region" && value == "eu"));
++    }
++}

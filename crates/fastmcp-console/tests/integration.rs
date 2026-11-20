@@ -6,6 +6,12 @@
 //! - DisplayContext affecting multiple components
 //! - Config affecting all subsystems
 
+// `renderers` is implied by `legacy-2024-11-05`, `tasks` and `apps`. The gate
+// is mirrored by a `required-features` stanza in Cargo.toml, so a run whose
+// features do not satisfy it SKIPS this target loudly instead of compiling it
+// to an empty binary that prints `ok. 0 passed` (bd-ufj6r).
+#![cfg(feature = "renderers")]
+
 use std::time::Duration;
 
 use fastmcp_console::client::ClientInfoRenderer;
@@ -61,7 +67,7 @@ fn test_error_renderer_uses_console_correctly() {
     renderer.render(&error, tc.console());
 
     // Verify output was captured
-    assert!(!tc.output().is_empty());
+    assert_ne!(tc.output(), [] as [std::string::String; 0]);
     tc.assert_contains("test error message");
 }
 
@@ -80,7 +86,7 @@ fn test_stats_renderer_uses_console_correctly() {
     renderer.render_table(&snapshot, tc.console());
 
     // Verify output was captured
-    assert!(!tc.output().is_empty());
+    assert_ne!(tc.output(), [] as [std::string::String; 0]);
     // Stats should show request counts
     tc.assert_contains("3"); // Total requests
 }
@@ -185,7 +191,7 @@ fn test_agent_context_produces_plain_output() {
     // The raw output from a non-rich TestConsole should have ANSI codes stripped
     // or not present at all, depending on the console mode
     // The assertion checks that we get meaningful text output
-    assert!(!tc.output().is_empty());
+    assert_ne!(tc.output(), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -206,7 +212,7 @@ fn test_human_context_works_with_rich_console() {
 
     // Raw output might have ANSI codes
     // Just verify we got some output
-    assert!(!tc.raw_output().is_empty());
+    assert_ne!(tc.raw_output(), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -283,7 +289,7 @@ fn test_error_boundary_integrates_with_console() {
     assert!(!boundary.has_errors());
 
     // No error output should have been generated
-    assert!(tc.output().is_empty());
+    assert_eq!(tc.output(), [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -376,7 +382,7 @@ fn test_stats_method_tracking() {
     let renderer = StatsRenderer::new(DisplayContext::new_agent());
     renderer.render_table(&snapshot, tc.console());
 
-    assert!(!tc.output().is_empty());
+    assert_ne!(tc.output(), [] as [std::string::String; 0]);
 }
 
 // ============================================================================
@@ -394,9 +400,10 @@ fn test_client_info_with_capabilities() {
     };
 
     let caps = ClientCapabilities {
-        sampling: Some(fastmcp_protocol::SamplingCapability {}),
+        sampling: Some(fastmcp_protocol::SamplingCapability::default()),
         elicitation: None,
         roots: Some(RootsCapability { list_changed: true }),
+        ..Default::default()
     };
 
     renderer.render_connected_with_caps(&client, &caps, tc.console());
@@ -461,7 +468,7 @@ fn test_test_console_clear_works() {
     tc.clear();
 
     // Should be empty after clear
-    assert!(tc.output().is_empty());
+    assert_eq!(tc.output(), [] as [std::string::String; 0]);
 
     tc.console().print("Second output");
     tc.assert_contains("Second");
@@ -482,7 +489,7 @@ fn test_test_console_raw_vs_stripped() {
 
     // Raw output captures everything
     let raw = tc.raw_output();
-    assert!(!raw.is_empty());
+    assert_ne!(raw, [] as [std::string::String; 0]);
 }
 
 // ============================================================================

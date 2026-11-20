@@ -21,15 +21,52 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(dead_code)]
 
+use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use asupersync::{LabConfig, LabRuntime};
+use fastmcp_rust::serde_json::json;
+#[cfg(feature = "tasks")]
 use fastmcp_rust::{
-    Content, Cx, JsonSchema, McpContext, McpResult, PromptHandler, PromptMessage, ResourceContent,
-    ResourceHandler, Role, ToolHandler, prompt, resource, tool,
+    ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
 };
-use serde_json::json;
-use std::collections::HashMap;
+use fastmcp_rust::{
+    CacheScope, CacheTtl, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
+    FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
+    FinalReadResourceResult, FinalToolOutcome, Implementation, InboundRequestContext,
+    InboundRequestTransport, InputRequiredResult, JsonRpcRequest, JsonSchema,
+    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, ModernConnection,
+    Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role,
+    ToolHandler, prompt, resource, tool,
+};
+use fastmcp_server::Server;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+#[cfg(feature = "tasks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "tasks")]
+use std::task::Poll;
 
 fn test_ctx() -> McpContext {
     McpContext::new(Cx::for_testing(), 1)
+}
+
+fn run_outcome<T, F>(future: F) -> McpOutcome<T>
+where
+    T: Send + 'static,
+    F: Future<Output = McpOutcome<T>> + Send + 'static,
+{
+    let mut runtime = LabRuntime::new(LabConfig::new(0xF45A_5A11).max_steps(2_000));
+    LabRuntimeTarget::block_on(&mut runtime, future)
+}
+
+fn expect_outcome_ok<T>(outcome: McpOutcome<T>) -> T {
+    match outcome {
+        Outcome::Ok(value) => value,
+        Outcome::Err(error) => panic!("expected successful handler outcome, got {error}"),
+        Outcome::Cancelled(_) => panic!("expected successful handler outcome, got cancellation"),
+        Outcome::Panicked(_) => panic!("expected successful handler outcome, got panic"),
+    }
 }
 
 fn expect_text(content: &Content) -> &str {
@@ -42,6 +79,436 @@ fn expect_text(content: &Content) -> &str {
         );
         ""
     }
+}
+
+/// Final input responses are a public, validated correlation map rather than
+/// a caller-assembled JSON object. The root, modern, and prelude spellings
+/// must remain constructible from a facade-only dependency.
+#[test]
+fn facade_final_input_response_surface_is_constructible() {
+    use fastmcp_rust::{FinalInputResponseCorrelationError, FinalInputResponses, modern, prelude};
+
+    let root = FinalInputResponses::try_from_entries(Vec::new()).expect("empty root responses");
+    let modern =
+        modern::FinalInputResponses::try_from_entries(Vec::new()).expect("empty modern responses");
+    let prelude = prelude::FinalInputResponses::try_from_entries(Vec::new())
+        .expect("empty prelude responses");
+
+    assert!(root.is_empty());
+    assert!(modern.is_empty());
+    assert!(prelude.is_empty());
+    assert_eq!(
+        FinalInputResponseCorrelationError::MissingResponse.to_string(),
+        "missing final input response"
+    );
+}
+
+/// The experimental facade exposes the caller-driven async URI/Upgrade client
+/// and the era-pinned async server lifecycle. Synchronous split-transport
+/// client wrappers must not reappear through the facade.
+#[cfg(feature = "websocket-experimental")]
+#[test]
+fn facade_websocket_surface_is_namespace_consistent() {
+    use fastmcp_rust::{
+        AsyncWsClientTransport, AsyncWsServerTransport, Cx, McpResult, prelude, server, transport,
+    };
+
+    async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
+        let transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9000/mcp")
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        let client = fastmcp_rust::ClientBuilder::new()
+            .connect_websocket_with_cx(cx, transport)
+            .await?;
+        let _ = client.session();
+
+        let modern_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9001/mcp")
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string()))?;
+        let modern_client = fastmcp_rust::modern::ClientBuilder::new()
+            .connect_websocket_with_cx(cx, modern_transport)
+            .await?;
+        let _ = modern_client.session();
+
+        let modern_listener = fastmcp_rust::modern::server_builder("modern-ws", "1.0")
+            .build()
+            .bind_websocket(cx, "127.0.0.1:0")
+            .await?;
+        let _ = modern_listener.local_addr()?;
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9002/mcp")
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            let legacy_client = fastmcp_rust::legacy_2024::ClientBuilder::new()
+                .connect_websocket_with_cx(cx, legacy_transport)
+                .await?;
+            let _ = legacy_client.server_capabilities();
+
+            let auto_client = fastmcp_rust::auto::ClientBuilder::new()
+                .connect_websocket_auto_with_cx(cx, move |_| async move {
+                    AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9003/mcp")
+                        .await
+                        .map_err(|error| McpError::internal_error(error.to_string()))
+                })
+                .await?;
+            let _ = auto_client.session();
+
+            let legacy_listener = fastmcp_rust::legacy_2024::server_builder("legacy-ws", "1.0")
+                .build()
+                .bind_websocket(cx, "127.0.0.1:0")
+                .await?;
+            let _ = legacy_listener.local_addr()?;
+        }
+
+        Ok(())
+    }
+
+    async fn binds_modern_websocket(
+        server: fastmcp_rust::modern::Server,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        let listener = server.bind_websocket(cx, "127.0.0.1:0").await?;
+        let _ = listener.local_addr()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn binds_legacy_websocket(
+        server: fastmcp_rust::legacy_2024::Server,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        let listener = server.bind_websocket(cx, "127.0.0.1:0").await?;
+        let _ = listener.local_addr()?;
+        Ok(())
+    }
+
+    fn exposes_async_websocket_types<IO>() {
+        let _: Option<AsyncWsClientTransport<IO>> = None;
+        let _: Option<AsyncWsServerTransport<()>> = None;
+        let _: Option<server::BoundWebSocketServer> = None;
+        let _: Option<server::WebSocketServerShutdown> = None;
+        let _: Option<transport::websocket::WebSocketListener> = None;
+        let _: Option<transport::websocket::WebSocketUpgradeAdmission> = None;
+        let _: Option<prelude::WebSocketResponse> = None;
+        let _: Option<prelude::BoundWebSocketServer> = None;
+        let _: Option<prelude::WebSocketServerShutdown> = None;
+        let _ = binds_modern_websocket;
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _ = binds_legacy_websocket;
+        }
+    }
+
+    let _ = composes_actual_async_websocket_client;
+    let _ = exposes_async_websocket_types::<()>;
+}
+
+// This module intentionally imports every macro dependency through the facade
+// only. It is a focused packaging proof: a downstream user needs neither a
+// component crate nor serde_json/asupersync as a direct dependency.
+mod facade_only_macro_compile_proofs {
+    use fastmcp_rust::{
+        CompleteResult, Content, FinalCallToolResult, JsonSchema, McpContext, PromptHandler,
+        PromptMessage, ResourceContent, ResourceHandler, Role, ToolHandler, prompt, resource, tool,
+    };
+
+    #[derive(JsonSchema)]
+    struct FacadeOnlySchema {
+        title: String,
+    }
+
+    #[tool]
+    fn facade_only_legacy_tool(name: String) -> String {
+        format!("hello, {name}")
+    }
+
+    #[cfg_attr(feature = "tasks", tool(tasks))]
+    #[cfg_attr(not(feature = "tasks"), tool)]
+    fn facade_only_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
+        fastmcp_rust::FinalToolOutcome::Complete(CompleteResult::new(
+            FinalCallToolResult {
+                content: Vec::new(),
+                is_error: false,
+                structured_content: None,
+            },
+            super::final_result_meta(),
+        ))
+    }
+
+    #[resource(uri = "facade://macro-proof")]
+    fn facade_only_resource(_ctx: &McpContext) -> String {
+        "facade resource".to_string()
+    }
+
+    #[prompt]
+    fn facade_only_prompt(name: String) -> Vec<PromptMessage> {
+        vec![PromptMessage {
+            role: Role::User,
+            content: Content::text(name),
+        }]
+    }
+
+    #[test]
+    fn facade_only_paths_compile_every_macro_family_and_keep_legacy_names() {
+        assert_eq!(FacadeOnlySchema::json_schema()["type"], "object");
+        assert_eq!(
+            FacadeOnlyLegacyTool.definition().name,
+            "facade_only_legacy_tool"
+        );
+        assert_eq!(
+            FacadeOnlyFinalTaskTool.declares_final_tasks(),
+            cfg!(feature = "tasks")
+        );
+        assert_eq!(
+            FacadeOnlyResourceResource.definition().uri,
+            "facade://macro-proof"
+        );
+        assert_eq!(
+            FacadeOnlyPromptPrompt.definition().name,
+            "facade_only_prompt"
+        );
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _: Option<fastmcp_rust::legacy_2024::CancelledParams> = None;
+            let _: Option<fastmcp_rust::legacy_2024::InitializeParams> = None;
+            let _: Option<fastmcp_rust::legacy_2024::Tool> = None;
+        }
+        let _: Option<fastmcp_rust::modern::FinalCallToolParams> = None;
+        let _: Option<ResourceContent> = None;
+    }
+}
+
+/// An Apps UI declaration belongs only to the final catalog projection.  The
+/// legacy tool definition remains its exact legacy shape even when the Apps
+/// facade feature is selected.
+#[cfg(feature = "apps")]
+#[tool(ui(resource_uri = "ui://apps.example.test/weather", visibility = ["model", "app"]))]
+fn facade_apps_ui_metadata_tool() -> String {
+    "weather".to_owned()
+}
+
+#[cfg(feature = "apps")]
+#[test]
+fn tool_apps_ui_metadata_is_final_only() {
+    let handler = FacadeAppsUiMetadataTool;
+    let metadata = handler
+        .final_metadata()
+        .expect("the Apps UI macro emits final tool metadata");
+    assert_eq!(
+        metadata.get("ui"),
+        Some(&json!({
+            "resourceUri": "ui://apps.example.test/weather",
+            "visibility": ["model", "app"],
+        }))
+    );
+
+    let legacy_tool = fastmcp_rust::serde_json::to_value(handler.definition())
+        .expect("the legacy tool definition serializes");
+    assert!(
+        legacy_tool.get("_meta").is_none(),
+        "Apps metadata must not be projected onto the exact legacy tool definition"
+    );
+}
+
+#[cfg(feature = "apps")]
+#[test]
+fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
+    use fastmcp_rust::{
+        FinalAbsoluteUri, FinalCoreResult, HttpSubscriptionListener, MAX_MCP_APPS_CSP_DOMAIN_BYTES,
+        MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE, MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES,
+        MAX_MCP_APPS_UI_METADATA_MEMBERS, MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY,
+        MCP_APPS_UI_METADATA_KEY, McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
+        McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
+        McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
+        McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult,
+        McpAppsToolVisibility, McpAppsViewLifecycle, ModernHttpResponseStream,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, RequestId, SseLimits,
+        SubscriptionFilter, modern, prelude, project_final_core_tools_call_result,
+    };
+
+    let resource_uri = FinalAbsoluteUri::parse("ui://apps.example.test/view")
+        .expect("facade must expose final absolute URI parsing");
+    let metadata =
+        McpAppsToolMetadata::try_new(Some(resource_uri), Some(vec![McpAppsToolVisibility::Model]))
+            .expect("facade must expose valid final MCP Apps metadata admission");
+    assert_eq!(
+        metadata.effective_visibility(),
+        &[McpAppsToolVisibility::Model]
+    );
+    assert!(
+        metadata
+            .to_open_metadata()
+            .expect("facade metadata encoding must remain available")
+            .entries()
+            .contains_key(MCP_APPS_UI_METADATA_KEY)
+    );
+
+    let csp = McpAppsResourceCsp::try_new(
+        Some(vec!["https://api.example.test".to_owned()]),
+        None,
+        None,
+        None,
+    )
+    .expect("facade must expose bounded MCP Apps CSP admission");
+    let permissions = McpAppsResourcePermissions {
+        camera: Some(McpAppsResourcePermission {}),
+        ..McpAppsResourcePermissions::default()
+    };
+    let resource_metadata = McpAppsResourceMetadata::try_new(
+        Some(csp),
+        Some(permissions),
+        Some("apps.example.test".to_owned()),
+        Some(true),
+    )
+    .expect("facade must expose bounded MCP Apps resource metadata admission");
+    assert_eq!(resource_metadata.prefers_border, Some(true));
+    let tool_result = McpAppsToolResult::try_new(Vec::new(), false, None)
+        .expect("facade must expose bounded MCP Apps tool-result construction");
+    assert!(tool_result.content.is_empty());
+    assert_eq!(McpAppsDisplayMode::Pip, McpAppsDisplayMode::Pip);
+
+    let mut lifecycle = McpAppsViewLifecycle::default();
+    lifecycle
+        .begin_initialize()
+        .expect("final Apps lifecycle initialization must be admitted");
+    lifecycle
+        .initialization_succeeded()
+        .expect("final Apps lifecycle initialization response must be admitted");
+    lifecycle
+        .admit_initialized()
+        .expect("final Apps lifecycle notification must be admitted");
+    assert!(lifecycle.permits_application_traffic());
+
+    let non_ui_uri = FinalAbsoluteUri::parse("https://apps.example.test/view")
+        .expect("only the URI scheme differs from the accepted metadata baseline");
+    assert_eq!(
+        McpAppsToolMetadata::try_new(Some(non_ui_uri), Some(vec![McpAppsToolVisibility::Model]),),
+        Err(McpAppsMetadataError::ResourceUriMustUseUiPrefix),
+        "changing only the resource URI scheme must be rejected"
+    );
+
+    let event = ModernHttpSubscriptionListenEvent::Acknowledged {
+        accepted_filter: SubscriptionFilter::default(),
+    };
+    assert!(matches!(
+        event,
+        ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+    ));
+
+    let _: fn(
+        ModernHttpResponseStream,
+        RequestId,
+        SubscriptionFilter,
+        SseLimits,
+    ) -> Result<
+        ModernHttpSubscriptionListener,
+        fastmcp_rust::ModernHttpSubscriptionListenError,
+    > = ModernHttpResponseStream::into_final_subscriptions_listener;
+    let _: fn(&FinalCoreResult) -> Result<McpAppsToolResult, McpAppsResultProjectionError> =
+        project_final_core_tools_call_result;
+    let _: fn(&modern::FinalTool) -> Result<Option<McpAppsResourceBinding>, McpAppsMetadataError> =
+        modern::FinalTool::mcp_apps_resource_binding;
+    let _: fn(
+        &modern::FinalResource,
+    ) -> Result<Option<McpAppsResourceMetadata>, McpAppsMetadataError> =
+        modern::FinalResource::mcp_apps_metadata;
+
+    let _: Option<HttpSubscriptionListener<'static>> = None;
+    let _: Option<modern::ModernHttpSubscriptionListenEvent> = None;
+    let _: Option<modern::ModernHttpSubscriptionListener> = None;
+    let _: Option<prelude::McpAppsToolMetadata> = None;
+    let _: Option<prelude::McpAppsResourceBinding> = None;
+    let _: Option<prelude::McpAppsResourceCsp> = None;
+    let _: Option<prelude::McpAppsResourcePermission> = None;
+    let _: Option<prelude::McpAppsResourcePermissions> = None;
+    let _: Option<prelude::McpAppsToolResult> = None;
+    let _: Option<prelude::McpAppsViewLifecycle> = None;
+    let _: Option<prelude::HttpSubscriptionListener<'static>> = None;
+    let _: Option<prelude::ModernHttpSubscriptionListenEvent> = None;
+    let _: Option<prelude::ModernHttpSubscriptionListener> = None;
+    let _: usize = prelude::MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE;
+    let _: usize = prelude::MAX_MCP_APPS_CSP_DOMAIN_BYTES;
+    let _: usize = prelude::MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES;
+    let _: usize = prelude::MAX_MCP_APPS_UI_METADATA_MEMBERS;
+    assert_eq!(prelude::MCP_APPS_UI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY);
+    let _: Option<McpAppsLifecycleError> = None;
+    let _: Option<McpAppsResourceBindingError> = None;
+    let _: usize = MAX_MCP_APPS_UI_METADATA_MEMBERS;
+    let _: usize = MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES;
+    let _: usize = MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE;
+    let _: usize = MAX_MCP_APPS_CSP_DOMAIN_BYTES;
+    assert_eq!(
+        MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY,
+        "ui/resourceUri"
+    );
+}
+
+#[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+#[test]
+fn facade_only_apps_with_legacy_companion_surfaces_compile() {
+    use fastmcp_rust::legacy_2024;
+
+    let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
+    let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
+    let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
+    let _: Option<fastmcp_rust::LegacySseHttpClient> = None;
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
+    use fastmcp_rust::{
+        CoreResult, FinalPrompt, FinalResource, FinalResourceTemplate, FinalTool, JsonValue,
+        McpContext, McpResult, Prompt, ProtocolEra, ProxyClient, ProxyFinalCatalog,
+        ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+        ProxyTypedCatalog, Resource, ResourceTemplate, Tool,
+    };
+
+    let legacy = ProxyTypedCatalog {
+        tools: ProxyToolCatalog::Legacy(Vec::<Tool>::new()),
+        resources: ProxyResourceCatalog::Legacy(Vec::<Resource>::new()),
+        resource_templates: ProxyResourceTemplateCatalog::Legacy(Vec::<ResourceTemplate>::new()),
+        prompts: ProxyPromptCatalog::Legacy(Vec::<Prompt>::new()),
+    };
+    assert_eq!(
+        legacy.era().expect("legacy catalog has one exact era"),
+        ProtocolEra::Legacy2024
+    );
+
+    let final_catalog = ProxyTypedCatalog {
+        tools: ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalTool>::new())),
+        resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalResource>::new())),
+        resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(Vec::<
+            FinalResourceTemplate,
+        >::new(
+        ))),
+        prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalPrompt>::new())),
+    };
+    assert_eq!(
+        final_catalog
+            .era()
+            .expect("final catalog has one exact era"),
+        ProtocolEra::Modern2026
+    );
+    assert!(final_catalog.final_tools().is_some());
+    assert!(final_catalog.final_resources().is_some());
+    assert!(final_catalog.final_resource_templates().is_some());
+    assert!(final_catalog.final_prompts().is_some());
+
+    let _: fn(&ProxyClient) -> McpResult<ProxyTypedCatalog> = ProxyClient::catalog_typed;
+    let _: fn(&ProxyClient, &McpContext, &str, JsonValue) -> McpResult<CoreResult> =
+        ProxyClient::call_tool_typed;
+    let _: fn(&ProxyClient, &McpContext, &str) -> McpResult<CoreResult> =
+        ProxyClient::read_resource_typed;
+    let _: fn(
+        &ProxyClient,
+        &McpContext,
+        &str,
+        std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult> = ProxyClient::get_prompt_typed;
 }
 
 // ============================================================================
@@ -206,6 +673,26 @@ fn tool_call_missing_required_param_errors() {
     assert!(result.is_err());
 }
 
+#[test]
+fn tool_call_optional_param_explicit_null_matches_omitted() {
+    let handler = AddNumbers;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"a": 3, "b": 4, "label": null}))
+        .unwrap();
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "7");
+}
+
+#[test]
+fn tool_call_required_param_still_rejects_null() {
+    let handler = AddNumbers;
+    let ctx = test_ctx();
+    // `a` is i64, not Option<i64>: explicit null stays a loud type error.
+    let result = handler.call(&ctx, json!({"a": null, "b": 4}));
+    assert!(result.is_err());
+}
+
 // --- Tool with default parameter value ---
 
 /// Greets with a default punctuation suffix.
@@ -232,6 +719,43 @@ fn tool_call_uses_default_param_when_missing() {
     let result = handler.call(&ctx, json!({"name": "World"})).unwrap();
     let text = expect_text(&result[0]);
     assert_eq!(text, "Hello, World!");
+}
+
+// --- Tool with a defaulted Option parameter ---
+
+/// Echoes with a defaulted optional suffix.
+#[tool(defaults(suffix = "?"))]
+fn echo_defaulted_option(msg: String, suffix: Option<String>) -> String {
+    format!("{msg}{}", suffix.unwrap_or_default())
+}
+
+#[test]
+fn tool_defaulted_option_omitted_uses_default() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"msg": "hi"})).unwrap();
+    assert_eq!(expect_text(&result[0]), "hi?");
+}
+
+#[test]
+fn tool_defaulted_option_explicit_null_uses_default() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    // null is the wire spelling of "omitted", so the default applies.
+    let result = handler
+        .call(&ctx, json!({"msg": "hi", "suffix": null}))
+        .unwrap();
+    assert_eq!(expect_text(&result[0]), "hi?");
+}
+
+#[test]
+fn tool_defaulted_option_value_wins() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"msg": "hi", "suffix": "!"}))
+        .unwrap();
+    assert_eq!(expect_text(&result[0]), "hi!");
 }
 
 // --- Tool with context parameter ---
@@ -330,7 +854,7 @@ fn tool_no_params_empty_schema() {
     let props = def.input_schema["properties"].as_object().unwrap();
     assert!(props.is_empty());
     let required = def.input_schema["required"].as_array().unwrap();
-    assert!(required.is_empty());
+    assert_eq!(required.len(), 0);
 }
 
 #[test]
@@ -369,7 +893,7 @@ fn long_timed_tool() -> String {
 fn tool_timeout_compound() {
     let handler = LongTimedTool;
     let timeout = handler.timeout();
-    assert_eq!(timeout, Some(std::time::Duration::from_secs(90 * 60)));
+    assert_eq!(timeout, Some(std::time::Duration::from_mins(90)));
 }
 
 // --- Tool with bool parameter ---
@@ -452,7 +976,9 @@ fn async_tool_definition() {
 fn async_tool_call() {
     let handler = AsyncGreet;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"name": "Rust"})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"name": "Rust"})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "Hello async, Rust!");
 }
@@ -470,7 +996,9 @@ async fn async_ctx_tool(ctx: &McpContext, val: String) -> String {
 fn async_tool_with_context_call() {
     let handler = AsyncCtxTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"val": "test"})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"val": "test"})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "async:test");
 }
@@ -492,7 +1020,7 @@ fn tool_default_version_is_none() {
 #[test]
 fn tool_default_tags_are_empty() {
     let handler = GreetSimple;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -547,6 +1075,971 @@ fn tool_output_schema_in_definition() {
     assert!(def.output_schema.is_some());
     let schema = def.output_schema.unwrap();
     assert_eq!(schema["type"], "object");
+    let content = handler
+        .call(&test_ctx(), json!({"input": "legacy"}))
+        .expect("legacy inline-schema string conversion remains available");
+    assert_eq!(expect_text(&content[0]), "processed: legacy");
+}
+
+// --- Schema-bound ordinary return values on registered modern tools ---
+
+#[derive(serde::Serialize, JsonSchema)]
+struct SchemaBoundResponse {
+    value: Option<String>,
+    error: Option<String>,
+}
+
+static SCHEMA_BOUND_TYPED_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static SCHEMA_BOUND_TYPED_MAPPINGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn schema_bound_response_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    Some(json!({
+        "value": null,
+        "error": match kind {
+            fastmcp_rust::ToolErrorKind::InputValidation => "input-validation",
+            fastmcp_rust::ToolErrorKind::Handler => "handler",
+        }
+    }))
+}
+
+fn schema_bound_counted_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    SCHEMA_BOUND_TYPED_MAPPINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    schema_bound_response_error(kind)
+}
+
+#[tool(output_schema = SchemaBoundResponse, error_mapper = schema_bound_counted_error)]
+fn schema_bound_typed_response(input: String) -> McpResult<SchemaBoundResponse> {
+    SCHEMA_BOUND_TYPED_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if input == "handler-error" {
+        return Err(McpError::tool_error(
+            "schema-bound handler rejected the request",
+        ));
+    }
+    Ok(SchemaBoundResponse {
+        value: Some(format!("processed: {input}")),
+        error: None,
+    })
+}
+
+fn schema_bound_any_root_schema() -> serde_json::Value {
+    json!({
+        "type": ["null", "boolean", "integer", "string", "array", "object"],
+        "items": {"type": "integer"}
+    })
+}
+
+fn schema_bound_json_root(mode: &str) -> serde_json::Value {
+    match mode {
+        "null" => json!(null),
+        "false" => json!(false),
+        "zero" => json!(0),
+        "empty-string" => json!(""),
+        "array" => json!([0, 2, 7]),
+        "empty-array" => json!([]),
+        "object" => json!({}),
+        "invalid-array" => json!([0, "2", 7]),
+        _ => panic!("the fixture accepts only declared JSON root cases"),
+    }
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+fn schema_bound_inline_direct(mode: String) -> serde_json::Value {
+    schema_bound_json_root(&mode)
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+async fn schema_bound_inline_async(mode: String) -> serde_json::Value {
+    schema_bound_json_root(&mode)
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+fn schema_bound_inline_result(mode: String) -> Result<serde_json::Value, String> {
+    if mode == "handler-error" {
+        return Err("generic application error".to_owned());
+    }
+    Ok(schema_bound_json_root(&mode))
+}
+
+#[tool(
+    output_schema = schema_bound_any_root_schema(),
+    error_mapper = schema_bound_response_error
+)]
+async fn schema_bound_inline_mcp_result(mode: String) -> McpResult<serde_json::Value> {
+    match mode.as_str() {
+        "cancelled" => Err(McpError::request_cancelled()),
+        "internal" => Err(McpError::internal_error("private internal fixture failure")),
+        "handler-error" => Err(McpError::tool_error("application tool failure")),
+        _ => Ok(schema_bound_json_root(&mode)),
+    }
+}
+
+async fn schema_bound_wire_call(
+    server: &Server,
+    connection: &ModernConnection,
+    name: &str,
+    arguments: serde_json::Value,
+) -> fastmcp_rust::JsonRpcResponse {
+    let request = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+            "name": name,
+            "arguments": arguments,
+        })),
+        64_i64,
+    );
+    server
+        .dispatch_stateless(&facade_final_inbound(connection), &request)
+        .await
+        .expect("a registered modern tool call receives a wire response")
+}
+
+fn schema_bound_complete(response: fastmcp_rust::JsonRpcResponse) -> serde_json::Value {
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.expect("the complete response has a result");
+    assert_eq!(result["resultType"], "complete");
+    result
+}
+
+fn assert_schema_bound_success(result: &serde_json::Value, expected: &serde_json::Value) {
+    assert_eq!(result.get("structuredContent"), Some(expected));
+    assert!(!result["isError"].as_bool().unwrap_or(false));
+    let content = result["content"].as_array().expect("complete text content");
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().expect("JSON text fallback");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).expect("fallback is serialized JSON"),
+        *expected
+    );
+}
+
+#[test]
+fn tool_schema_bound_typed_return_and_errors_reach_registered_modern_dispatch() {
+    on_caller_runtime(async {
+        use std::sync::atomic::Ordering;
+
+        SCHEMA_BOUND_TYPED_CALLS.store(0, Ordering::SeqCst);
+        SCHEMA_BOUND_TYPED_MAPPINGS.store(0, Ordering::SeqCst);
+        let connection = ModernConnection::new();
+        let server = Server::new("schema-bound-typed", "1.0.0")
+            .tool(SchemaBoundTypedResponse)
+            .try_build()
+            .expect("the typed output and both mapped errors admit");
+        assert_eq!(SCHEMA_BOUND_TYPED_MAPPINGS.load(Ordering::SeqCst), 2);
+
+        let invalid = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": 7}),
+            )
+            .await,
+        );
+        assert_eq!(invalid["isError"], true);
+        assert_eq!(
+            invalid["structuredContent"],
+            json!({"value": null, "error": "input-validation"})
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 0);
+
+        let success = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": "seven"}),
+            )
+            .await,
+        );
+        assert_schema_bound_success(
+            &success,
+            &json!({"value": "processed: seven", "error": null}),
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 1);
+
+        let failed = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_typed_response",
+                json!({"input": "handler-error"}),
+            )
+            .await,
+        );
+        assert_eq!(failed["isError"], true);
+        assert_eq!(
+            failed["structuredContent"],
+            json!({"value": null, "error": "handler"})
+        );
+        assert_eq!(SCHEMA_BOUND_TYPED_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            SCHEMA_BOUND_TYPED_MAPPINGS.load(Ordering::SeqCst),
+            2,
+            "dispatch consumes immutable error mappings admitted at registration"
+        );
+    });
+}
+
+#[test]
+fn tool_schema_bound_inline_outputs_preserve_all_json_roots_and_result_algebras() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("schema-bound-json", "1.0.0")
+            .tool(SchemaBoundInlineDirect)
+            .tool(SchemaBoundInlineAsync)
+            .tool(SchemaBoundInlineResult)
+            .tool(SchemaBoundInlineMcpResult)
+            .try_build()
+            .expect("sync, async, Result and McpResult schema-bound tools admit");
+
+        for name in [
+            "schema_bound_inline_direct",
+            "schema_bound_inline_async",
+            "schema_bound_inline_result",
+            "schema_bound_inline_mcp_result",
+        ] {
+            for mode in [
+                "null",
+                "false",
+                "zero",
+                "empty-string",
+                "array",
+                "empty-array",
+                "object",
+            ] {
+                let result = schema_bound_complete(
+                    schema_bound_wire_call(&server, &connection, name, json!({"mode": mode})).await,
+                );
+                assert_schema_bound_success(&result, &schema_bound_json_root(mode));
+            }
+
+            let invalid = schema_bound_wire_call(
+                &server,
+                &connection,
+                name,
+                json!({"mode": "invalid-array"}),
+            )
+            .await;
+            assert!(invalid.result.is_none());
+            assert_eq!(
+                invalid
+                    .error
+                    .expect("invalid output remains a protocol error")
+                    .code
+                    .as_i32(),
+                Some(-32603)
+            );
+        }
+
+        for name in [
+            "schema_bound_inline_result",
+            "schema_bound_inline_mcp_result",
+        ] {
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    name,
+                    json!({"mode": "handler-error"}),
+                )
+                .await,
+            );
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"],
+                json!({"value": null, "error": "handler"})
+            );
+        }
+
+        for (mode, expected_code) in [("cancelled", -32004), ("internal", -32603)] {
+            let response = schema_bound_wire_call(
+                &server,
+                &connection,
+                "schema_bound_inline_mcp_result",
+                json!({"mode": mode}),
+            )
+            .await;
+            assert!(response.result.is_none());
+            assert_eq!(
+                response
+                    .error
+                    .expect("terminal errors bypass tool-error mapping")
+                    .code
+                    .as_i32(),
+                Some(expected_code)
+            );
+        }
+    });
+}
+
+fn schema_bound_incompatible_error(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    match kind {
+        fastmcp_rust::ToolErrorKind::InputValidation => schema_bound_response_error(kind),
+        fastmcp_rust::ToolErrorKind::Handler => Some(json!({"value": null, "error": 7})),
+    }
+}
+
+#[tool(output_schema = SchemaBoundResponse, error_mapper = schema_bound_incompatible_error)]
+fn schema_bound_invalid_mapper(input: String) -> SchemaBoundResponse {
+    SchemaBoundResponse {
+        value: Some(input),
+        error: None,
+    }
+}
+
+#[test]
+fn tool_schema_bound_incompatible_mapper_refuses_registration_before_catalog_mutation() {
+    let mut router = fastmcp_rust::Router::new();
+    router.add_tool(GreetSimple).expect("baseline tool admits");
+    let before = serde_json::to_value(router.tools()).expect("catalog serializes");
+    let error = router
+        .add_tool(SchemaBoundInvalidMapper)
+        .expect_err("one mismatched error branch refuses the complete registration");
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert_eq!(
+        error.message,
+        "tool error structured-content mapper does not satisfy outputSchema"
+    );
+    assert_eq!(serde_json::to_value(router.tools()).unwrap(), before);
+    assert!(router.get_tool("greet_simple").is_some());
+    assert!(router.get_tool("schema_bound_invalid_mapper").is_none());
+}
+
+mod schema_bound_nested_mapper {
+    use super::SchemaBoundResponse;
+
+    #[fastmcp_rust::tool(
+        output_schema = SchemaBoundResponse,
+        error_mapper = super::schema_bound_response_error
+    )]
+    fn parent_mapping(input: String) -> SchemaBoundResponse {
+        SchemaBoundResponse {
+            value: Some(input),
+            error: None,
+        }
+    }
+
+    fn sibling_mapping(kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+        super::schema_bound_response_error(kind)
+    }
+
+    #[fastmcp_rust::tool(
+        output_schema = SchemaBoundResponse,
+        error_mapper = self::sibling_mapping
+    )]
+    fn self_mapping(input: String) -> SchemaBoundResponse {
+        SchemaBoundResponse {
+            value: Some(input),
+            error: None,
+        }
+    }
+}
+
+#[test]
+fn tool_schema_bound_error_mapper_paths_resolve_at_the_declaration_site() {
+    assert_eq!(
+        schema_bound_nested_mapper::ParentMapping
+            .final_tool_error_structured_content(fastmcp_rust::ToolErrorKind::InputValidation),
+        Some(json!({"value": null, "error": "input-validation"}))
+    );
+    assert_eq!(
+        schema_bound_nested_mapper::SelfMapping
+            .final_tool_error_structured_content(fastmcp_rust::ToolErrorKind::Handler),
+        Some(json!({"value": null, "error": "handler"}))
+    );
+}
+
+// --- Final complete tool result projection ---
+
+fn final_tool_payload(text: &str) -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![
+                ContentBlock::text(text),
+                ContentBlock::image("aGVsbG8=", "image/png").expect("image content"),
+                ContentBlock::audio("aGVsbG8=", "audio/ogg").expect("audio content"),
+                ContentBlock::resource(
+                    "final://tool/embedded-resource",
+                    "embedded",
+                    Some("text/plain".to_string()),
+                )
+                .expect("embedded resource content"),
+            ],
+            is_error: false,
+            structured_content: None,
+        },
+        final_result_meta(),
+    )
+}
+
+#[tool(output_schema = serde_json::json!({
+    "type": "object",
+    "properties": { "answer": { "type": "string" } },
+    "required": ["answer"]
+}))]
+fn final_complete_tool_direct() -> CompleteResult<FinalCallToolResult> {
+    final_tool_payload("direct")
+}
+
+#[tool]
+fn final_complete_tool_result() -> Result<CompleteResult<FinalCallToolResult>, McpError> {
+    Ok(final_tool_payload("result"))
+}
+
+#[tool]
+fn final_complete_tool_mcp_result() -> McpResult<CompleteResult<FinalCallToolResult>> {
+    Ok(final_tool_payload("mcp-result"))
+}
+
+#[test]
+fn tool_final_complete_results_project_exact_legacy_content_and_output_schema() {
+    let direct = FinalCompleteToolDirect;
+    assert_eq!(
+        direct.output_schema(),
+        Some(json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"]
+        }))
+    );
+    assert_eq!(direct.definition().output_schema, direct.output_schema());
+
+    let ctx = test_ctx();
+    let handlers: [Box<dyn ToolHandler>; 3] = [
+        Box::new(direct),
+        Box::new(FinalCompleteToolResult),
+        Box::new(FinalCompleteToolMcpResult),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        let content = handler
+            .call(&ctx, json!({}))
+            .expect("final complete result projects");
+        assert_eq!(content.len(), 4);
+        assert_eq!(expect_text(&content[0]), expected_text);
+        assert!(matches!(
+            &content[1],
+            Content::Image { data, mime_type } if data == "aGVsbG8=" && mime_type == "image/png"
+        ));
+        assert!(matches!(
+            &content[2],
+            Content::Audio { data, mime_type } if data == "aGVsbG8=" && mime_type == "audio/ogg"
+        ));
+        let Content::Resource { resource } = &content[3] else {
+            panic!("embedded final resource must preserve the legacy content variant");
+        };
+        assert_eq!(resource.uri.as_str(), "final://tool/embedded-resource");
+        assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(resource.text.as_deref(), Some("embedded"));
+        assert!(resource.blob.is_none());
+
+        let complete = handler
+            .call_final(&ctx, json!({}))
+            .expect("explicit final results retain their exact result algebra");
+        assert_eq!(complete.payload.content.len(), 4);
+        assert!(complete.payload.structured_content.is_none());
+        assert_eq!(
+            complete
+                .meta
+                .final_server_info()
+                .expect("final metadata is valid")
+                .expect("explicit metadata retains server identity")
+                .name,
+            "macro-expansion-test"
+        );
+    }
+}
+
+#[tool]
+fn final_complete_tool_with_resource_link() -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![
+                ContentBlock::resource_link("final://tool/embedded-resource", "embedded")
+                    .expect("resource link content"),
+            ],
+            is_error: false,
+            structured_content: None,
+        },
+        final_result_meta(),
+    )
+}
+
+#[test]
+fn tool_final_complete_resource_link_rejects_lossy_legacy_projection() {
+    let error = FinalCompleteToolWithResourceLink
+        .call(&test_ctx(), json!({}))
+        .expect_err("changing only to a resource link must reject lossy legacy projection");
+
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert_eq!(
+        error.message,
+        "final tool content cannot be projected exactly through the legacy handler"
+    );
+}
+
+// --- Final tool outcome algebra ---
+
+fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
+    match mode {
+        "complete" => FinalToolOutcome::Complete(final_tool_payload("outcome-complete")),
+        "input-required" => FinalToolOutcome::InputRequired(
+            InputRequiredResult::new(None, Some("retry-state".to_string()), final_result_meta())
+                .expect("request state makes input-required valid"),
+        ),
+        #[cfg(feature = "tasks")]
+        "create-task" => FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "macro-expansion-final-task"
+            }))
+            .expect("non-null final task work descriptor"),
+            status_message: Some("queued".to_string()),
+        },
+        _ => unreachable!("test calls only supported final tool outcome modes"),
+    }
+}
+
+fn facade_final_tool_outcome_request(
+    tool_name: &str,
+    mode: &str,
+    declare_tasks: bool,
+) -> JsonRpcRequest {
+    let client_capabilities = if declare_tasks {
+        json!({
+            "extensions": { "io.modelcontextprotocol/tasks": {} },
+        })
+    } else {
+        json!({})
+    };
+    JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": client_capabilities,
+            },
+            "name": tool_name,
+            "arguments": { "mode": mode },
+        })),
+        64_i64,
+    )
+}
+
+/// Runs a test body on a caller-owned runtime, so dispatch awaits on its Cx.
+fn on_caller_runtime(body: impl Future<Output = ()>) {
+    asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("the caller runtime builds")
+        .block_on(body);
+}
+
+fn facade_final_inbound(connection: &ModernConnection) -> InboundRequestContext {
+    InboundRequestContext::with_modern_connection(
+        Cx::current().expect("the caller runtime installs its Cx"),
+        64,
+        InboundRequestTransport::Memory,
+        connection,
+    )
+}
+
+#[cfg(feature = "tasks")]
+struct NoopFinalTaskSupervisor;
+
+#[cfg(feature = "tasks")]
+impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[cfg_attr(feature = "tasks", tool(tasks))]
+#[cfg_attr(not(feature = "tasks"), tool)]
+fn final_tool_outcome_direct(mode: String) -> fastmcp_rust::FinalToolOutcome {
+    final_tool_outcome(&mode)
+}
+
+#[tool]
+fn final_tool_outcome_result(mode: String) -> Result<fastmcp_rust::FinalToolOutcome, McpError> {
+    if mode == "error" {
+        return Err(McpError::invalid_params("outcome result rejected"));
+    }
+    Ok(final_tool_outcome(&mode))
+}
+
+#[tool]
+fn final_tool_outcome_mcp_result(mode: String) -> McpResult<fastmcp_rust::FinalToolOutcome> {
+    Ok(final_tool_outcome(&mode))
+}
+
+#[tool]
+async fn final_tool_outcome_async_input_required(
+    ctx: &McpContext,
+    cancel_request: bool,
+) -> fastmcp_rust::FinalToolOutcome {
+    if cancel_request {
+        ctx.cx().set_cancel_requested(true);
+    }
+    final_tool_outcome("input-required")
+}
+
+#[test]
+fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
+    let ctx = test_ctx();
+    assert_eq!(
+        FinalToolOutcomeDirect.declares_final_tasks(),
+        cfg!(feature = "tasks"),
+        "the explicit Tasks opt-in is only emitted when its macro feature is enabled"
+    );
+    assert!(
+        !FinalToolOutcomeResult.declares_final_tasks(),
+        "canonical final outcomes do not declare final Tasks without the opt-in"
+    );
+    let handlers: [Box<dyn ToolHandler>; 3] = [
+        Box::new(FinalToolOutcomeDirect),
+        Box::new(FinalToolOutcomeResult),
+        Box::new(FinalToolOutcomeMcpResult),
+    ];
+
+    for handler in handlers {
+        assert!(
+            handler.declares_final_mrtr(),
+            "every canonical final-outcome return algebra can mint InputRequired"
+        );
+        assert!(
+            handler.call(&ctx, json!({"mode": "complete"})).is_err(),
+            "the disjoint final outcome must not leak through the legacy hook"
+        );
+
+        match handler
+            .call_final_outcome(&ctx, json!({"mode": "complete"}))
+            .expect("complete outcome is preserved")
+        {
+            FinalToolOutcome::Complete(result) => {
+                let ContentBlock::Text { text, .. } = &result.payload.content[0] else {
+                    panic!("complete outcome keeps text content");
+                };
+                assert_eq!(text, "outcome-complete");
+            }
+            _ => panic!("expected complete final tool outcome"),
+        }
+
+        assert!(matches!(
+            handler
+                .call_final_outcome(&ctx, json!({"mode": "input-required"}))
+                .expect("input-required outcome is preserved"),
+            FinalToolOutcome::InputRequired(_)
+        ));
+        #[cfg(feature = "tasks")]
+        assert!(matches!(
+            handler
+                .call_final_outcome(&ctx, json!({"mode": "create-task"}))
+                .expect("task creation outcome is preserved"),
+            FinalToolOutcome::CreateTask {
+                work_descriptor,
+                status_message: Some(ref message),
+            } if message == "queued"
+                && work_descriptor.as_value() == &json!({
+                    "operation": "macro-expansion-final-task"
+                })
+        ));
+    }
+}
+
+#[test]
+fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("facade-final-outcome", "1.0.0")
+            .tool(FinalToolOutcomeResult)
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_result",
+                    "input-required",
+                    false,
+                ),
+            )
+            .await
+            .expect("facade final tools/call returns an input-required wire response");
+        let result = response
+            .result
+            .expect("input-required final tools/call has a result");
+
+        assert!(response.error.is_none());
+        assert_eq!(result["resultType"], "input_required");
+        let request_state = result["requestState"]
+            .as_str()
+            .expect("the framework emits an opaque MRTR continuation state");
+        assert!(!request_state.is_empty());
+        assert_ne!(
+            request_state, "retry-state",
+            "handler-controlled state must not cross the framework MRTR boundary"
+        );
+    });
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn facade_final_tool_outcome_creates_task_through_modern_wire() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+        let emitted_notifications = std::sync::Arc::clone(&notifications);
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            std::sync::Arc::new(move |_| {
+                emitted_notifications.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let service_runner = runtime
+            .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+            .expect("the facade installs an application-owned task service");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let server = Server::new("facade-final-task", "1.0.0")
+            .tool(FinalToolOutcomeDirect)
+            .final_tasks(runtime.clone())
+            .expect("final Tasks install through the facade builder")
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_direct",
+                    "create-task",
+                    true,
+                ),
+            )
+            .await
+            .expect("task-capable facade final tools/call returns a wire response");
+        assert!(response.error.is_none());
+        let result = response.result.expect("task final tools/call has a result");
+        assert_eq!(result["resultType"], "task");
+        assert_eq!(result["status"], "working");
+        assert_eq!(result["statusMessage"], "queued");
+        let task_id = fastmcp_rust::FinalTaskId::parse(
+            result["taskId"]
+                .as_str()
+                .expect("task creation wire result includes its public task identifier"),
+        )
+        .expect("task creation wire result has a valid public task identifier");
+        let retained = runtime
+            .get_task(&task_id)
+            .expect("the created task remains readable from the caller-owned runtime");
+        let mut durable_task = result.clone();
+        durable_task
+            .as_object_mut()
+            .expect("task result is an object")
+            .remove("resultType");
+        assert_eq!(
+            serde_json::to_value(retained.task).expect("created task serializes"),
+            durable_task,
+            "the public task result is the exact durable caller-owned task state"
+        );
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            1,
+            "creation advertises one durable task state transition"
+        );
+    });
+}
+
+#[cfg(feature = "tasks")]
+#[test]
+fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+        let emitted_notifications = std::sync::Arc::clone(&notifications);
+        let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = FinalTaskRuntime::new(
+            task_store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
+            std::sync::Arc::new(move |_| {
+                emitted_notifications.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let service_runner = runtime
+            .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
+            .expect("the facade installs an application-owned task service");
+        let service_cx = Cx::for_testing();
+        let mut running_service = Box::pin(service_runner.run(&service_cx));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Future::poll(running_service.as_mut(), &mut task_cx),
+            Poll::Pending
+        ));
+        let retained_task = runtime
+            .create_task_with_work(
+                FinalTaskWorkDescriptor::new(json!({
+                    "operation": "retained-state-for-capability-rejection"
+                }))
+                .expect("non-null retained task work descriptor"),
+                Some("retained before capability rejection".to_owned()),
+            )
+            .expect("the ready caller-owned runtime creates retained work")
+            .task;
+        let retained_task_id = retained_task.base().task_id.clone();
+        let state_before = serde_json::to_value(
+            runtime
+                .get_task(&retained_task_id)
+                .expect("read retained task before the capability rejection")
+                .task,
+        )
+        .expect("retained task serializes before the capability rejection");
+        let task_count_before = task_store.task_count();
+        let notifications_before = notifications.load(Ordering::SeqCst);
+        let server = Server::new("facade-final-task", "1.0.0")
+            .tool(FinalToolOutcomeDirect)
+            .final_tasks(runtime.clone())
+            .expect("final Tasks install through the facade builder")
+            .build();
+        let response = server
+            .dispatch_stateless(
+                &facade_final_inbound(&connection),
+                &facade_final_tool_outcome_request(
+                    "final_tool_outcome_direct",
+                    "create-task",
+                    false,
+                ),
+            )
+            .await
+            .expect("missing task capability returns a JSON-RPC error response");
+
+        assert!(response.result.is_none());
+        let error = response
+            .error
+            .expect("missing task capability returns the final capability error");
+        assert_eq!(
+            error.code,
+            MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE.into()
+        );
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "requiredCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} },
+                },
+            }))
+        );
+        assert_eq!(
+            serde_json::to_value(
+                runtime
+                    .get_task(&retained_task_id)
+                    .expect("read retained task after the capability rejection")
+                    .task,
+            )
+            .expect("retained task serializes after the capability rejection"),
+            state_before,
+            "removing only the client Tasks capability leaves durable task state unchanged"
+        );
+        assert_eq!(
+            task_store.task_count(),
+            task_count_before,
+            "removing only the client Tasks capability cannot add another durable task"
+        );
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            notifications_before,
+            "removing only the client Tasks capability emits no task transition"
+        );
+    });
+}
+
+#[cfg(not(feature = "tasks"))]
+#[test]
+fn facade_final_tool_outcome_rejects_undeclared_task_before_router_admission() {
+    let ctx = test_ctx();
+    let outcome = run_outcome(async move {
+        FinalToolOutcomeDirect
+            .call_final_outcome_async(&ctx, json!({"mode": "create-task"}))
+            .await
+    });
+
+    match outcome {
+        Outcome::Err(error) => {
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "tool returned CreateTask without declaring final Tasks capability"
+            );
+        }
+        Outcome::Ok(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => {
+            panic!("undeclared CreateTask must be rejected before router admission");
+        }
+    }
+}
+
+#[test]
+fn tool_final_outcome_result_preserves_mcp_error() {
+    let error =
+        match FinalToolOutcomeResult.call_final_outcome(&test_ctx(), json!({"mode": "error"})) {
+            Err(error) => error,
+            Ok(_) => panic!("the handler's McpError must cross the final outcome hook unchanged"),
+        };
+
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
+    assert_eq!(error.message, "outcome result rejected");
+}
+
+#[test]
+fn async_tool_final_outcome_request_hook_rejects_pre_cancelled_request() {
+    let handler = FinalToolOutcomeAsyncInputRequired;
+    let request_cx = Cx::for_testing();
+    request_cx.set_cancel_requested(true);
+    let ctx = McpContext::new(request_cx.clone(), 62);
+    let outcome = run_outcome(async move {
+        handler
+            .call_final_outcome_async_in_request(
+                &ctx,
+                &request_cx,
+                json!({"cancel_request": false}),
+            )
+            .await
+    });
+
+    assert!(matches!(outcome, Outcome::Cancelled(_)));
+}
+
+#[test]
+fn async_tool_final_outcome_request_hook_discards_post_handler_cancelled_outcome() {
+    let handler = FinalToolOutcomeAsyncInputRequired;
+    let request_cx = Cx::for_testing();
+    let ctx = McpContext::new(request_cx.clone(), 63);
+    let outcome = run_outcome(async move {
+        handler
+            .call_final_outcome_async_in_request(&ctx, &request_cx, json!({"cancel_request": true}))
+            .await
+    });
+
+    assert!(matches!(outcome, Outcome::Cancelled(_)));
 }
 
 // --- Tool with HashMap parameter ---
@@ -696,7 +2189,7 @@ fn tool_all_optional_none_required() {
     let handler = AllOptionalTool;
     let def = handler.definition();
     let required = def.input_schema["required"].as_array().unwrap();
-    assert!(required.is_empty());
+    assert_eq!(required.len(), 0);
 }
 
 #[test]
@@ -706,6 +2199,30 @@ fn tool_all_optional_call_empty() {
     let result = handler.call(&ctx, json!({})).unwrap();
     let text = expect_text(&result[0]);
     assert_eq!(text, "a=none, b=none, c=none");
+}
+
+#[test]
+fn tool_optional_param_schema_is_nullable_union() {
+    let handler = AllOptionalTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["a"]["type"], json!(["string", "null"]));
+    assert_eq!(props["b"]["type"], json!(["integer", "null"]));
+    assert_eq!(props["c"]["type"], json!(["boolean", "null"]));
+    // Optional params stay out of `required` even though they admit null.
+    let required = def.input_schema["required"].as_array().unwrap();
+    assert_eq!(required.len(), 0);
+}
+
+#[test]
+fn tool_all_optional_call_explicit_null_is_omitted() {
+    let handler = AllOptionalTool;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"a": null, "b": 42, "c": null}))
+        .unwrap();
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a=none, b=42, c=none");
 }
 
 #[test]
@@ -758,7 +2275,9 @@ async fn async_fallible_tool(succeed: bool) -> McpResult<String> {
 fn async_fallible_tool_ok() {
     let handler = AsyncFallibleTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"succeed": true})).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler.call_async(&ctx, json!({"succeed": true})).await
+    }));
     let text = expect_text(&result[0]);
     assert_eq!(text, "async success");
 }
@@ -767,8 +2286,9 @@ fn async_fallible_tool_ok() {
 fn async_fallible_tool_err() {
     let handler = AsyncFallibleTool;
     let ctx = test_ctx();
-    let result = handler.call(&ctx, json!({"succeed": false}));
-    assert!(result.is_err());
+    let outcome =
+        run_outcome(async move { handler.call_async(&ctx, json!({"succeed": false})).await });
+    assert!(matches!(outcome, Outcome::Err(_)));
 }
 
 // ============================================================================
@@ -816,12 +2336,7 @@ fn tool_annotations_destructive_only() {
 }
 
 /// Tool with all annotations set.
-#[tool(annotations(
-    read_only,
-    idempotent,
-    destructive,
-    open_world_hint = "accepts extra fields"
-))]
+#[tool(annotations(read_only, idempotent, destructive, open_world_hint = true))]
 fn fully_annotated(_ctx: &McpContext) -> String {
     "full".to_string()
 }
@@ -834,7 +2349,7 @@ fn tool_annotations_all_fields() {
     assert_eq!(ann.read_only, Some(true));
     assert_eq!(ann.idempotent, Some(true));
     assert_eq!(ann.destructive, Some(true));
-    assert_eq!(ann.open_world_hint.as_deref(), Some("accepts extra fields"));
+    assert_eq!(ann.open_world_hint, Some(true));
 }
 
 /// Tool with version only, no annotations.
@@ -863,6 +2378,34 @@ fn tool_no_annotations_no_version_stays_none() {
     let def = handler.definition();
     assert!(def.version.is_none());
     assert!(def.annotations.is_none());
+    assert!(def.icon.is_none());
+}
+
+/// Tool with an explicit icon source.
+#[tool(icon = "https://example.com/tool.png")]
+fn icon_tool(_ctx: &McpContext) -> String {
+    "icon".to_string()
+}
+
+#[test]
+fn tool_icon_is_advertised_on_definition() {
+    let handler = IconTool;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/tool.png")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(final_icons[0].src.as_str(), "https://example.com/tool.png");
+}
+
+#[test]
+fn tool_without_icon_does_not_invent_one() {
+    let def = PlainTool.definition();
+    assert!(def.icon.is_none());
 }
 
 /// Tool with annotations, version, and tags combined.
@@ -1053,7 +2596,7 @@ fn async_resource_definition() {
 fn async_resource_read() {
     let handler = AsyncResourceResource;
     let ctx = test_ctx();
-    let result = handler.read(&ctx).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move { handler.read_async(&ctx).await }));
     assert_eq!(result[0].text, Some("async data".to_string()));
 }
 
@@ -1087,6 +2630,130 @@ fn resource_result_ok() {
     assert_eq!(result[0].text, Some("ok".to_string()));
 }
 
+// --- Final complete resource result projection ---
+
+fn final_result_meta() -> ResultMeta {
+    ResultMeta::server_generated(Implementation {
+        name: "macro-expansion-test".to_string(),
+        version: "1.0.0".to_string(),
+        title: None,
+        description: None,
+        website_url: None,
+        icons: Vec::new(),
+        additional: BTreeMap::new(),
+    })
+}
+
+fn final_resource_payload(text: &str) -> CompleteResult<FinalReadResourceResult> {
+    CompleteResult::new(
+        FinalReadResourceResult {
+            contents: vec![EmbeddedResourceContents::Text {
+                uri: FinalAbsoluteUri::parse("final://resource/content").expect("valid final URI"),
+                text: text.to_string(),
+                mime_type: Some("application/json".to_string()),
+                meta: None,
+                additional: BTreeMap::new(),
+            }],
+            ttl_ms: CacheTtl::milliseconds(0),
+            cache_scope: CacheScope::Private,
+        },
+        final_result_meta(),
+    )
+}
+
+#[resource(uri = "final://resource/direct")]
+fn final_complete_resource_direct() -> CompleteResult<FinalReadResourceResult> {
+    final_resource_payload("direct")
+}
+
+#[resource(uri = "final://resource/result")]
+fn final_complete_resource_result() -> Result<CompleteResult<FinalReadResourceResult>, McpError> {
+    Ok(final_resource_payload("result"))
+}
+
+#[resource(uri = "final://resource/mcp-result")]
+fn final_complete_resource_mcp_result() -> McpResult<CompleteResult<FinalReadResourceResult>> {
+    Ok(final_resource_payload("mcp-result"))
+}
+
+#[resource(uri = "final://resource/async-outcome")]
+async fn async_final_resource_outcome()
+-> fastmcp_rust::server::FinalMethodOutcome<FinalReadResourceResult> {
+    fastmcp_rust::server::FinalMethodOutcome::Complete(final_resource_payload("async-outcome"))
+}
+
+#[test]
+fn resource_final_complete_results_keep_final_payloads() {
+    let ctx = test_ctx();
+    let handlers: [Box<dyn ResourceHandler>; 3] = [
+        Box::new(FinalCompleteResourceDirectResource),
+        Box::new(FinalCompleteResourceResultResource),
+        Box::new(FinalCompleteResourceMcpResultResource),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        assert!(
+            handler.read(&ctx).is_err(),
+            "legacy hook must not project final payload"
+        );
+        let result = handler
+            .read_final(&ctx)
+            .expect("final complete result remains on the final hook");
+        let [
+            EmbeddedResourceContents::Text {
+                uri,
+                text,
+                mime_type,
+                meta,
+                additional,
+            },
+        ] = result.payload.contents.as_slice()
+        else {
+            panic!("final resource result contains one text resource");
+        };
+        assert_eq!(uri.as_str(), "final://resource/content");
+        assert_eq!(mime_type.as_deref(), Some("application/json"));
+        assert_eq!(text, expected_text);
+        assert!(meta.is_none());
+        assert!(additional.is_empty());
+    }
+}
+
+#[test]
+fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("facade-final-resource-outcome", "1.0.0")
+            .resource(AsyncFinalResourceOutcomeResource)
+            .build();
+        let request = JsonRpcRequest::new(
+            "resources/read",
+            Some(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "uri": "final://resource/async-outcome",
+            })),
+            64_i64,
+        );
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request)
+            .await
+            .expect("the public final resources/read route invokes the async macro outcome hook");
+        assert!(
+            response.error.is_none(),
+            "final resources/read returned an unexpected error: {:?}",
+            response.error
+        );
+        let result = response
+            .result
+            .expect("final resources/read returns its outcome as a result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["contents"][0]["text"], "async-outcome");
+    });
+}
+
 // --- Resource default trait methods ---
 
 #[test]
@@ -1104,7 +2771,7 @@ fn resource_default_version_is_none() {
 #[test]
 fn resource_default_tags_are_empty() {
     let handler = AppConfigResource;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -1139,6 +2806,29 @@ fn resource_multi_param_read_with_uri() {
         .read_with_uri(&ctx, "files://docs/readme.txt", &params)
         .unwrap();
     assert_eq!(result[0].text, Some("docs/readme.txt".to_string()));
+}
+
+/// A resource whose two Rust parameters come from one RFC 6570 expression.
+#[resource(uri = "macro://resource{?collection*,revision*}")]
+fn multi_variable_expression_resource(collection: String, revision: String) -> String {
+    format!("{collection}:{revision}")
+}
+
+#[test]
+fn resource_multi_variable_expression_flattens_every_template_parameter() {
+    let handler = MultiVariableExpressionResourceResource;
+    let ctx = test_ctx();
+    let mut params = HashMap::new();
+    params.insert("collection".to_string(), "books".to_string());
+    params.insert("revision".to_string(), "stable".to_string());
+    let result = handler
+        .read_with_uri(
+            &ctx,
+            "macro://resource?collection=books&revision=stable",
+            &params,
+        )
+        .expect("both parameters from one expression reach the resource function");
+    assert_eq!(result[0].text, Some("books:stable".to_string()));
 }
 
 // --- Resource with optional URI template parameter ---
@@ -1212,7 +2902,7 @@ fn async_resource_with_context_definition() {
 fn async_resource_with_context_read() {
     let handler = AsyncCtxResourceResource;
     let ctx = test_ctx();
-    let result = handler.read(&ctx).unwrap();
+    let result = expect_outcome_ok(run_outcome(async move { handler.read_async(&ctx).await }));
     assert_eq!(result[0].text, Some("async_request_id=1".to_string()));
 }
 
@@ -1257,9 +2947,11 @@ fn async_template_resource_read() {
     let ctx = test_ctx();
     let mut params = HashMap::new();
     params.insert("path".to_string(), "data.json".to_string());
-    let result = handler
-        .read_with_uri(&ctx, "async-file://data.json", &params)
-        .unwrap();
+    let result = expect_outcome_ok(run_outcome(async move {
+        handler
+            .read_async_with_uri(&ctx, "async-file://data.json", &params)
+            .await
+    }));
     assert_eq!(
         result[0].text,
         Some("async contents of data.json".to_string())
@@ -1308,6 +3000,31 @@ fn resource_version_and_tags() {
     let def = handler.definition();
     assert_eq!(def.version.as_deref(), Some("3.0.0"));
     assert_eq!(def.tags, vec!["monitoring", "metrics"]);
+    assert!(def.icon.is_none());
+}
+
+/// Resource with an explicit icon source.
+#[resource(uri = "data://icon", icon = "https://example.com/resource.svg")]
+fn icon_resource() -> String {
+    "icon-resource".to_string()
+}
+
+#[test]
+fn resource_icon_is_advertised_on_definition() {
+    let handler = IconResourceResource;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/resource.svg")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the resource icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(
+        final_icons[0].src.as_str(),
+        "https://example.com/resource.svg"
+    );
 }
 
 /// Resource with version only.
@@ -1321,7 +3038,7 @@ fn resource_version_without_tags() {
     let handler = PlainVersionedResourceResource;
     let def = handler.definition();
     assert_eq!(def.version.as_deref(), Some("1.0.0"));
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 /// Resource with no version or tags (backwards compat).
@@ -1335,7 +3052,7 @@ fn resource_no_version_no_tags_stays_none() {
     let handler = BasicResourceResource;
     let def = handler.definition();
     assert!(def.version.is_none());
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 // ============================================================================
@@ -1376,6 +3093,36 @@ fn prompt_definition_arguments() {
     assert!(def.arguments[0].required);
     // No doc comment on parameter, so description is None
     assert!(def.arguments[0].description.is_none());
+    assert!(def.icon.is_none());
+}
+
+/// Prompt with an explicit icon source.
+#[prompt(icon = "https://example.com/prompt.png")]
+fn icon_prompt(name: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("Greet {name}"),
+        },
+    }]
+}
+
+#[test]
+fn prompt_icon_is_advertised_on_definition() {
+    let handler = IconPromptPrompt;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/prompt.png")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the prompt icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(
+        final_icons[0].src.as_str(),
+        "https://example.com/prompt.png"
+    );
 }
 
 /// A greeting prompt with a default argument.
@@ -1592,9 +3339,37 @@ fn async_prompt_get() {
     let ctx = test_ctx();
     let mut args = HashMap::new();
     args.insert("text".to_string(), "async hello".to_string());
-    let result = handler.get(&ctx, args).unwrap();
+    let result = expect_outcome_ok(run_outcome(
+        async move { handler.get_async(&ctx, args).await },
+    ));
     let text = expect_text(&result[0].content);
     assert_eq!(text, "async hello");
+}
+
+#[test]
+fn async_generated_handlers_reject_synchronous_trait_entry_points() {
+    let ctx = test_ctx();
+
+    let tool_error = AsyncGreet
+        .call(&ctx, json!({"name": "Rust"}))
+        .expect_err("an async tool has no synchronous execution entry point");
+    assert_eq!(tool_error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert!(tool_error.message.contains("call_async"));
+
+    let resource_error = AsyncResourceResource
+        .read(&ctx)
+        .expect_err("an async resource has no synchronous execution entry point");
+    assert_eq!(
+        resource_error.code,
+        fastmcp_rust::McpErrorCode::InternalError
+    );
+    assert!(resource_error.message.contains("read_async"));
+
+    let prompt_error = AsyncPromptPrompt
+        .get(&ctx, HashMap::new())
+        .expect_err("an async prompt has no synchronous execution entry point");
+    assert_eq!(prompt_error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert!(prompt_error.message.contains("get_async"));
 }
 
 // --- Prompt default trait methods ---
@@ -1614,7 +3389,7 @@ fn prompt_default_version_is_none() {
 #[test]
 fn prompt_default_tags_are_empty() {
     let handler = GreetingPromptPrompt;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -1695,6 +3470,66 @@ fn prompt_result_err() {
     assert_eq!(err.code, fastmcp_rust::McpErrorCode::InvalidParams);
 }
 
+// --- Final complete prompt result projection ---
+
+fn final_prompt_payload(text: &str) -> CompleteResult<FinalGetPromptResult> {
+    CompleteResult::new(
+        FinalGetPromptResult {
+            description: Some("final prompt metadata is projected by the modern layer".to_string()),
+            messages: vec![FinalPromptMessage {
+                role: Role::Assistant,
+                content: ContentBlock::Text {
+                    text: text.to_string(),
+                    annotations: None,
+                    meta: None,
+                    additional: BTreeMap::new(),
+                },
+            }],
+        },
+        final_result_meta(),
+    )
+}
+
+#[prompt]
+fn final_complete_prompt_direct() -> CompleteResult<FinalGetPromptResult> {
+    final_prompt_payload("direct")
+}
+
+#[prompt]
+fn final_complete_prompt_result() -> Result<CompleteResult<FinalGetPromptResult>, McpError> {
+    Ok(final_prompt_payload("result"))
+}
+
+#[prompt]
+fn final_complete_prompt_mcp_result() -> McpResult<CompleteResult<FinalGetPromptResult>> {
+    Ok(final_prompt_payload("mcp-result"))
+}
+
+#[test]
+fn prompt_final_complete_results_keep_final_payloads() {
+    let ctx = test_ctx();
+    let handlers: [Box<dyn PromptHandler>; 3] = [
+        Box::new(FinalCompletePromptDirectPrompt),
+        Box::new(FinalCompletePromptResultPrompt),
+        Box::new(FinalCompletePromptMcpResultPrompt),
+    ];
+
+    for (handler, expected_text) in handlers.into_iter().zip(["direct", "result", "mcp-result"]) {
+        assert!(
+            handler.get(&ctx, HashMap::new()).is_err(),
+            "legacy hook must not project final payload"
+        );
+        let result = handler
+            .get_final(&ctx, HashMap::new())
+            .expect("final complete result remains on the final hook");
+        let [FinalPromptMessage { role, content }] = result.payload.messages.as_slice() else {
+            panic!("final prompt result contains one message");
+        };
+        assert_eq!(*role, Role::Assistant);
+        assert!(matches!(content, ContentBlock::Text { text, .. } if text == expected_text));
+    }
+}
+
 // --- Async prompt with context ---
 
 /// Async prompt using context.
@@ -1723,7 +3558,9 @@ fn async_prompt_with_context_get() {
     let ctx = test_ctx();
     let mut args = HashMap::new();
     args.insert("msg".to_string(), "hello".to_string());
-    let result = handler.get(&ctx, args).unwrap();
+    let result = expect_outcome_ok(run_outcome(
+        async move { handler.get_async(&ctx, args).await },
+    ));
     let text = expect_text(&result[0].content);
     assert_eq!(text, "async_req:1 msg:hello");
 }
@@ -1872,7 +3709,7 @@ fn prompt_no_version_no_tags_stays_none() {
     let handler = BasicPromptPrompt;
     let def = handler.definition();
     assert!(def.version.is_none());
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 // ============================================================================
@@ -1910,7 +3747,8 @@ fn json_schema_struct_field_types() {
     let schema = Person::json_schema();
     let props = schema["properties"].as_object().unwrap();
     assert_eq!(props["name"]["type"], "string");
-    assert_eq!(props["age"]["type"], "integer");
+    // Option<u32> widens to a nullable union: explicit null == omitted.
+    assert_eq!(props["age"]["type"], json!(["integer", "null"]));
     assert_eq!(props["tags"]["type"], "array");
     assert_eq!(props["tags"]["items"]["type"], "string");
 }
@@ -1985,8 +3823,8 @@ fn json_schema_nested_vec() {
 fn json_schema_optional_vec() {
     let schema = Nested::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    // Option<Vec<String>> → array of strings, not required
-    assert_eq!(props["optional_items"]["type"], "array");
+    // Option<Vec<String>> → nullable array of strings, not required
+    assert_eq!(props["optional_items"]["type"], json!(["array", "null"]));
     assert_eq!(props["optional_items"]["items"]["type"], "string");
     let required: Vec<&str> = schema["required"]
         .as_array()
@@ -2269,8 +4107,8 @@ fn json_schema_map_of_lists_field() {
 fn json_schema_optional_map_field() {
     let schema = DeeplyNested::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    // Option<HashMap<String, i32>> - should be object, not required
-    assert_eq!(props["optional_map"]["type"], "object");
+    // Option<HashMap<String, i32>> - nullable object, not required
+    assert_eq!(props["optional_map"]["type"], json!(["object", "null"]));
     assert_eq!(
         props["optional_map"]["additionalProperties"]["type"],
         "integer"
@@ -2316,10 +4154,10 @@ fn json_schema_many_optionals_properties() {
     let props = schema["properties"].as_object().unwrap();
     // All 5 fields should be present
     assert_eq!(props.len(), 5);
-    assert_eq!(props["opt1"]["type"], "string");
-    assert_eq!(props["opt2"]["type"], "integer");
-    assert_eq!(props["opt3"]["type"], "boolean");
-    assert_eq!(props["opt4"]["type"], "array");
+    assert_eq!(props["opt1"]["type"], json!(["string", "null"]));
+    assert_eq!(props["opt2"]["type"], json!(["integer", "null"]));
+    assert_eq!(props["opt3"]["type"], json!(["boolean", "null"]));
+    assert_eq!(props["opt4"]["type"], json!(["array", "null"]));
 }
 
 // --- Enum with multiple variant types ---
@@ -2346,6 +4184,1853 @@ fn json_schema_mixed_enum_variants() {
 fn json_schema_enum_description() {
     let schema = StatusVariants::json_schema();
     assert_eq!(schema["description"], "Status with mixed variants.");
+}
+
+/// Every default Serde enum representation must survive schema admission.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum WireEnum {
+    Idle,
+    Message(String),
+    Pair(String, u32),
+    Record {
+        /// Required work count.
+        count: u32,
+        label: Option<String>,
+    },
+    EmptyTuple(),
+    EmptyRecord {},
+}
+
+#[test]
+fn json_schema_external_enum_accepts_actual_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(WireEnum::json_schema())
+        .expect("derived enum is a valid final-dialect schema");
+    for value in [
+        WireEnum::Idle,
+        WireEnum::Message("hello".to_owned()),
+        WireEnum::Pair("work".to_owned(), 3),
+        WireEnum::Record {
+            count: 3,
+            label: None,
+        },
+        WireEnum::Record {
+            count: 3,
+            label: Some("work".to_owned()),
+        },
+        WireEnum::EmptyTuple(),
+        WireEnum::EmptyRecord {},
+    ] {
+        let encoded = serde_json::to_value(&value).expect("enum serializes");
+        schema
+            .validate(&encoded)
+            .expect("actual Serde payload must be admitted");
+        assert_eq!(
+            serde_json::from_str::<WireEnum>(&serde_json::to_string(&value).unwrap()).unwrap(),
+            value
+        );
+    }
+    schema
+        .validate(&json!({"Record": {"count": 3}}))
+        .expect("omitted Option field stays optional inside a variant");
+    assert!(
+        schema.schema()["oneOf"][4]["properties"]["EmptyTuple"]
+            .get("prefixItems")
+            .is_none()
+    );
+    assert_eq!(
+        schema.schema()["oneOf"][3]["properties"]["Record"]["properties"]["count"]["description"],
+        "Required work count."
+    );
+}
+
+#[test]
+fn json_schema_external_enum_rejects_wrong_tags_and_payload_shapes() {
+    let schema = fastmcp_rust::schema::admit_final_schema(WireEnum::json_schema()).unwrap();
+    // Serde accepts this alternate unit representation on input, but emits a
+    // string. The generated schema describes its canonical serialized form.
+    assert!(schema.validate(&json!({"Idle": null})).is_err());
+    for invalid in [
+        json!("Unknown"),
+        json!({"Message": 3}),
+        json!({"Message": "hello", "extra": true}),
+        json!({"Message": "hello", "Pair": ["work", 3]}),
+        json!({"Pair": {}}),
+        json!({"Pair": ["work"]}),
+        json!({"Pair": ["work", 3, 4]}),
+        json!({"Pair": [3, "work"]}),
+        json!({"Record": {}}),
+        json!({"Record": {"count": "three"}}),
+        json!({"Record": {"count": 3, "label": false}}),
+        json!({"EmptyTuple": {}}),
+        json!({"EmptyTuple": [1]}),
+        json!({"EmptyRecord": []}),
+    ] {
+        assert!(
+            serde_json::from_value::<WireEnum>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[tool]
+fn describe_wire_enum(value: WireEnum) -> String {
+    format!("{value:?}")
+}
+
+#[test]
+fn json_schema_external_enum_reaches_registered_modern_tool() {
+    on_caller_runtime(async {
+        let server = Server::new("enum-schema", "1.0.0")
+            .tool(DescribeWireEnum)
+            .build();
+        let connection = ModernConnection::new();
+        for value in [
+            json!("Idle"),
+            json!({"Pair": ["work", 3]}),
+            json!({"Record": {"count": 3}}),
+        ] {
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_wire_enum",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request)
+                .await
+                .expect("registered enum tool produces a response");
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.expect("enum tool produced a result");
+            assert_eq!(result["resultType"], "complete");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            );
+        }
+    });
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RecursiveSchemaNode {
+    value: i32,
+    children: Vec<Self>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum RecursiveSchemaExpression {
+    Literal(i64),
+    Negate(Box<Self>),
+    Add(Box<Self>, Box<Self>),
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct RecursiveSchemaBranch {
+    label: String,
+    edge: Option<Box<RecursiveSchemaEdge>>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum RecursiveSchemaEdge {
+    Finish,
+    Visit(RecursiveSchemaBranch),
+}
+
+#[test]
+fn json_schema_recursive_struct_preserves_constraints_at_every_level() {
+    let generated = RecursiveSchemaNode::try_json_schema()
+        .expect("finite local definitions represent a recursive Vec");
+    assert_eq!(generated, RecursiveSchemaNode::json_schema());
+    assert_eq!(generated["type"], "object");
+    assert_eq!(generated["$defs"].as_object().unwrap().len(), 1);
+    let schema = fastmcp_rust::schema::admit_final_schema(generated)
+        .expect("every recursive reference resolves inside the standalone document");
+    let valid = json!({
+        "value": 1,
+        "children": [{"value": 2, "children": [{"value": 3, "children": []}]}]
+    });
+    schema.validate(&valid).expect("nested tree is admitted");
+    let tree: RecursiveSchemaNode = serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(tree).unwrap(), valid);
+    for invalid in [
+        json!({"value": 1, "children": [{"value": "two", "children": []}]}),
+        json!({"value": 1, "children": [{"value": 2, "children": [], "extra": true}]}),
+        json!({"value": 1, "children": [{"value": 2}]}),
+    ] {
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<RecursiveSchemaNode>(invalid).is_err());
+    }
+}
+
+#[test]
+fn json_schema_recursive_enum_and_mutual_recursion_follow_serde() {
+    let expression_schema =
+        fastmcp_rust::schema::admit_final_schema(RecursiveSchemaExpression::json_schema())
+            .expect("recursive enum emits a closed local reference graph");
+    let expression = RecursiveSchemaExpression::Add(
+        Box::new(RecursiveSchemaExpression::Literal(4)),
+        Box::new(RecursiveSchemaExpression::Negate(Box::new(
+            RecursiveSchemaExpression::Literal(2),
+        ))),
+    );
+    let valid = serde_json::to_value(&expression).unwrap();
+    expression_schema.validate(&valid).unwrap();
+    assert_eq!(
+        serde_json::from_value::<RecursiveSchemaExpression>(valid.clone()).unwrap(),
+        expression
+    );
+    let mut invalid = valid;
+    invalid["Add"][1]["Negate"]["Literal"] = json!("two");
+    assert!(expression_schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<RecursiveSchemaExpression>(invalid).is_err());
+
+    let branch_schema =
+        fastmcp_rust::schema::admit_final_schema(RecursiveSchemaBranch::json_schema())
+            .expect("mutually recursive types resolve in one generation context");
+    let valid = json!({
+        "label": "root",
+        "edge": {"Visit": {"label": "child", "edge": "Finish"}}
+    });
+    branch_schema.validate(&valid).unwrap();
+    serde_json::from_value::<RecursiveSchemaBranch>(valid.clone()).unwrap();
+    let mut invalid = valid;
+    invalid["edge"]["Visit"]["label"] = json!(false);
+    assert!(branch_schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<RecursiveSchemaBranch>(invalid).is_err());
+}
+
+#[derive(JsonSchema)]
+struct RecursiveSchemaArray<const N: usize> {
+    bytes: [u8; N],
+    next: Option<Box<Self>>,
+}
+
+#[derive(JsonSchema)]
+struct DistinctRecursiveSchemaArrays {
+    two: RecursiveSchemaArray<2>,
+    three: RecursiveSchemaArray<3>,
+}
+
+#[derive(JsonSchema)]
+struct RecursiveSchemaPointers {
+    boxed: Box<RecursiveSchemaNode>,
+    shared: std::sync::Arc<RecursiveSchemaNode>,
+    local: std::rc::Rc<RecursiveSchemaNode>,
+    slice: Box<[RecursiveSchemaNode]>,
+}
+
+#[derive(JsonSchema)]
+struct BorrowedRecursiveSchema<'a> {
+    label: &'a str,
+    child: Option<Box<Self>>,
+}
+
+#[test]
+fn json_schema_borrowed_recursive_type_uses_static_schema_instantiation() {
+    let generated = BorrowedRecursiveSchema::<'static>::try_json_schema()
+        .expect("schema generation needs a type identity without constructing a value");
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    let valid = json!({"label": "parent", "child": {"label": "child", "child": null}});
+    schema.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["child"]["label"] = json!(false);
+    assert!(schema.validate(&invalid).is_err());
+}
+
+#[test]
+fn json_schema_recursive_generic_instances_and_shared_pointers_do_not_alias() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(DistinctRecursiveSchemaArrays::json_schema())
+            .expect("different const-generic instantiations retain separate definitions");
+    assert_eq!(schema.schema()["$defs"].as_object().unwrap().len(), 2);
+    let valid = json!({
+        "two": {"bytes": [1, 2], "next": {"bytes": [3, 4]}},
+        "three": {"bytes": [1, 2, 3], "next": {"bytes": [4, 5, 6]}}
+    });
+    schema.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["three"]["next"]["bytes"] = json!([4, 5]);
+    assert!(schema.validate(&invalid).is_err());
+
+    let pointers = fastmcp_rust::schema::admit_final_schema(RecursiveSchemaPointers::json_schema())
+        .expect("transparent pointers and slices preserve the recursive payload");
+    let leaf = json!({"value": 1, "children": []});
+    let valid = json!({
+        "boxed": leaf.clone(), "shared": leaf.clone(), "local": leaf.clone(),
+        "slice": [leaf]
+    });
+    pointers.validate(&valid).unwrap();
+    let mut invalid = valid;
+    invalid["shared"]["value"] = json!(false);
+    assert!(pointers.validate(&invalid).is_err());
+}
+
+/// Every container splices its element schema into a `json!` value position;
+/// a derived element expands to a block there.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DerivedElementContainers {
+    array: [RecursiveSchemaNode; 2],
+    pair: (RecursiveSchemaNode, u8),
+    by_name: std::collections::BTreeMap<String, RecursiveSchemaNode>,
+    unique: std::collections::BTreeSet<ContainerElementTag>,
+    maybe: Vec<Option<RecursiveSchemaNode>>,
+}
+
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
+enum ContainerElementTag {
+    Hot,
+    Cold(u8),
+}
+
+#[test]
+fn json_schema_derived_elements_inside_every_container_admit_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(DerivedElementContainers::json_schema())
+        .expect("container element schemas are valid final-dialect schemas");
+    let leaf = || RecursiveSchemaNode {
+        value: 1,
+        children: Vec::new(),
+    };
+    let value = DerivedElementContainers {
+        array: [leaf(), leaf()],
+        pair: (leaf(), 7),
+        by_name: [("a".to_owned(), leaf())].into_iter().collect(),
+        unique: [ContainerElementTag::Hot, ContainerElementTag::Cold(2)]
+            .into_iter()
+            .collect(),
+        maybe: vec![Some(leaf()), None],
+    };
+    let encoded = serde_json::to_value(&value).expect("containers serialize");
+    schema
+        .validate(&encoded)
+        .expect("actual Serde payload must be admitted");
+    for (pointer, wrong) in [
+        ("/array/1/value", json!("one")),
+        ("/pair/0/children", json!({})),
+        ("/by_name/a/extra", json!(true)),
+        ("/unique/1", json!({"Cold": "two"})),
+        ("/maybe/0/value", json!(null)),
+    ] {
+        let mut invalid = encoded.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        let target = invalid.pointer_mut(parent).unwrap();
+        match target {
+            serde_json::Value::Array(items) => items[key.parse::<usize>().unwrap()] = wrong,
+            serde_json::Value::Object(map) => {
+                map.insert(key.to_owned(), wrong);
+            }
+            other => panic!("{pointer} parent is not a container: {other}"),
+        }
+        assert!(
+            schema.validate(&invalid).is_err(),
+            "{pointer} must reject a wrong element payload"
+        );
+    }
+}
+
+static RECURSIVE_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn compare_recursive_schema_trees(left: RecursiveSchemaNode, right: RecursiveSchemaNode) -> String {
+    RECURSIVE_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("{}:{}", left.value, right.value)
+}
+
+#[test]
+fn json_schema_recursive_arguments_share_definitions_in_registered_modern_tool() {
+    let definition = CompareRecursiveSchemaTrees.definition();
+    assert_eq!(definition.input_schema["type"], "object");
+    assert_eq!(
+        definition.input_schema["$defs"].as_object().unwrap().len(),
+        1
+    );
+    fastmcp_rust::schema::admit_final_schema(definition.input_schema)
+        .expect("multiple recursive arguments form one standalone input schema");
+    on_caller_runtime(async {
+        let server = Server::new("recursive-schema", "1.0.0")
+            .tool(CompareRecursiveSchemaTrees)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |arguments| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "compare_recursive_schema_trees",
+                    "arguments": arguments,
+                })),
+                64_i64,
+            )
+        };
+        let valid = json!({
+            "left": {"value": 1, "children": [{"value": 2, "children": []}]},
+            "right": {"value": 3, "children": [{"value": 4, "children": []}]}
+        });
+        let before = RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(valid.clone()))
+            .await
+            .expect("registered recursive input tool produces a response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_ne!(result["isError"], json!(true));
+        assert_eq!(result["content"][0]["text"], "1:3");
+        assert_eq!(
+            RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+        let mut invalid = valid;
+        invalid["right"]["children"][0]["value"] = json!("four");
+        let response = server
+            .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+            .await
+            .expect("nested invalid input produces a tool execution error");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], json!(true));
+        assert_eq!(
+            RECURSIVE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "recursive input validation must finish before the handler runs"
+        );
+    });
+}
+
+// --- Serde enum representations and their registered input schemas ---
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum InternalTaggedSchema {
+    StandBy,
+    #[serde(rename = "branch-node")]
+    Branch {
+        node_value: i32,
+        #[serde(default)]
+        children: Vec<Self>,
+        #[serde(skip)]
+        transient: bool,
+    },
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum AdjacentTaggedSchema {
+    Idle,
+    #[serde(rename = "count")]
+    Number(i64),
+    Pair(String, bool),
+    Named {
+        display_name: String,
+        #[serde(default)]
+        enabled: bool,
+    },
+    Maybe(Option<String>),
+    Nothing(()),
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+enum UntaggedOverlappingSchema {
+    Small(i32),
+    Wide(i64),
+    Empty,
+    NullValue(()),
+    Pair(String, bool),
+    Named {
+        label: String,
+        #[serde(default)]
+        count: u32,
+    },
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum MixedTaggedSchema {
+    Ready,
+    Named {
+        count: u32,
+    },
+    #[serde(untagged)]
+    TextFallback(String),
+    #[serde(untagged)]
+    IntegerFallback(i64),
+}
+
+fn internal_tagged_schema_fixture() -> InternalTaggedSchema {
+    InternalTaggedSchema::Branch {
+        node_value: 5,
+        children: vec![InternalTaggedSchema::Branch {
+            node_value: 9,
+            children: vec![InternalTaggedSchema::StandBy],
+            transient: false,
+        }],
+        transient: false,
+    }
+}
+
+fn assert_enum_schema_roundtrip<T>(schema: &fastmcp_rust::schema::AdmittedSchema, value: T)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let encoded = serde_json::to_value(value).expect("Serde serializes the enum fixture");
+    schema
+        .validate(&encoded)
+        .expect("the generated schema accepts the actual Serde representation");
+    let decoded: T = serde_json::from_value(encoded.clone())
+        .expect("the actual representation deserializes through Serde");
+    assert_eq!(
+        serde_json::to_value(decoded).expect("decoded enum serializes"),
+        encoded,
+        "overlapping untagged variants may change Rust variants but preserve their JSON value"
+    );
+}
+
+fn assert_enum_schema_rejects<T: serde::de::DeserializeOwned>(
+    schema: &fastmcp_rust::schema::AdmittedSchema,
+    value: serde_json::Value,
+) {
+    assert!(
+        serde_json::from_value::<T>(value.clone()).is_err(),
+        "Serde must reject the planted representation: {value}"
+    );
+    assert!(
+        schema.validate(&value).is_err(),
+        "the schema must reject the same representation: {value}"
+    );
+}
+
+#[test]
+fn json_schema_internal_tags_preserve_recursive_fields_defaults_and_closed_objects() {
+    let schema = fastmcp_rust::schema::admit_final_schema(InternalTaggedSchema::json_schema())
+        .expect("internally tagged recursive schemas admit");
+    assert!(schema.schema()["$defs"].is_object());
+    assert_enum_schema_roundtrip(&schema, InternalTaggedSchema::StandBy);
+    assert_enum_schema_roundtrip(&schema, internal_tagged_schema_fixture());
+    let unit_with_extra = json!({"kind": "stand_by", "extra": true});
+    schema
+        .validate(&unit_with_extra)
+        .expect("Serde's internal unit visitor permits extra fields");
+    assert_eq!(
+        serde_json::from_value::<InternalTaggedSchema>(unit_with_extra).unwrap(),
+        InternalTaggedSchema::StandBy
+    );
+    let defaulted = json!({"kind": "branch-node", "nodeValue": 7});
+    schema
+        .validate(&defaulted)
+        .expect("defaulted children are optional");
+    assert_eq!(
+        serde_json::from_value::<InternalTaggedSchema>(defaulted).unwrap(),
+        InternalTaggedSchema::Branch {
+            node_value: 7,
+            children: Vec::new(),
+            transient: false,
+        }
+    );
+
+    for invalid in [
+        json!({"kind": "branch", "nodeValue": 7}),
+        json!({"nodeValue": 7}),
+        json!({"kind": "branch-node", "nodeValue": "7"}),
+        json!({"kind": "branch-node", "nodeValue": 7, "extra": true}),
+        json!({"kind": "hidden"}),
+        json!({"kind": "branch-node", "nodeValue": 7, "children": [
+            {"kind": "branch-node", "nodeValue": "9"}
+        ]}),
+    ] {
+        assert_enum_schema_rejects::<InternalTaggedSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_adjacent_tags_preserve_each_payload_form_and_reject_near_neighbors() {
+    let schema = fastmcp_rust::schema::admit_final_schema(AdjacentTaggedSchema::json_schema())
+        .expect("adjacently tagged schemas admit");
+    for value in [
+        AdjacentTaggedSchema::Idle,
+        AdjacentTaggedSchema::Number(7),
+        AdjacentTaggedSchema::Pair("left".to_owned(), true),
+        AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: true,
+        },
+        AdjacentTaggedSchema::Maybe(Some("optional".to_owned())),
+        AdjacentTaggedSchema::Maybe(None),
+        AdjacentTaggedSchema::Nothing(()),
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    let defaulted = json!({"kind": "named", "data": {"displayName": "ready"}});
+    schema
+        .validate(&defaulted)
+        .expect("defaulted named payload field may be omitted");
+    assert_eq!(
+        serde_json::from_value::<AdjacentTaggedSchema>(defaulted).unwrap(),
+        AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: false,
+        }
+    );
+    for (accepted, expected) in [
+        (
+            json!({"kind": "idle", "data": null}),
+            AdjacentTaggedSchema::Idle,
+        ),
+        (json!({"kind": "maybe"}), AdjacentTaggedSchema::Maybe(None)),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<AdjacentTaggedSchema>(accepted.clone()).unwrap(),
+            expected
+        );
+        schema
+            .validate(&accepted)
+            .expect("explicit unit null and omitted Option content match Serde");
+    }
+    for edge in [
+        json!({"kind": "idle", "data": false}),
+        json!({"kind": "nothing"}),
+    ] {
+        assert_eq!(
+            schema.validate(&edge).is_ok(),
+            serde_json::from_value::<AdjacentTaggedSchema>(edge.clone()).is_ok(),
+            "adjacent content presence must match Serde for {edge}"
+        );
+    }
+    for invalid in [
+        json!({"kind": "number", "data": 7}),
+        json!({"kind": "count"}),
+        json!({"kind": "count", "data": "7"}),
+        json!({"kind": "pair", "data": ["left", "true"]}),
+        json!({"kind": "pair", "data": ["left", true, 3]}),
+        json!({"kind": "named", "data": {"displayName": 7}}),
+        json!({"kind": "named", "data": {"displayName": "ready", "extra": 1}}),
+        json!({"kind": "count", "data": 7, "extra": 1}),
+        json!({"kind": "hidden"}),
+    ] {
+        assert_enum_schema_rejects::<AdjacentTaggedSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_untagged_overlapping_integer_and_null_branches_follow_serde() {
+    let schema = fastmcp_rust::schema::admit_final_schema(UntaggedOverlappingSchema::json_schema())
+        .expect("overlapping untagged alternatives admit");
+    assert!(schema.schema()["anyOf"].is_array());
+    assert!(schema.schema().get("oneOf").is_none());
+    for value in [
+        UntaggedOverlappingSchema::Small(7),
+        UntaggedOverlappingSchema::Wide(7),
+        UntaggedOverlappingSchema::Wide(i64::MAX),
+        UntaggedOverlappingSchema::Empty,
+        UntaggedOverlappingSchema::NullValue(()),
+        UntaggedOverlappingSchema::Pair("left".to_owned(), false),
+        UntaggedOverlappingSchema::Named {
+            label: "ready".to_owned(),
+            count: 2,
+        },
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    for invalid in [
+        json!(0.5),
+        json!(true),
+        json!(u64::MAX),
+        json!(["left", "false"]),
+        json!({"label": 7}),
+        json!({"label": "ready", "extra": 1}),
+    ] {
+        assert_enum_schema_rejects::<UntaggedOverlappingSchema>(&schema, invalid);
+    }
+}
+
+#[test]
+fn json_schema_trailing_untagged_fallbacks_overlap_external_tags_without_exclusion() {
+    let schema = fastmcp_rust::schema::admit_final_schema(MixedTaggedSchema::json_schema())
+        .expect("tagged alternatives and untagged fallbacks admit together");
+    assert!(schema.schema()["anyOf"].is_array());
+    for value in [
+        MixedTaggedSchema::Ready,
+        MixedTaggedSchema::Named { count: 2 },
+        MixedTaggedSchema::TextFallback("ready".to_owned()),
+        MixedTaggedSchema::TextFallback("future-value".to_owned()),
+        MixedTaggedSchema::IntegerFallback(7),
+    ] {
+        assert_enum_schema_roundtrip(&schema, value);
+    }
+    for invalid in [
+        json!(true),
+        json!({"unknown": 7}),
+        json!({"named": {"count": "2"}}),
+        json!({"named": {"count": 2, "extra": true}}),
+        json!({"named": {"count": 2}, "extra": true}),
+    ] {
+        assert_enum_schema_rejects::<MixedTaggedSchema>(&schema, invalid);
+    }
+}
+
+static ENUM_REPRESENTATION_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn echo_enum_representations(
+    internal: InternalTaggedSchema,
+    adjacent: AdjacentTaggedSchema,
+) -> String {
+    ENUM_REPRESENTATION_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&(internal, adjacent)).expect("accepted enum values serialize")
+}
+
+#[test]
+fn json_schema_tagged_enum_inputs_enforce_nested_constraints_before_registered_handler() {
+    on_caller_runtime(async {
+        let connection = ModernConnection::new();
+        let server = Server::new("enum-representation-schema", "1.0.0")
+            .tool(EchoEnumRepresentations)
+            .try_build()
+            .expect("tagged enum input schemas admit through public registration");
+        let internal = serde_json::to_value(internal_tagged_schema_fixture()).unwrap();
+        let adjacent = serde_json::to_value(AdjacentTaggedSchema::Named {
+            display_name: "ready".to_owned(),
+            enabled: true,
+        })
+        .unwrap();
+        let valid = json!({"internal": internal, "adjacent": adjacent});
+        let before = ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let accepted = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "echo_enum_representations",
+                valid.clone(),
+            )
+            .await,
+        );
+        assert_ne!(accepted["isError"], json!(true));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                accepted["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap(),
+            json!([valid["internal"], valid["adjacent"]])
+        );
+        assert_eq!(
+            ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+
+        for (pointer, wrong) in [
+            ("/internal/children/0/nodeValue", json!("nine")),
+            ("/internal/children/0/kind", json!("unknown")),
+            ("/adjacent/data/displayName", json!(false)),
+            ("/adjacent/kind", json!("unknown")),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid
+                .pointer_mut(pointer)
+                .expect("fixture pointer exists") = wrong;
+            let rejected = schema_bound_complete(
+                schema_bound_wire_call(&server, &connection, "echo_enum_representations", invalid)
+                    .await,
+            );
+            assert_eq!(rejected["isError"], json!(true));
+            assert_eq!(
+                ENUM_REPRESENTATION_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid nested enum fields must be rejected before handler invocation"
+            );
+        }
+    });
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+enum OptionalUnitChoice {
+    First,
+    Second,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+enum ConstChoice {
+    Allowed,
+}
+
+impl ConstChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({"type": "string", "const": "Allowed"})
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct ConjunctionChoice(ConstChoice);
+
+impl ConjunctionChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "allOf": [{"type": "string"}, {"enum": ["Allowed"]}],
+            "not": {"const": "Denied"}
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum AlreadyNullableChoice {
+    Empty(()),
+    Choice(ConstChoice),
+}
+
+impl AlreadyNullableChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({"oneOf": [{"type": "null"}, ConstChoice::json_schema()]})
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct DialectChoice(ConstChoice);
+
+impl DialectChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "const": "Allowed"
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalDialectChoice(Option<DialectChoice>);
+
+#[test]
+fn json_schema_optional_newtype_keeps_custom_root_dialect_admissible() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalDialectChoice::json_schema())
+        .expect("the optional newtype retains a valid document-root dialect");
+    for value in [
+        OptionalDialectChoice(None),
+        OptionalDialectChoice(Some(DialectChoice(ConstChoice::Allowed))),
+    ] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        schema
+            .validate(&encoded)
+            .expect("nullable dialect preserves accepted values");
+        assert_eq!(
+            serde_json::from_value::<OptionalDialectChoice>(encoded).unwrap(),
+            value
+        );
+    }
+    assert!(schema.validate(&json!("Denied")).is_err());
+    assert!(serde_json::from_value::<OptionalDialectChoice>(json!("Denied")).is_err());
+    assert_eq!(
+        schema.schema()["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct IdentifiedChoice(ConstChoice);
+
+impl IdentifiedChoice {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://schemas.example.test/nullable-choice",
+            "$defs": {"choice": ConstChoice::json_schema()},
+            "$ref": "#/$defs/choice"
+        })
+    }
+}
+
+#[derive(JsonSchema)]
+struct DescribedIdentifiedSchema {
+    /// The annotation must not change the handwritten resource's scope.
+    choice: IdentifiedChoice,
+}
+
+struct UnscopedManualSchema;
+
+impl UnscopedManualSchema {
+    fn json_schema() -> serde_json::Value {
+        json!({
+            "$defs": {"type_1": {"type": "boolean"}},
+            "$ref": "#/$defs/type_1"
+        })
+    }
+}
+
+#[derive(JsonSchema)]
+struct DescribedUnscopedSchema {
+    recursive: RecursiveSchemaNode,
+    /// Adding a description must not bypass handwritten reference admission.
+    manual: UnscopedManualSchema,
+}
+
+#[test]
+fn json_schema_custom_provider_annotations_preserve_resource_boundaries() {
+    let schema = fastmcp_rust::schema::admit_final_schema(
+        DescribedIdentifiedSchema::try_json_schema()
+            .expect("a described handwritten resource keeps its own identity"),
+    )
+    .unwrap();
+    schema.validate(&json!({"choice": "Allowed"})).unwrap();
+    assert!(schema.validate(&json!({"choice": "Denied"})).is_err());
+    assert_eq!(
+        DescribedUnscopedSchema::try_json_schema(),
+        Err(fastmcp_rust::schema::SchemaGenerationError::ReferenceResourceBoundary),
+        "a described manual local ref cannot capture the generated recursive definition"
+    );
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalIdentifiedChoice {
+    choice: Option<IdentifiedChoice>,
+}
+
+#[test]
+fn json_schema_optional_identified_resource_keeps_its_reference_scope() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalIdentifiedChoice::json_schema())
+        .expect("an explicitly identified custom resource remains admissible when nullable");
+    for encoded in [
+        json!({}),
+        json!({"choice": null}),
+        json!({"choice": "Allowed"}),
+    ] {
+        schema
+            .validate(&encoded)
+            .expect("the resource-local ref resolves within its original id");
+        serde_json::from_value::<OptionalIdentifiedChoice>(encoded).unwrap();
+    }
+    assert!(schema.validate(&json!({"choice": "Denied"})).is_err());
+    assert!(
+        serde_json::from_value::<OptionalIdentifiedChoice>(json!({"choice": "Denied"})).is_err()
+    );
+    assert_eq!(
+        schema.schema()["properties"]["choice"]["anyOf"][0],
+        IdentifiedChoice::json_schema()
+    );
+}
+
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct OptionalSchemaArguments {
+    unit: Option<OptionalUnitChoice>,
+    mixed: Option<WireEnum>,
+    constant: Option<ConstChoice>,
+    conjunction: Option<ConjunctionChoice>,
+    already_nullable: Option<AlreadyNullableChoice>,
+}
+
+fn optional_schema_argument_pairs() -> [(serde_json::Value, serde_json::Value); 7] {
+    [
+        (json!({"unit": "First"}), json!({"unit": "Unknown"})),
+        (json!({"mixed": "Idle"}), json!({"mixed": "Unknown"})),
+        (
+            json!({"mixed": {"Pair": ["work", 3]}}),
+            json!({"mixed": {"Pair": ["work"]}}),
+        ),
+        (
+            json!({"constant": "Allowed"}),
+            json!({"constant": "Denied"}),
+        ),
+        (
+            json!({"conjunction": "Allowed"}),
+            json!({"conjunction": "Denied"}),
+        ),
+        (
+            json!({"already_nullable": "Allowed"}),
+            json!({"already_nullable": "Denied"}),
+        ),
+        (
+            json!({"already_nullable": null}),
+            json!({"already_nullable": []}),
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_optional_custom_types_accept_null_and_actual_serde_payloads() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalSchemaArguments::json_schema())
+        .expect("nullable custom schemas pass final-dialect admission");
+    for value in [
+        OptionalSchemaArguments::default(),
+        OptionalSchemaArguments {
+            unit: Some(OptionalUnitChoice::First),
+            mixed: Some(WireEnum::Pair("work".to_owned(), 3)),
+            constant: Some(ConstChoice::Allowed),
+            conjunction: Some(ConjunctionChoice(ConstChoice::Allowed)),
+            already_nullable: Some(AlreadyNullableChoice::Choice(ConstChoice::Allowed)),
+        },
+        OptionalSchemaArguments {
+            unit: Some(OptionalUnitChoice::Second),
+            mixed: Some(WireEnum::Idle),
+            ..OptionalSchemaArguments::default()
+        },
+    ] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        schema
+            .validate(&encoded)
+            .expect("Some and None preserve their Serde wire form");
+        assert_eq!(
+            serde_json::from_value::<OptionalSchemaArguments>(encoded).unwrap(),
+            value
+        );
+    }
+    schema
+        .validate(&json!({}))
+        .expect("all optional fields may be absent");
+    assert_eq!(
+        serde_json::from_value::<OptionalSchemaArguments>(json!({})).unwrap(),
+        OptionalSchemaArguments::default()
+    );
+    // The inner oneOf already matches null. Adding null must use anyOf so the
+    // two matching nullable branches cannot cancel each other out.
+    assert_eq!(
+        serde_json::from_value::<AlreadyNullableChoice>(json!(null)).unwrap(),
+        AlreadyNullableChoice::Empty(())
+    );
+    schema.validate(&json!({"already_nullable": null})).unwrap();
+}
+
+#[test]
+fn json_schema_optional_custom_types_preserve_non_null_constraints() {
+    let schema = fastmcp_rust::schema::admit_final_schema(OptionalSchemaArguments::json_schema())
+        .expect("optional argument schema is admitted");
+    for (valid, invalid) in optional_schema_argument_pairs() {
+        schema
+            .validate(&valid)
+            .expect("the matched valid control is admitted");
+        serde_json::from_value::<OptionalSchemaArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(
+            serde_json::from_value::<OptionalSchemaArguments>(invalid.clone()).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+static OPTIONAL_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_optional_schema(
+    unit: Option<OptionalUnitChoice>,
+    mixed: Option<WireEnum>,
+    constant: Option<ConstChoice>,
+    conjunction: Option<ConjunctionChoice>,
+    already_nullable: Option<AlreadyNullableChoice>,
+) -> McpResult<String> {
+    OPTIONAL_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&OptionalSchemaArguments {
+        unit,
+        mixed,
+        constant,
+        conjunction,
+        already_nullable,
+    })
+    .map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_optional_custom_types_reach_registered_modern_tool() {
+    on_caller_runtime(async {
+        let server = Server::new("optional-schema", "1.0.0")
+            .tool(DescribeOptionalSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |arguments| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_optional_schema",
+                    "arguments": arguments,
+                })),
+                64_i64,
+            )
+        };
+        for arguments in [
+            json!({}),
+            json!({"unit": null, "mixed": null, "constant": null, "conjunction": null,
+            "already_nullable": null}),
+            json!({"unit": "First", "mixed": {"Pair": ["work", 3]}, "constant": "Allowed",
+            "conjunction": "Allowed", "already_nullable": "Allowed"}),
+        ] {
+            let expected: OptionalSchemaArguments =
+                serde_json::from_value(arguments.clone()).unwrap();
+            let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(arguments))
+                .await
+                .expect("the registered optional tool returns a response");
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response
+                .result
+                .expect("tool returned its actual decoded arguments");
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: OptionalSchemaArguments = serde_json::from_str(
+                result["content"][0]["text"]
+                    .as_str()
+                    .expect("serialized handler arguments"),
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+        }
+        for (valid, invalid) in optional_schema_argument_pairs() {
+            let positive = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .expect("the matched optional argument reaches the tool");
+            assert!(positive.error.is_none());
+            let result = positive
+                .result
+                .expect("the matched positive returns application content");
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let before = OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .expect("invalid optional values receive a protocol response");
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                OPTIONAL_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "invalid non-null values must not reach application code"
+            );
+        }
+    });
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct SerdeSchemaLocalState;
+
+fn serde_schema_default_retry_limit() -> u32 {
+    3
+}
+
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SerdeWireArguments {
+    user_name: String,
+    #[serde(rename = "account-id")]
+    account_id: u32,
+    #[serde(default = "serde_schema_default_retry_limit")]
+    retry_limit: u32,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip)]
+    local_only: SerdeSchemaLocalState,
+    r#type: String,
+}
+
+fn serde_schema_valid_arguments() -> serde_json::Value {
+    json!({"userName": "Ada", "account-id": 7, "type": "job"})
+}
+
+fn serde_schema_argument_pairs() -> Vec<(serde_json::Value, serde_json::Value)> {
+    let valid = serde_schema_valid_arguments();
+    vec![
+        (
+            valid.clone(),
+            json!({"user_name": "Ada", "account-id": 7, "type": "job"}),
+        ),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "accountId": 7, "type": "job"}),
+        ),
+        (valid.clone(), json!({"account-id": 7, "type": "job"})),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "account-id": "seven", "type": "job"}),
+        ),
+        (
+            valid.clone(),
+            json!({"userName": "Ada", "account-id": 7, "type": "job", "retryLimit": null}),
+        ),
+        (
+            valid,
+            json!({"userName": "Ada", "account-id": 7, "type": "job", "localOnly": {}}),
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_serde_names_defaults_and_skips_match_wire_values() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeWireArguments::json_schema())
+        .expect("Serde field attributes produce an admissible schema");
+    for value in [
+        serde_schema_valid_arguments(),
+        json!({"userName": "Ada", "account-id": 7, "type": "job", "retryLimit": 9,
+            "labels": ["urgent"], "displayName": "Ada L."}),
+    ] {
+        let decoded: SerdeWireArguments = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        schema.validate(&encoded).unwrap();
+        assert!(encoded.get("localOnly").is_none());
+        assert!(encoded.get("local_only").is_none());
+    }
+    let defaults: SerdeWireArguments =
+        serde_json::from_value(serde_schema_valid_arguments()).unwrap();
+    assert_eq!(defaults.retry_limit, 3);
+    assert!(defaults.labels.is_empty());
+    assert_eq!(defaults.local_only, SerdeSchemaLocalState);
+    assert_eq!(
+        schema.schema()["required"],
+        json!(["userName", "account-id", "type"])
+    );
+    assert_eq!(schema.schema()["additionalProperties"], false);
+    assert!(schema.schema()["properties"].get("retryLimit").is_some());
+    assert!(schema.schema()["properties"].get("r#type").is_none());
+}
+
+#[test]
+fn json_schema_serde_names_reject_wrong_fields_and_missing_required() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(SerdeWireArguments::json_schema()).unwrap();
+    for (valid, invalid) in serde_schema_argument_pairs() {
+        schema.validate(&valid).unwrap();
+        serde_json::from_value::<SerdeWireArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<SerdeWireArguments>(invalid).is_err());
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(default = "serde_schema_container_default", rename_all = "kebab-case")]
+struct SerdeDefaultedContainer {
+    retry_limit: u32,
+    queue_name: String,
+}
+
+static SERDE_SCHEMA_DEFAULT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn serde_schema_container_default() -> SerdeDefaultedContainer {
+    SERDE_SCHEMA_DEFAULT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    SerdeDefaultedContainer {
+        retry_limit: 5,
+        queue_name: "general".to_owned(),
+    }
+}
+
+#[test]
+fn json_schema_serde_container_defaults_do_not_run_during_generation() {
+    let before = SERDE_SCHEMA_DEFAULT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeDefaultedContainer::json_schema())
+        .expect("container default only changes omission constraints");
+    assert_eq!(
+        SERDE_SCHEMA_DEFAULT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        before
+    );
+    for value in [
+        json!({}),
+        json!({"retry-limit": 9}),
+        json!({"queue-name": "urgent"}),
+    ] {
+        schema.validate(&value).unwrap();
+        let decoded: SerdeDefaultedContainer = serde_json::from_value(value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [json!({"retry-limit": null}), json!({"queue-name": false})] {
+        assert!(schema.validate(&value).is_err());
+        assert!(serde_json::from_value::<SerdeDefaultedContainer>(value).is_err());
+    }
+    assert_eq!(schema.schema()["required"], json!([]));
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum SerdeWireEnum {
+    HTTP2Ready,
+    #[serde(rename = "manual-tag")]
+    ManuallyNamed {
+        job_count: u32,
+        #[serde(default)]
+        optional_note: String,
+        #[serde(skip)]
+        local_only: SerdeSchemaLocalState,
+    },
+    #[serde(rename_all = "kebab-case")]
+    FieldOverride {
+        job_count: u32,
+        #[serde(rename = "exactName")]
+        item_id: String,
+    },
+    #[serde(skip)]
+    Hidden,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all(
+    serialize = "SCREAMING-KEBAB-CASE",
+    deserialize = "SCREAMING-KEBAB-CASE"
+))]
+enum SerdeWireUnitEnum {
+    HTTP2Ready,
+    #[serde(rename(serialize = "ready-now", deserialize = "ready-now"))]
+    ReadyNow,
+    #[serde(skip)]
+    Hidden,
+}
+
+#[test]
+fn json_schema_serde_enum_names_and_field_rules_match_wire_values() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeWireEnum::json_schema()).unwrap();
+    for value in [
+        json!("h_t_t_p2_ready"),
+        json!({"manual-tag": {"jobCount": 2}}),
+        json!({"field_override": {"job-count": 2, "exactName": "A"}}),
+    ] {
+        schema.validate(&value).unwrap();
+        let decoded: SerdeWireEnum = serde_json::from_value(value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [
+        json!("http2_ready"),
+        json!("hidden"),
+        json!({"manually_named": {"jobCount": 2}}),
+        json!({"manual-tag": {"job_count": 2}}),
+        json!({"field_override": {"jobCount": 2, "exactName": "A"}}),
+        json!({"field_override": {"job-count": 2, "item-id": "A"}}),
+        json!({"manual-tag": {"jobCount": 2, "localOnly": {}}}),
+    ] {
+        assert!(schema.validate(&value).is_err(), "{value}");
+        assert!(serde_json::from_value::<SerdeWireEnum>(value).is_err());
+    }
+    let units = fastmcp_rust::schema::admit_final_schema(SerdeWireUnitEnum::json_schema()).unwrap();
+    assert_eq!(
+        units.schema()["enum"],
+        json!(["H-T-T-P2-READY", "ready-now"])
+    );
+    for value in [SerdeWireUnitEnum::HTTP2Ready, SerdeWireUnitEnum::ReadyNow] {
+        let encoded = serde_json::to_value(&value).unwrap();
+        units.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SerdeWireUnitEnum>(encoded).unwrap(),
+            value
+        );
+    }
+    assert!(units.validate(&json!("HIDDEN")).is_err());
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct SerdeTupleWire(
+    String,
+    #[serde(skip)] SerdeSchemaLocalState,
+    #[serde(default)] u32,
+);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct SerdeOneRetainedTuple(#[serde(skip)] SerdeSchemaLocalState, String);
+
+#[test]
+fn json_schema_serde_tuple_skips_preserve_array_positions() {
+    let schema = fastmcp_rust::schema::admit_final_schema(SerdeTupleWire::json_schema()).unwrap();
+    for value in [json!(["work"]), json!(["work", 3])] {
+        let decoded: SerdeTupleWire = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+    }
+    for value in [json!([]), json!(["work", null]), json!(["work", {}, 3])] {
+        assert!(schema.validate(&value).is_err());
+        assert!(serde_json::from_value::<SerdeTupleWire>(value).is_err());
+    }
+    let one =
+        fastmcp_rust::schema::admit_final_schema(SerdeOneRetainedTuple::json_schema()).unwrap();
+    let value = SerdeOneRetainedTuple(SerdeSchemaLocalState, "work".to_owned());
+    let encoded = serde_json::to_value(&value).unwrap();
+    assert_eq!(encoded, json!(["work"]));
+    one.validate(&encoded).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SerdeOneRetainedTuple>(encoded).unwrap(),
+        value
+    );
+    assert!(one.validate(&json!("work")).is_err());
+}
+
+#[derive(serde::Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SerdeSchemaOverride {
+    #[serde(rename = "serde-name")]
+    #[json_schema(rename = "schema-name")]
+    field_name: String,
+}
+
+#[test]
+fn json_schema_serde_schema_override_precedence_is_explicit() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(SerdeSchemaOverride::json_schema()).unwrap();
+    assert_eq!(schema.schema()["required"], json!(["schema-name"]));
+    assert!(schema.schema()["properties"].get("schema-name").is_some());
+    assert!(schema.schema()["properties"].get("serde-name").is_none());
+    let encoded = serde_json::to_value(SerdeSchemaOverride {
+        field_name: "work".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(encoded, json!({"serde-name": "work"}));
+    assert!(
+        schema.validate(&encoded).is_err(),
+        "explicit schema override retains responsibility for wire parity"
+    );
+    schema.validate(&json!({"schema-name": "work"})).unwrap();
+}
+
+static SERDE_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_serde_schema(value: SerdeWireArguments) -> McpResult<String> {
+    SERDE_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&value).map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_serde_names_and_defaults_reach_registered_modern_tool() {
+    on_caller_runtime(async {
+        let server = Server::new("serde-schema", "1.0.0")
+            .tool(DescribeSerdeSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |value| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_serde_schema",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            )
+        };
+        for (valid, invalid) in serde_schema_argument_pairs() {
+            let expected: SerdeWireArguments = serde_json::from_value(valid.clone()).unwrap();
+            let before = SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .unwrap();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: SerdeWireArguments =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .unwrap();
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                SERDE_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid neighboring arguments do not invoke the handler"
+            );
+        }
+    });
+}
+
+const SHAPED_SCHEMA_ARRAY_WIDTH: usize = 2;
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaInferredArray([u8; !0 >> (usize::BITS - 1)]);
+
+#[allow(non_upper_case_globals)]
+const __fastmcp_array_length: usize = 2;
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaHygienicArray([[u8; __fastmcp_array_length]; 1]);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct ShapedSchemaArguments {
+    pair: (String, u16),
+    singleton: (bool,),
+    fixed: [i16; SHAPED_SCHEMA_ARRAY_WIDTH + 1],
+    empty: [bool; 0],
+    nested: Vec<(u8, [String; 2])>,
+    glyph: char,
+    optional_glyph: Option<char>,
+    unit: (),
+    tiny: i8,
+}
+
+fn shaped_schema_valid_arguments() -> serde_json::Value {
+    json!({
+        "pair": ["work", 65535],
+        "singleton": [true],
+        "fixed": [-32768, 0, 32767],
+        "empty": [],
+        "nested": [[255, ["A", "B"]]],
+        "glyph": "🦀",
+        "unit": null,
+        "tiny": 127,
+    })
+}
+
+fn shaped_schema_argument_pairs() -> Vec<(serde_json::Value, serde_json::Value)> {
+    let valid = shaped_schema_valid_arguments();
+    [
+        ("pair", json!(["work"])),
+        ("pair", json!(["work", 65535, true])),
+        ("pair", json!(["work", 65536])),
+        ("pair", json!(["work", -1])),
+        ("singleton", json!(true)),
+        ("fixed", json!([-32768, 0])),
+        ("fixed", json!([-32768, 0, 32767, 1])),
+        ("fixed", json!([-32769, 0, 32767])),
+        ("empty", json!([true])),
+        ("nested", json!([[256, ["A", "B"]]])),
+        ("nested", json!([[255, ["A"]]])),
+        ("glyph", json!("")),
+        ("glyph", json!("🦀🦀")),
+        ("optional_glyph", json!("AB")),
+        ("unit", json!([])),
+        ("tiny", json!(128)),
+    ]
+    .into_iter()
+    .map(|(field, value)| {
+        let mut invalid = valid.clone();
+        invalid[field] = value;
+        (valid.clone(), invalid)
+    })
+    .collect()
+}
+
+#[test]
+fn json_schema_tuple_and_array_shapes_match_serde() {
+    let schema = fastmcp_rust::schema::admit_final_schema(ShapedSchemaArguments::json_schema())
+        .expect("tuples, arrays, unit, and char produce an admissible schema");
+    let mut alternate = shaped_schema_valid_arguments();
+    alternate["nested"] = json!([]);
+    alternate["glyph"] = json!("é");
+    alternate["optional_glyph"] = json!("A");
+    alternate["tiny"] = json!(-128);
+    for value in [shaped_schema_valid_arguments(), alternate] {
+        let decoded: ShapedSchemaArguments = serde_json::from_value(value.clone()).unwrap();
+        schema.validate(&value).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        schema.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ShapedSchemaArguments>(encoded).unwrap(),
+            decoded
+        );
+    }
+    let properties = &schema.schema()["properties"];
+    assert_eq!(properties["pair"]["minItems"], 2);
+    assert_eq!(properties["pair"]["maxItems"], 2);
+    assert_eq!(properties["singleton"]["type"], "array");
+    assert_eq!(properties["singleton"]["minItems"], 1);
+    assert_eq!(properties["fixed"]["minItems"], 3);
+    assert_eq!(properties["fixed"]["maxItems"], 3);
+    assert_eq!(properties["empty"]["maxItems"], 0);
+    assert!(properties["empty"].get("prefixItems").is_none());
+    assert_eq!(properties["unit"]["type"], "null");
+    assert!(properties["unit"].get("prefixItems").is_none());
+    assert_eq!(
+        properties["optional_glyph"]["type"],
+        json!(["string", "null"])
+    );
+    {
+        // The array type gives these unsuffixed literals a usize context.
+        // Losing that context produces a negative bound or overflows an i32 shift.
+        let inferred =
+            fastmcp_rust::schema::admit_final_schema(ShapedSchemaInferredArray::json_schema())
+                .unwrap();
+        let value = ShapedSchemaInferredArray([7]);
+        let encoded = serde_json::to_value(&value).unwrap();
+        inferred.validate(&encoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ShapedSchemaInferredArray>(encoded).unwrap(),
+            value
+        );
+        assert_eq!(inferred.schema()["minItems"], 1);
+        assert_eq!(inferred.schema()["maxItems"], 1);
+        assert!(inferred.validate(&json!([7, 8])).is_err());
+    }
+    let hygienic =
+        fastmcp_rust::schema::admit_final_schema(ShapedSchemaHygienicArray::json_schema()).unwrap();
+    let value = ShapedSchemaHygienicArray([[7, 8]]);
+    let encoded = serde_json::to_value(&value).unwrap();
+    hygienic.validate(&encoded).unwrap();
+    assert_eq!(
+        serde_json::from_value::<ShapedSchemaHygienicArray>(encoded).unwrap(),
+        value
+    );
+    assert_eq!(hygienic.schema()["items"]["minItems"], 2);
+    assert_eq!(hygienic.schema()["maxItems"], 1);
+    assert!(hygienic.validate(&json!([[7]])).is_err());
+}
+
+#[test]
+fn json_schema_tuple_and_array_shapes_reject_near_neighbors() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(ShapedSchemaArguments::json_schema()).unwrap();
+    for (valid, invalid) in shaped_schema_argument_pairs() {
+        schema.validate(&valid).unwrap();
+        serde_json::from_value::<ShapedSchemaArguments>(valid).unwrap();
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<ShapedSchemaArguments>(invalid).is_err());
+    }
+}
+
+#[derive(JsonSchema)]
+struct NativeIntegerSchemas {
+    i8_value: i8,
+    i16_value: i16,
+    i32_value: i32,
+    i64_value: i64,
+    i128_value: i128,
+    isize_value: isize,
+    u8_value: u8,
+    u16_value: u16,
+    u32_value: u32,
+    u64_value: u64,
+    u128_value: u128,
+    usize_value: usize,
+}
+
+struct NativeIntegerSchemaCase {
+    name: &'static str,
+    minimum: serde_json::Value,
+    maximum: serde_json::Value,
+    below: serde_json::Value,
+    above: serde_json::Value,
+    accepts: fn(serde_json::Value) -> bool,
+}
+
+fn native_integer_schema_cases() -> Vec<NativeIntegerSchemaCase> {
+    macro_rules! case {
+        ($name:literal, $ty:ty, $below:expr, $above:expr) => {
+            NativeIntegerSchemaCase {
+                name: $name,
+                minimum: json!(<$ty>::MIN),
+                maximum: json!(<$ty>::MAX),
+                below: serde_json::from_str($below).unwrap(),
+                above: serde_json::from_str($above).unwrap(),
+                accepts: |value| serde_json::from_value::<$ty>(value).is_ok(),
+            }
+        };
+    }
+    vec![
+        case!("i8_value", i8, "-129", "128"),
+        case!("i16_value", i16, "-32769", "32768"),
+        case!("i32_value", i32, "-2147483649", "2147483648"),
+        case!(
+            "i64_value",
+            i64,
+            "-9223372036854775809",
+            "9223372036854775808"
+        ),
+        case!(
+            "i128_value",
+            i128,
+            "-170141183460469231731687303715884105729",
+            "170141183460469231731687303715884105728"
+        ),
+        case!(
+            "isize_value",
+            isize,
+            &(isize::MIN as i128 - 1).to_string(),
+            &(isize::MAX as i128 + 1).to_string()
+        ),
+        case!("u8_value", u8, "-1", "256"),
+        case!("u16_value", u16, "-1", "65536"),
+        case!("u32_value", u32, "-1", "4294967296"),
+        case!("u64_value", u64, "-1", "18446744073709551616"),
+        case!(
+            "u128_value",
+            u128,
+            "-1",
+            "340282366920938463463374607431768211456"
+        ),
+        case!(
+            "usize_value",
+            usize,
+            "-1",
+            &(usize::MAX as u128 + 1).to_string()
+        ),
+    ]
+}
+
+#[test]
+fn json_schema_native_integer_bounds_are_exact() {
+    let schema = NativeIntegerSchemas::json_schema();
+    for case in native_integer_schema_cases() {
+        let admitted =
+            fastmcp_rust::schema::admit_final_schema(schema["properties"][case.name].clone())
+                .unwrap();
+        assert_eq!(admitted.schema()["minimum"], case.minimum);
+        assert_eq!(admitted.schema()["maximum"], case.maximum);
+        for value in [case.minimum, case.maximum] {
+            admitted.validate(&value).unwrap();
+            assert!((case.accepts)(value));
+        }
+    }
+    assert_eq!(
+        schema["properties"]["i128_value"]["minimum"].to_string(),
+        "-170141183460469231731687303715884105728"
+    );
+    assert_eq!(
+        schema["properties"]["u128_value"]["maximum"].to_string(),
+        "340282366920938463463374607431768211455"
+    );
+}
+
+#[test]
+fn json_schema_native_integer_bounds_reject_neighboring_values() {
+    let schema = NativeIntegerSchemas::json_schema();
+    for case in native_integer_schema_cases() {
+        let admitted =
+            fastmcp_rust::schema::admit_final_schema(schema["properties"][case.name].clone())
+                .unwrap();
+        admitted.validate(&case.minimum).unwrap();
+        admitted.validate(&case.maximum).unwrap();
+        for value in [case.below, case.above] {
+            assert!(
+                admitted.validate(&value).is_err(),
+                "{} accepts {value}",
+                case.name
+            );
+            assert!(!(case.accepts)(value));
+        }
+    }
+}
+
+static SHAPED_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn describe_shaped_schema(value: ShapedSchemaArguments) -> McpResult<String> {
+    SHAPED_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    serde_json::to_string(&value).map_err(McpError::from)
+}
+
+#[test]
+fn json_schema_shaped_arguments_reach_registered_modern_tool() {
+    on_caller_runtime(async {
+        let server = Server::new("shaped-schema", "1.0.0")
+            .tool(DescribeShapedSchema)
+            .build();
+        let connection = ModernConnection::new();
+        let request = |value| {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                    "name": "describe_shaped_schema",
+                    "arguments": {"value": value},
+                })),
+                64_i64,
+            )
+        };
+        for (valid, invalid) in shaped_schema_argument_pairs() {
+            let expected: ShapedSchemaArguments = serde_json::from_value(valid.clone()).unwrap();
+            let before = SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(valid))
+                .await
+                .unwrap();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let result = response.result.unwrap();
+            assert_eq!(result["resultType"], "complete");
+            assert_ne!(result["isError"], json!(true));
+            let actual: ShapedSchemaArguments =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            let response = server
+                .dispatch_stateless(&facade_final_inbound(&connection), &request(invalid))
+                .await
+                .unwrap();
+            assert!(
+                response.error.is_some()
+                    || response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["isError"] == json!(true))
+            );
+            assert_eq!(
+                SHAPED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid shape or out-of-range integer must not reach the handler"
+            );
+        }
+    });
 }
 
 // --- Struct with only description, no fields ---

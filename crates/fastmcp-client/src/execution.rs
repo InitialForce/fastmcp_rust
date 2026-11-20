@@ -1,0 +1,8659 @@
+//! Transport-neutral request execution and response correlation.
+//!
+//! This module owns the correlation rules that are independent of a concrete
+//! MCP transport. A transport supplies typed JSON-RPC frames; the executor
+//! commits requests, preserves out-of-order final responses for their exact
+//! owners, retains bounded tombstones for retired owners, and never turns
+//! malformed peer ingress into a peer-directed JSON-RPC response.
+
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
+
+use asupersync::Cx;
+use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
+#[cfg(any(feature = "tasks", test))]
+use fastmcp_protocol::FinalCoreResult;
+use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
+use fastmcp_protocol::methods::{
+    FINAL_2026_07_28_METHODS, Final2026EnvelopeKind, Final2026Peer, INITIALIZE,
+    LEGACY_2024_11_05_METHODS, Legacy2024Direction, Legacy2024EnvelopeKind, SUBSCRIPTIONS_LISTEN,
+    TOOLS_CALL, validate_legacy_2024_11_05_method_params,
+};
+use fastmcp_protocol::protocol_policy::ProtocolEra;
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::tasks_extension::{
+    CancelTaskParams, CancelTaskResult, GetTaskParams, GetTaskResult, TASK_STATUS_NOTIFICATION,
+    Task, TaskId, TaskInputLedger, TaskMethodRequest, TaskStatusNotification, UpdateTaskParams,
+    UpdateTaskResult, task_subscription_ids,
+};
+use fastmcp_protocol::{
+    CancellationSender, CancellationWireMessage, CancelledParams, CoreRequest, CoreResult,
+    CoreResultDiscriminatorPolicy, CorrelationKey, DecodedResult, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCancelledNotificationParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ProgressMarker, RequestId, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
+    decode_peer_result, decode_strict_jsonrpc_response,
+};
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::{
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    SubscriptionFilter,
+};
+use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
+use serde_json::Value;
+
+use crate::{
+    RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy, request_timeout_error,
+    transport_error_to_mcp,
+};
+
+/// Bounded compatibility diagnostic for a peer's final cache TTL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalCacheTtlDiagnostic {
+    /// A cacheable final complete result omitted its required `ttlMs` member.
+    Missing,
+    /// A cacheable final complete result supplied a negative `ttlMs`.
+    Negative,
+}
+
+/// Default maximum number of active request owners.
+pub const DEFAULT_MAX_IN_FLIGHT_EXECUTIONS: usize = 1_024;
+/// Default maximum number of retained response correlations.
+pub const DEFAULT_MAX_RESPONSE_CORRELATIONS: usize = 4_096;
+/// Default period for retaining a retired execution's exact response ID.
+pub const DEFAULT_TOMBSTONE_RETENTION: Duration = Duration::from_mins(10);
+
+const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
+/// Minimum automatic-pagination page bound admitted by CLT-01 B.
+pub const MIN_AUTOMATIC_PAGINATION_PAGES: usize = 1_000;
+/// Minimum automatic-pagination item bound admitted by CLT-01 B.
+pub const MIN_AUTOMATIC_PAGINATION_ITEMS: usize = 100_000;
+/// Minimum automatic-pagination decoded-byte bound admitted by CLT-01 B.
+pub const MIN_AUTOMATIC_PAGINATION_DECODED_BYTES: usize = 256 * 1024 * 1024;
+/// Minimum automatic-pagination deadline admitted by CLT-01 B.
+pub const MIN_AUTOMATIC_PAGINATION_DEADLINE: Duration = Duration::from_mins(5);
+/// Hard automatic-pagination page ceiling.
+pub const MAX_AUTOMATIC_PAGINATION_PAGES: usize = 10_000;
+/// Hard automatic-pagination item ceiling.
+pub const MAX_AUTOMATIC_PAGINATION_ITEMS: usize = 1_000_000;
+/// Hard automatic-pagination decoded-byte ceiling.
+pub const MAX_AUTOMATIC_PAGINATION_DECODED_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Hard automatic-pagination deadline ceiling.
+pub const MAX_AUTOMATIC_PAGINATION_DEADLINE: Duration = Duration::from_mins(30);
+const CLT_01_A_MANIFEST_ROWS: &str = concat!(
+    "CLT-01-A\n",
+    "01 reordered correlated finals\n",
+    "02 duplicate response ID\n",
+    "03 unknown late tombstoned ID\n",
+    "04 notification interleaving\n",
+    "05 malformed peer ingress without reverse response\n",
+    "06 typed complete input-required result siblings\n",
+    "07 send queue backpressure\n",
+    "08 connection-loss waiter fanout\n",
+    "pending correlation_key request_id execution_generation request_state send_committed idle_deadline absolute_deadline terminal_state cancellation_committed tombstone_generation\n",
+);
+const CLT_01_B_MANIFEST_ROWS: &str = concat!(
+    "CLT-01-B\n",
+    "09 explicit caller cancellation/drop\n",
+    "10 idle expiry and exact matching-progress reset\n",
+    "11 non-resettable absolute expiry under progress/log/keepalive flood\n",
+    "12 final-response/caller-cancel/timeout/connection-loss same-tick race\n",
+    "13 reverse request and streaming notification ordering\n",
+    "14 opaque pagination empty/repeated/absent cursors plus page/item/byte/deadline bounds\n",
+    "15 shutdown/connection-close cleanup\n",
+    "terminal_state terminal_reason final_delivered cancellation_committed cancellation_transport_attempts local_cancellation_event waiter_release tombstone\n",
+);
+
+/// Bounds for one multi-round model-request tool retry (MRTR) operation.
+///
+/// The caller chooses the operation's absolute deadline separately. These
+/// bounds limit only how many input-required continuations and total supplied
+/// input values that operation may admit before it sends another request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MrtrDriverLimits {
+    max_continuation_rounds: usize,
+    max_total_input_responses: usize,
+}
+
+impl MrtrDriverLimits {
+    /// Creates validated MRTR continuation bounds.
+    ///
+    /// Both bounds must be nonzero. A continuation round is one peer
+    /// `input_required` result followed by one possible caller retry.
+    pub(crate) fn new(
+        max_continuation_rounds: usize,
+        max_total_input_responses: usize,
+    ) -> McpResult<Self> {
+        if max_continuation_rounds == 0 {
+            return Err(McpError::invalid_params(
+                "MRTR continuation-round limit must be at least one",
+            ));
+        }
+        if max_total_input_responses == 0 {
+            return Err(McpError::invalid_params(
+                "MRTR total input-response limit must be at least one",
+            ));
+        }
+        Ok(Self {
+            max_continuation_rounds,
+            max_total_input_responses,
+        })
+    }
+}
+
+/// Caller-owned state for one bounded multi-round MRTR operation.
+///
+/// This type deliberately does not own transport state or spawn work. The
+/// stdio client keeps transport ownership while this driver makes the caller's
+/// cancellation context, one absolute deadline, and the continuation/input
+/// counters explicit at every retry boundary.
+#[derive(Debug)]
+pub(crate) struct MrtrDriver<'cx> {
+    cx: &'cx Cx,
+    deadline: Instant,
+    limits: MrtrDriverLimits,
+    continuation_rounds: usize,
+    total_input_responses: usize,
+}
+
+impl<'cx> MrtrDriver<'cx> {
+    /// Starts one MRTR operation using exactly the supplied caller context and
+    /// absolute deadline.
+    pub(crate) fn new(cx: &'cx Cx, deadline: Instant, limits: MrtrDriverLimits) -> McpResult<Self> {
+        let driver = Self {
+            cx,
+            deadline,
+            limits,
+            continuation_rounds: 0,
+            total_input_responses: 0,
+        };
+        driver.before_request()?;
+        Ok(driver)
+    }
+
+    /// Returns the operation-wide absolute deadline.
+    #[must_use]
+    pub(crate) const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Checks caller cancellation and the operation-wide deadline before a
+    /// request can be committed.
+    pub(crate) fn before_request(&self) -> McpResult<()> {
+        if self.cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(McpError::internal_error(
+                "MRTR operation absolute deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admits one peer `input_required` continuation before the callback is
+    /// invoked. This prevents a callback effect or another wire request after
+    /// the configured round bound has been reached.
+    pub(crate) fn begin_continuation(&mut self) -> McpResult<()> {
+        self.before_request()?;
+        let continuation_rounds = self.continuation_rounds.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("MRTR continuation-round counter overflowed")
+        })?;
+        if continuation_rounds > self.limits.max_continuation_rounds {
+            return Err(McpError::invalid_params(
+                "MRTR continuation-round limit exceeded",
+            ));
+        }
+        self.continuation_rounds = continuation_rounds;
+        Ok(())
+    }
+
+    /// Admits the response entries selected for the current continuation.
+    ///
+    /// A state-only continuation supplies zero entries and is therefore
+    /// admitted as long as the caller has not exceeded the round limit.
+    pub(crate) fn admit_input_responses(&mut self, input_response_count: usize) -> McpResult<()> {
+        self.before_request()?;
+        let total_input_responses = self
+            .total_input_responses
+            .checked_add(input_response_count)
+            .ok_or_else(|| {
+                McpError::internal_error("MRTR total input-response counter overflowed")
+            })?;
+        if total_input_responses > self.limits.max_total_input_responses {
+            return Err(McpError::invalid_params(
+                "MRTR total input-response limit exceeded",
+            ));
+        }
+        self.total_input_responses = total_input_responses;
+        self.before_request()
+    }
+}
+
+/// A client-authored JSON-RPC request that expects one final response.
+pub type Request = JsonRpcRequest;
+
+/// Returns the canonical CLT-01 A case-and-pending-record manifest digest.
+///
+/// The manifest is an executable acceptance input, not a source-file hash: it
+/// binds the public executor's ordered groups 01–08 and every observable
+/// pending-map field exercised by the public-surface tests.
+#[must_use]
+pub fn clt_01_a_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        CLT_01_A_MANIFEST_ROWS.as_bytes(),
+        CLT_01_A_MANIFEST_ROWS.len(),
+    )
+    .expect("the fixed CLT-01 A manifest is within its exact byte bound")
+}
+
+/// Returns the canonical CLT-01 B lifecycle-and-pagination manifest digest.
+///
+/// The digest binds ordered groups 09–15 and the terminal predicate; it is
+/// deliberately a fixed acceptance input rather than a hash of this source.
+#[must_use]
+pub fn clt_01_b_manifest_digest() -> Sha256Digest {
+    sha256_bounded(
+        CLT_01_B_MANIFEST_ROWS.as_bytes(),
+        CLT_01_B_MANIFEST_ROWS.len(),
+    )
+    .expect("the fixed CLT-01 B manifest is within its exact byte bound")
+}
+
+/// Decodes a core response through the exact request and negotiated-era type.
+///
+/// The request owns the method-specific result shape, so this cannot conflate a
+/// final `tools/call` response with a legacy result or with another core
+/// method's complete payload. The caller owns connection policy after a peer
+/// violates this contract.
+pub(crate) fn decode_core_result_from_source(
+    request: &CoreRequest,
+    result: &Value,
+    result_source: Option<&str>,
+) -> McpResult<CoreResult> {
+    let encoded = match result_source {
+        Some(source) => {
+            let admitted: Value = serde_json::from_str(source).map_err(|_| {
+                McpError::invalid_request("Peer core result source is not valid JSON")
+            })?;
+            if &admitted != result {
+                return Err(McpError::invalid_request(
+                    "Peer core result source differs from its typed response",
+                ));
+            }
+            Cow::Borrowed(source)
+        }
+        None => Cow::Owned(serde_json::to_string(result).map_err(|_| {
+            McpError::invalid_request(
+                "Peer core result could not be encoded for protocol admission",
+            )
+        })?),
+    };
+    request
+        .decode_result(&encoded)
+        .map_err(|_| McpError::invalid_request("Peer core result failed protocol decoding"))
+}
+
+/// Decodes a core result while applying the final cache-TTL compatibility rule
+/// at the client ingress boundary. Missing or negative peer TTLs are
+/// normalized to zero freshness and reported through a bounded local
+/// diagnostic. All other malformed shapes continue through strict protocol
+/// decoding unchanged.
+pub(crate) fn decode_core_result_with_cache_ttl_from_source(
+    request: &CoreRequest,
+    result: &Value,
+    result_source: Option<&str>,
+) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
+    let mut normalized = result.clone();
+    let diagnostic = tolerant_final_cache_ttl(request, &mut normalized);
+    let normalized_source = result_source
+        .map(|source| normalize_final_cache_ttl_source(source, diagnostic))
+        .transpose()?;
+    decode_core_result_from_source(request, &normalized, normalized_source.as_deref())
+        .map(|result| (result, diagnostic))
+}
+
+fn normalize_final_cache_ttl_source(
+    source: &str,
+    diagnostic: Option<FinalCacheTtlDiagnostic>,
+) -> McpResult<Cow<'_, str>> {
+    match diagnostic {
+        None => Ok(Cow::Borrowed(source)),
+        Some(FinalCacheTtlDiagnostic::Missing) => {
+            let end = source.trim_end().len();
+            let Some(close) = end
+                .checked_sub(1)
+                .filter(|index| source.as_bytes()[*index] == b'}')
+            else {
+                return Err(McpError::invalid_request(
+                    "Peer cacheable result source is not an object",
+                ));
+            };
+            let open = source.find('{').ok_or_else(|| {
+                McpError::invalid_request("Peer cacheable result is not an object")
+            })?;
+            let separator = if source[open + 1..close].trim().is_empty() {
+                ""
+            } else {
+                ","
+            };
+            Ok(Cow::Owned(format!(
+                "{}{}\"ttlMs\":0{}",
+                &source[..close],
+                separator,
+                &source[close..]
+            )))
+        }
+        Some(FinalCacheTtlDiagnostic::Negative) => {
+            let range = top_level_json_member_value_range(source, "ttlMs").ok_or_else(|| {
+                McpError::invalid_request("Peer cache TTL source member could not be located")
+            })?;
+            let mut normalized = String::with_capacity(source.len());
+            normalized.push_str(&source[..range.start]);
+            normalized.push('0');
+            normalized.push_str(&source[range.end..]);
+            Ok(Cow::Owned(normalized))
+        }
+    }
+}
+
+fn top_level_json_member_value_range(
+    source: &str,
+    expected_name: &str,
+) -> Option<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut cursor = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    if bytes.get(cursor) != Some(&b'{') {
+        return None;
+    }
+    cursor += 1;
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'}') {
+            return None;
+        }
+        let key_start = cursor;
+        let key_end = json_string_end(bytes, cursor)?;
+        let key: String = serde_json::from_str(&source[key_start..key_end]).ok()?;
+        cursor = key_end;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        let value_end = json_value_end(bytes, cursor)?;
+        if key == expected_name {
+            return Some(value_start..value_end);
+        }
+        cursor = value_end;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        match bytes.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b'}') => return None,
+            _ => return None,
+        }
+    }
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut cursor = start + 1;
+    while let Some(byte) = bytes.get(cursor) {
+        match byte {
+            b'"' => return Some(cursor + 1),
+            b'\\' => cursor = cursor.checked_add(2)?,
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) == Some(&b'"') {
+        return json_string_end(bytes, start);
+    }
+    if matches!(bytes.get(start), Some(b'{' | b'[')) {
+        let mut stack = vec![*bytes.get(start)?];
+        let mut cursor = start + 1;
+        while let Some(byte) = bytes.get(cursor) {
+            match byte {
+                b'"' => cursor = json_string_end(bytes, cursor)?,
+                b'{' | b'[' => {
+                    stack.push(*byte);
+                    cursor += 1;
+                }
+                b'}' if stack.last() == Some(&b'{') => {
+                    stack.pop();
+                    cursor += 1;
+                    if stack.is_empty() {
+                        return Some(cursor);
+                    }
+                }
+                b']' if stack.last() == Some(&b'[') => {
+                    stack.pop();
+                    cursor += 1;
+                    if stack.is_empty() {
+                        return Some(cursor);
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        return None;
+    }
+    let mut cursor = start;
+    while !matches!(bytes.get(cursor), None | Some(b',' | b'}')) {
+        cursor += 1;
+    }
+    let mut end = cursor;
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    (end > start).then_some(end)
+}
+
+fn tolerant_final_cache_ttl(
+    request: &CoreRequest,
+    result: &mut Value,
+) -> Option<FinalCacheTtlDiagnostic> {
+    let CoreRequest::Final(request) = request else {
+        return None;
+    };
+    if !matches!(
+        request,
+        fastmcp_protocol::FinalCoreRequest::ToolsList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourcesList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourceTemplatesList(_)
+            | fastmcp_protocol::FinalCoreRequest::ResourcesRead(_)
+            | fastmcp_protocol::FinalCoreRequest::PromptsList(_)
+    ) {
+        return None;
+    }
+    let members = result.as_object_mut()?;
+    if members
+        .get("resultType")
+        .is_some_and(|result_type| result_type.as_str() != Some("complete"))
+    {
+        return None;
+    }
+
+    match members.get("ttlMs") {
+        None => {
+            members.insert("ttlMs".to_owned(), Value::Number(0_u64.into()));
+            Some(FinalCacheTtlDiagnostic::Missing)
+        }
+        Some(Value::Number(ttl)) if ttl.to_string().starts_with('-') => {
+            members.insert("ttlMs".to_owned(), Value::Number(0_u64.into()));
+            Some(FinalCacheTtlDiagnostic::Negative)
+        }
+        _ => None,
+    }
+}
+
+/// Public snapshot of one active correlation record.
+///
+/// The executor exposes these records so callers can audit exactly which
+/// request owns a response slot without access to the concrete transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRequestRecord {
+    /// Canonical key for this correlation; numeric wire aliases share one key.
+    pub correlation_key: CorrelationKey,
+    /// Exact JSON-RPC request ID sent to the peer.
+    pub request_id: RequestId,
+    /// Monotonic generation for a request ID that may later be tombstoned.
+    pub execution_generation: u64,
+    /// Whether the request has entered the response-wait phase.
+    pub request_state: ExecutionTerminalState,
+    /// Whether the request bytes were committed to the transport.
+    pub send_committed: bool,
+    /// Post-send idle deadline recorded for the execution owner.
+    pub idle_deadline: Instant,
+    /// Non-resettable post-send absolute deadline recorded for the owner.
+    pub absolute_deadline: Instant,
+    /// Current terminal state; active entries are always [`Self::request_state`].
+    pub terminal_state: ExecutionTerminalState,
+    /// Whether a cancellation transition has been selected for this owner.
+    pub cancellation_committed: bool,
+    /// Generation retained by a later tombstone, if this record has retired.
+    pub tombstone_generation: Option<u64>,
+}
+
+/// Exactly-once execution state visible to callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionTerminalState {
+    /// The execution remains eligible to receive one final response.
+    Pending,
+    /// A final JSON-RPC response was accepted for the exact owner.
+    Response,
+    /// The transport or peer protocol failed the owner.
+    Failed,
+    /// The owner was abandoned and a cancellation request was selected.
+    Cancelled,
+}
+
+/// The one local cause that won an execution's terminal transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionTerminalReason {
+    /// The peer final response won the terminal transition.
+    FinalResponse,
+    /// The caller explicitly cancelled the execution.
+    CallerCancelled,
+    /// The request-owned handle was dropped before its final response.
+    CallerDropped,
+    /// A valid, accepted peer subscription teardown selected cancellation.
+    PeerSubscriptionTeardown,
+    /// The committed request made no qualifying progress before idle expiry.
+    IdleTimeout,
+    /// The non-resettable committed request lifetime elapsed.
+    AbsoluteTimeout,
+    /// The shared connection or peer ingress failed.
+    ConnectionLost,
+    /// The exact owner received an invalid final MCP result envelope.
+    PeerProtocol,
+    /// The configured HTTP credential could no longer authorize dispatch.
+    CredentialUnavailable,
+    /// Local executor shutdown selected the terminal transition.
+    Shutdown,
+}
+
+/// Typed, local-only cancellation indication for an execution owner.
+///
+/// This intentionally exposes a classifier rather than peer-provided text;
+/// raw cancellation reasons are never copied into an observer event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CancellationRequested {
+    /// Exact request ID whose cancellation was selected.
+    pub request_id: RequestId,
+    /// Local classifier for the selected cancellation source.
+    pub reason: ExecutionTerminalReason,
+}
+
+/// Cooperative cancellation handle owned by one exact-2024 reverse request.
+///
+/// The executor cancels this handle only after accepting an ID-free legacy
+/// `notifications/cancelled` notification that names this request's live
+/// owner. A callback must use its own checkpoints before producing effects.
+const REVERSE_CALLBACK_OPEN: u8 = 0;
+const REVERSE_CALLBACK_CANCELLED: u8 = 1;
+const REVERSE_CALLBACK_RESPONSE_SENT: u8 = 2;
+
+#[derive(Clone, Debug)]
+pub struct ReverseRequestCancellation(Arc<AtomicU8>);
+
+impl ReverseRequestCancellation {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(REVERSE_CALLBACK_OPEN)))
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _ = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_OPEN
+    }
+
+    pub(crate) fn record_response_sent(&self) {
+        let previous = self.0.compare_exchange(
+            REVERSE_CALLBACK_OPEN,
+            REVERSE_CALLBACK_RESPONSE_SENT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(
+            previous.is_ok(),
+            "only an elected open callback can record a response write"
+        );
+    }
+
+    pub(crate) fn belongs_to_same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Returns whether the server or owning connection cancelled this request.
+    #[must_use]
+    pub fn is_cancel_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire) == REVERSE_CALLBACK_CANCELLED
+    }
+
+    /// Returns `RequestCancelled` when this reverse request is no longer live.
+    pub fn checkpoint(&self) -> McpResult<()> {
+        if self.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
+    }
+}
+
+/// One exact-2024 server-authored reverse request together with its response
+/// capability.
+///
+/// The capability is local to both this request incarnation and this executor
+/// connection. It cannot answer a later request that happens to reuse the
+/// same JSON-RPC ID, including after a matching cancellation.
+#[derive(Clone, Debug)]
+pub struct ReverseRequest {
+    request: JsonRpcRequest,
+    cancellation: ReverseRequestCancellation,
+    owner: Arc<ReverseRequestOwner>,
+}
+
+#[derive(Debug)]
+struct ReverseRequestOwner {
+    cancellation: ReverseRequestCancellation,
+}
+
+impl Drop for ReverseRequestOwner {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl ReverseRequest {
+    /// Returns the exact server-authored request frame.
+    #[must_use]
+    pub fn request(&self) -> &JsonRpcRequest {
+        &self.request
+    }
+
+    /// Returns the exact response ID carried by this request.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        self.request
+            .id
+            .as_ref()
+            .expect("reverse request owners always retain a request ID")
+    }
+
+    /// Returns the cooperative cancellation handle for this request owner.
+    #[must_use]
+    pub fn cancellation(&self) -> &ReverseRequestCancellation {
+        &self.cancellation
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActiveReverseRequest {
+    request_id: RequestId,
+    cancellation: ReverseRequestCancellation,
+    owner: Weak<ReverseRequestOwner>,
+}
+
+/// Immutable receipt for the terminal CAS of one execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionTerminalRecord {
+    /// State selected by the single terminal transition.
+    pub terminal_state: ExecutionTerminalState,
+    /// Cause selected by the single terminal transition.
+    pub terminal_reason: ExecutionTerminalReason,
+    /// Whether a peer final response, rather than a local error, was delivered.
+    pub final_delivered: bool,
+    /// Whether this terminal path selected cancellation.
+    pub cancellation_committed: bool,
+    /// Number of cancellation transport sends attempted for this execution.
+    pub cancellation_transport_attempts: u8,
+    /// Whether the one typed local cancellation event was published.
+    pub local_cancellation_event: bool,
+    /// Whether the response waiter was released.
+    pub waiter_release: bool,
+    /// Whether the canonical request ID is retained to discard a late final response.
+    pub tombstone: bool,
+}
+
+/// Bounds for an automatic opaque-cursor pagination sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaginationBounds {
+    max_pages: usize,
+    max_items: usize,
+    max_decoded_bytes: usize,
+    deadline: Duration,
+}
+
+impl PaginationBounds {
+    /// Creates bounds within the frozen CLT-01 B admission interval.
+    pub fn new(
+        max_pages: usize,
+        max_items: usize,
+        max_decoded_bytes: usize,
+        deadline: Duration,
+    ) -> McpResult<Self> {
+        if !(MIN_AUTOMATIC_PAGINATION_PAGES..=MAX_AUTOMATIC_PAGINATION_PAGES).contains(&max_pages)
+            || !(MIN_AUTOMATIC_PAGINATION_ITEMS..=MAX_AUTOMATIC_PAGINATION_ITEMS)
+                .contains(&max_items)
+            || !(MIN_AUTOMATIC_PAGINATION_DECODED_BYTES..=MAX_AUTOMATIC_PAGINATION_DECODED_BYTES)
+                .contains(&max_decoded_bytes)
+            || !(MIN_AUTOMATIC_PAGINATION_DEADLINE..=MAX_AUTOMATIC_PAGINATION_DEADLINE)
+                .contains(&deadline)
+        {
+            return Err(McpError::invalid_params(
+                "Automatic pagination bounds fall outside the CLT-01 B admission interval",
+            ));
+        }
+        Ok(Self {
+            max_pages,
+            max_items,
+            max_decoded_bytes,
+            deadline,
+        })
+    }
+}
+
+impl Default for PaginationBounds {
+    fn default() -> Self {
+        Self {
+            max_pages: MIN_AUTOMATIC_PAGINATION_PAGES,
+            max_items: MIN_AUTOMATIC_PAGINATION_ITEMS,
+            max_decoded_bytes: MIN_AUTOMATIC_PAGINATION_DECODED_BYTES,
+            deadline: MIN_AUTOMATIC_PAGINATION_DEADLINE,
+        }
+    }
+}
+
+/// State machine for opaque pagination cursors.
+///
+/// A present cursor, including the empty string and a repeated value, always
+/// means another page. Only an absent field finishes the sequence.
+#[derive(Clone, Debug)]
+pub struct OpaquePagination {
+    bounds: PaginationBounds,
+    started_at: Instant,
+    pages: usize,
+    items: usize,
+    decoded_bytes: usize,
+    next_cursor: Option<String>,
+    complete: bool,
+}
+
+impl OpaquePagination {
+    /// Starts a bounded pagination sequence at `started_at`.
+    #[must_use]
+    pub fn new(bounds: PaginationBounds, started_at: Instant) -> Self {
+        Self {
+            bounds,
+            started_at,
+            pages: 0,
+            items: 0,
+            decoded_bytes: 0,
+            next_cursor: None,
+            complete: false,
+        }
+    }
+
+    /// Admits one decoded page and records its next cursor verbatim.
+    ///
+    /// Returns `true` when the next cursor field is present, independently of
+    /// its contents; callers must issue another request in that case.
+    pub fn accept_page(
+        &mut self,
+        next_cursor: Option<String>,
+        item_count: usize,
+        decoded_bytes: usize,
+        observed_at: Instant,
+    ) -> McpResult<bool> {
+        if self.complete {
+            return Err(McpError::invalid_request(
+                "Automatic pagination received a page after cursor absence completed it",
+            ));
+        }
+        if observed_at.duration_since(self.started_at) > self.bounds.deadline {
+            return Err(McpError::internal_error(
+                "Automatic pagination deadline elapsed",
+            ));
+        }
+        self.pages = self.pages.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("Automatic pagination page counter overflowed")
+        })?;
+        self.items = self.items.checked_add(item_count).ok_or_else(|| {
+            McpError::internal_error("Automatic pagination item counter overflowed")
+        })?;
+        self.decoded_bytes = self
+            .decoded_bytes
+            .checked_add(decoded_bytes)
+            .ok_or_else(|| {
+                McpError::internal_error("Automatic pagination byte counter overflowed")
+            })?;
+        if self.pages > self.bounds.max_pages
+            || self.items > self.bounds.max_items
+            || self.decoded_bytes > self.bounds.max_decoded_bytes
+        {
+            return Err(McpError::internal_error(
+                "Automatic pagination exceeded a local bound",
+            ));
+        }
+        self.complete = next_cursor.is_none();
+        self.next_cursor = next_cursor;
+        Ok(!self.complete)
+    }
+
+    /// Returns the opaque next cursor without normalization or interpretation.
+    #[must_use]
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+}
+
+/// Poll accounting for one synchronous executor operation. Nested maintenance
+/// and every iteration of a wait share this ledger. The runtime's `Cx` remains
+/// the authority for runtime cancellation, masks, deadlines and transport
+/// access. This separate operation-admission limit also applies inside a
+/// runtime cancellation mask; consuming it never cancels a shared `Cx`.
+struct ExecutionTurn<'cx> {
+    cx: &'cx Cx,
+    budget: Cell<asupersync::Budget>,
+}
+
+impl<'cx> ExecutionTurn<'cx> {
+    fn new(cx: &'cx Cx) -> Self {
+        Self {
+            cx,
+            budget: Cell::new(cx.budget()),
+        }
+    }
+
+    fn checkpoint(&self) -> McpResult<()> {
+        self.cx
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        let mut budget = self.budget.get();
+        if budget.poll_quota != u32::MAX {
+            budget
+                .consume_poll()
+                .ok_or_else(McpError::request_cancelled)?;
+            self.budget.set(budget);
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for ExecutionTurn<'_> {
+    type Target = Cx;
+
+    fn deref(&self) -> &Self::Target {
+        self.cx
+    }
+}
+
+#[derive(Debug)]
+struct PendingExecution {
+    record: PendingRequestRecord,
+    /// The execution's originating lifetime, not whichever sibling or
+    /// connection driver happens to service the shared transport next.
+    /// Retain the real context so its clock, masks and cancellation state
+    /// cannot be replaced by a later observer's more permissive context.
+    caller: Cx,
+    owner_dropped: OwnerDropped,
+    timeout_policy: ExecutionTimeoutPolicy,
+    /// Canonical identity of the optional marker advertised in `_meta`.
+    ///
+    /// Progress is never correlated from a JSON-RPC request ID alone: a peer
+    /// notification belongs to this request only when its token has the same
+    /// string identity or exact mathematical integer value.
+    advertised_progress_key: Option<CorrelationKey>,
+    last_progress: Option<ExactNonNegativeJsonNumber>,
+    method: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExecutionTimeoutPolicy {
+    Request(RequestTimeoutPolicy),
+    Subscription(SubscriptionTimeoutPolicy),
+}
+
+impl ExecutionTimeoutPolicy {
+    fn idle_timeout(self) -> Duration {
+        match self {
+            Self::Request(policy) => policy.idle_timeout(),
+            Self::Subscription(policy) => policy.idle_timeout(),
+        }
+    }
+
+    fn absolute_timeout(self) -> Duration {
+        match self {
+            Self::Request(policy) => policy.absolute_timeout(),
+            Self::Subscription(policy) => policy.absolute_timeout(),
+        }
+    }
+
+    fn resets_idle_on_matching_progress(self) -> bool {
+        matches!(self, Self::Request(policy) if policy.resets_idle_on_matching_progress())
+    }
+}
+
+/// Returns the exact progress marker a client request advertised, when valid.
+///
+/// A generic raw request may omit `_meta` or supply an invalid marker. Neither
+/// case grants a peer progress notification ownership of that execution.
+fn advertised_progress_marker(params: Option<&Value>) -> Option<ProgressMarker> {
+    let marker = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("progressToken"))?;
+    serde_json::from_value(marker.clone()).ok()
+}
+
+/// Returns one valid typed marker from a peer progress notification.
+fn progress_notification_marker(notification: &JsonRpcRequest) -> Option<ProgressMarker> {
+    let marker = notification
+        .params
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("progressToken"))?;
+    serde_json::from_value(marker.clone()).ok()
+}
+
+/// Progress tokens use the same exact integer/string identity as request IDs.
+/// Keep their wire spelling in the request while using one mathematical key
+/// for ownership, including integral decimal/exponent and signed-zero aliases.
+fn progress_marker_key(marker: &ProgressMarker) -> Option<CorrelationKey> {
+    match marker {
+        ProgressMarker::String(marker) => Some(CorrelationKey::String(marker.clone())),
+        ProgressMarker::Number(marker) => RequestId::Integer(marker.as_str().to_owned())
+            .correlation_key()
+            .ok(),
+    }
+}
+
+/// Shared dropped-owner marker. This replaces the executor's local
+/// `Rc<Cell<bool>>` ownership so cloned execution handles can cross the
+/// negotiated stdio boundary without relying on thread-local state.
+#[derive(Clone, Debug)]
+struct OwnerDropped(Arc<AtomicBool>);
+
+impl OwnerDropped {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Release);
+    }
+}
+
+/// Mutex-backed executor state ownership.
+///
+/// The transport-neutral adapter retains its historical synchronous API. The
+/// negotiated stdio client uses its own sole ingress arbiter and shared
+/// response registry; this wrapper removes the old `Rc<RefCell<_>>` ownership
+/// from public request handles.
+#[derive(Debug)]
+struct SharedExecutorState<T>(Arc<Mutex<ExecutorState<T>>>);
+
+impl<T> Clone for SharedExecutorState<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> SharedExecutorState<T> {
+    fn new(state: ExecutorState<T>) -> Self {
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    fn borrow(&self) -> MutexGuard<'_, ExecutorState<T>> {
+        self.0
+            .lock()
+            .expect("request executor state mutex poisoned")
+    }
+
+    fn borrow_mut(&self) -> MutexGuard<'_, ExecutorState<T>> {
+        self.borrow()
+    }
+
+    fn try_borrow_mut(&self) -> Result<MutexGuard<'_, ExecutorState<T>>, ()> {
+        self.0.try_lock().map_err(|_| ())
+    }
+
+    fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Clone, Debug)]
+enum TaskExecutionOperation {
+    ToolCall,
+    Get(TaskId),
+    Update,
+    Cancel,
+    Subscription,
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Debug)]
+struct TaskSubscription {
+    requested_filter: SubscriptionFilter,
+    accepted_filter: Option<SubscriptionFilter>,
+    notifications: VecDeque<TaskStatusNotification>,
+}
+
+#[derive(Debug)]
+enum ExecutionOutcome {
+    Response(Box<DecodedFinalResponse>),
+    Failure(McpError),
+}
+
+/// One admitted JSON-RPC final response and its lossless result envelope.
+///
+/// JSON-RPC error responses have no result envelope, so their `decoded` field
+/// is absent and the caller receives the peer's typed JSON-RPC error instead.
+#[derive(Debug)]
+struct DecodedFinalResponse {
+    response: JsonRpcResponse,
+    raw_result: Option<String>,
+    decoded: Option<AdmittedFinalResult>,
+}
+
+#[derive(Debug)]
+enum AdmittedFinalResult {
+    Core(Box<DecodedResult>, Option<ResultPeerDiagnostic>),
+    Task,
+    /// `subscriptions/listen` completion is method-shaped, not a generic
+    /// complete-result payload. Keep the admitted source for the typed
+    /// listener instead of forcing it through [`CoreResultDiscriminatorPolicy`].
+    SubscriptionListen,
+}
+
+impl DecodedFinalResponse {
+    fn admit(
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+        peer_era: ResultPeerEra,
+        accepts_task_result: bool,
+        retain_subscription_listen: bool,
+    ) -> McpResult<Self> {
+        if raw_result.is_some() && response.result.is_none() {
+            return Err(McpError::invalid_request(
+                "Peer final result source does not match the response kind",
+            ));
+        }
+        if let Some(source) = raw_result.as_deref() {
+            let admitted: Value = serde_json::from_str(source).map_err(|_| {
+                McpError::invalid_request("Peer final result source is not valid JSON")
+            })?;
+            if response.result.as_ref() != Some(&admitted) {
+                return Err(McpError::invalid_request(
+                    "Peer final result source differs from its typed response",
+                ));
+            }
+        }
+        let decoded = response
+            .result
+            .as_ref()
+            .map(|result| {
+                if retain_subscription_listen {
+                    return Ok(AdmittedFinalResult::SubscriptionListen);
+                }
+                if accepts_task_result
+                    && result.get("resultType").and_then(Value::as_str) == Some("task")
+                {
+                    return Ok(AdmittedFinalResult::Task);
+                }
+                let encoded = raw_result.as_deref().map_or_else(
+                    || {
+                        serde_json::to_string(result).map_err(|_| {
+                            McpError::invalid_request(
+                                "Peer final result could not be encoded for protocol admission",
+                            )
+                        })
+                    },
+                    |source| Ok(source.to_owned()),
+                )?;
+                decode_peer_result(&encoded, peer_era, &CoreResultDiscriminatorPolicy)
+                    .map_err(|_| {
+                        McpError::invalid_request("Peer final result failed protocol decoding")
+                    })
+                    .map(|(result, diagnostic)| {
+                        AdmittedFinalResult::Core(Box::new(result), diagnostic)
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            response,
+            raw_result,
+            decoded,
+        })
+    }
+
+    fn into_decoded(self) -> McpResult<(DecodedResult, Option<ResultPeerDiagnostic>)> {
+        match self.decoded {
+            Some(AdmittedFinalResult::Core(decoded, diagnostic)) => Ok((*decoded, diagnostic)),
+            Some(AdmittedFinalResult::Task) => Err(McpError::invalid_request(
+                "Tasks result requires its typed Tasks execution surface",
+            )),
+            Some(AdmittedFinalResult::SubscriptionListen) => Err(McpError::invalid_request(
+                "Listen result requires its typed subscription surface",
+            )),
+            None => {
+                let error = self
+                    .response
+                    .error
+                    .expect("validated JSON-RPC final responses have either result or error");
+                match error.data {
+                    Some(data) => Err(McpError::with_data(
+                        error
+                            .code
+                            .as_i32()
+                            .map(McpErrorCode::from)
+                            .unwrap_or(McpErrorCode::InternalError),
+                        error.message,
+                        data,
+                    )),
+                    None => Err(McpError::new(
+                        error
+                            .code
+                            .as_i32()
+                            .map(McpErrorCode::from)
+                            .unwrap_or(McpErrorCode::InternalError),
+                        error.message,
+                    )),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Tombstone {
+    generation: u64,
+    expires_at: Instant,
+    /// Peer-produced terminal outcomes remain observable as duplicate
+    /// diagnostics; abandoned-owner finals are silently discarded instead.
+    retain_late_response_diagnostic: bool,
+}
+
+#[derive(Debug)]
+struct PendingCancellationControl {
+    request_id: RequestId,
+    generation: u64,
+    message: JsonRpcMessage,
+}
+
+#[derive(Debug)]
+struct ExecutorState<T> {
+    transport: T,
+    receive_frame: Option<fn(&mut T, &Cx) -> Result<ReceivedTransportFrame, TransportError>>,
+    ingress_owner: IngressOwner,
+    pending: HashMap<CorrelationKey, PendingExecution>,
+    completed: HashMap<(RequestId, u64), ExecutionOutcome>,
+    tombstones: HashMap<CorrelationKey, Tombstone>,
+    notifications: VecDeque<JsonRpcRequest>,
+    reverse_requests: VecDeque<ReverseRequest>,
+    pending_reverse_requests: HashMap<CorrelationKey, ActiveReverseRequest>,
+    stream_notifications: HashMap<(RequestId, u64), VecDeque<JsonRpcRequest>>,
+    uncorrelated_responses: VecDeque<JsonRpcResponse>,
+    terminal_records: HashMap<(RequestId, u64), ExecutionTerminalRecord>,
+    terminal_expirations: HashMap<(RequestId, u64), Instant>,
+    cancellation_events: VecDeque<CancellationRequested>,
+    deferred_cancellations: VecDeque<PendingCancellationControl>,
+    #[cfg(feature = "tasks")]
+    task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
+    next_generation: u64,
+    result_peer_era: ResultPeerEra,
+    terminal_error: Option<McpError>,
+    shutdown: bool,
+}
+
+/// The one authority allowed to take the next inbound transport frame.
+///
+/// An executor starts unclaimed. Its ordinary [`RequestExecutor::drive`]
+/// claims self-reader mode, while [`RequestExecutor::drive_frame`] claims the
+/// externally driven mode used by a connection-owned selected-I/O arbiter.
+/// The modes never switch for a live executor, preventing a response frame
+/// from being consumed by a second reader after a request owner has chosen
+/// its ingress path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngressOwner {
+    Unclaimed,
+    SelfReader,
+    ExternalDriver,
+}
+
+impl<T> ExecutorState<T> {
+    fn retain_notification(&mut self, request: JsonRpcRequest) -> bool {
+        if self.notifications.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            return false;
+        }
+        self.notifications.push_back(request);
+        true
+    }
+
+    fn retain_uncorrelated_response(&mut self, response: JsonRpcResponse) -> bool {
+        if self.uncorrelated_responses.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            return false;
+        }
+        self.uncorrelated_responses.push_back(response);
+        true
+    }
+
+    fn retain_reverse_request(&mut self, request: JsonRpcRequest) -> McpResult<()> {
+        self.prune_abandoned_reverse_requests();
+        let request_id = request.id.clone().ok_or_else(|| {
+            McpError::invalid_request("Client reverse request omitted a JSON-RPC request ID")
+        })?;
+        let key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Client reverse request has an invalid JSON-RPC request ID")
+        })?;
+        if self.pending_reverse_requests.contains_key(&key) {
+            return Err(McpError::invalid_request(
+                "Client reverse request ID is already active",
+            ));
+        }
+        if self.pending_reverse_requests.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            return Err(McpError::internal_error(
+                "Client reverse-request capacity is full",
+            ));
+        }
+        let cancellation = ReverseRequestCancellation::new();
+        let owner = Arc::new(ReverseRequestOwner {
+            cancellation: cancellation.clone(),
+        });
+        self.pending_reverse_requests.insert(
+            key,
+            ActiveReverseRequest {
+                request_id: request_id.clone(),
+                cancellation: cancellation.clone(),
+                owner: Arc::downgrade(&owner),
+            },
+        );
+        self.reverse_requests.push_back(ReverseRequest {
+            request,
+            cancellation,
+            owner,
+        });
+        Ok(())
+    }
+
+    fn prune_abandoned_reverse_requests(&mut self) {
+        self.pending_reverse_requests
+            .retain(|_, request| request.owner.strong_count() > 0);
+    }
+
+    fn defer_cancellation(&mut self, cancellation: PendingCancellationControl) -> McpResult<()> {
+        if self.deferred_cancellations.len() >= DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
+            let error = McpError::internal_error("Client cancellation control queue is full");
+            self.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        self.deferred_cancellations.push_back(cancellation);
+        Ok(())
+    }
+
+    fn prune_tombstones(&mut self, now: Instant) {
+        self.tombstones
+            .retain(|_, tombstone| tombstone.expires_at > now);
+    }
+
+    fn retain_terminal(
+        &mut self,
+        key: (RequestId, u64),
+        record: ExecutionTerminalRecord,
+        outcome: ExecutionOutcome,
+    ) {
+        let now = Instant::now();
+        let expires_at = now.checked_add(DEFAULT_TOMBSTONE_RETENTION).unwrap_or(now);
+        self.terminal_records.insert(key.clone(), record);
+        self.terminal_expirations.insert(key.clone(), expires_at);
+        self.completed.insert(key, outcome);
+    }
+
+    fn release_terminal(&mut self, key: &(RequestId, u64)) {
+        self.completed.remove(key);
+        self.terminal_records.remove(key);
+        self.terminal_expirations.remove(key);
+    }
+
+    fn prune_retained_terminals(&mut self, now: Instant) {
+        let expired = self
+            .terminal_expirations
+            .iter()
+            .filter_map(|(key, expires_at)| (*expires_at <= now).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.release_terminal(&key);
+            self.stream_notifications.remove(&key);
+            #[cfg(feature = "tasks")]
+            self.task_subscriptions.remove(&key);
+        }
+    }
+
+    fn cancel_reverse_requests(&mut self) {
+        for reverse_request in self.pending_reverse_requests.values() {
+            reverse_request.cancellation.cancel();
+        }
+        self.pending_reverse_requests.clear();
+        self.reverse_requests.clear();
+    }
+
+    fn fail_all(&mut self, error: McpError, reason: ExecutionTerminalReason) {
+        if self.terminal_error.is_some() {
+            return;
+        }
+        self.terminal_error = Some(error.clone());
+        self.tombstones.clear();
+        self.cancel_reverse_requests();
+        #[cfg(feature = "tasks")]
+        self.task_subscriptions.clear();
+        self.deferred_cancellations.clear();
+        let pending = std::mem::take(&mut self.pending);
+        for (_, pending) in pending {
+            let request_id = pending.record.request_id.clone();
+            // A connection-owned reader may report failure without another
+            // ordinary service turn. Do not let that path replace a stopped
+            // origin's local cancellation with its live sibling's I/O error.
+            // Observe the retained origin's clock and mask, not an ambient Cx.
+            let caller_stopped = pending.caller.checkpoint().is_err();
+            let (terminal_state, terminal_reason, outcome_error) = if caller_stopped {
+                (
+                    ExecutionTerminalState::Cancelled,
+                    ExecutionTerminalReason::CallerCancelled,
+                    McpError::request_cancelled(),
+                )
+            } else {
+                (ExecutionTerminalState::Failed, reason, error.clone())
+            };
+            self.stream_notifications
+                .remove(&(request_id.clone(), pending.record.execution_generation));
+            self.retain_terminal(
+                (request_id.clone(), pending.record.execution_generation),
+                ExecutionTerminalRecord {
+                    terminal_state,
+                    terminal_reason,
+                    final_delivered: false,
+                    cancellation_committed: caller_stopped,
+                    cancellation_transport_attempts: 0,
+                    local_cancellation_event: caller_stopped,
+                    waiter_release: true,
+                    // The connection is terminal: neither late-frame
+                    // correlation nor a deferred control may survive it.
+                    tombstone: false,
+                },
+                ExecutionOutcome::Failure(outcome_error),
+            );
+            if caller_stopped {
+                if self.cancellation_events.len() >= MAX_RETAINED_PEER_ACTIVITY {
+                    let _ = self.cancellation_events.pop_front();
+                }
+                self.cancellation_events.push_back(CancellationRequested {
+                    request_id,
+                    reason: ExecutionTerminalReason::CallerCancelled,
+                });
+            }
+        }
+    }
+}
+
+/// A transport-neutral request executor.
+///
+/// Multiple executions may be started before either is waited. The one
+/// transport reader routes each final response by its exact request ID, so a
+/// reordered final response becomes available to its owner rather than being
+/// consumed by the request currently driving the reader.
+#[derive(Debug)]
+pub struct RequestExecutor<T> {
+    state: SharedExecutorState<T>,
+    tombstone_retention: Duration,
+    max_in_flight: usize,
+    max_correlations: usize,
+}
+
+impl<T> Clone for RequestExecutor<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            tombstone_retention: self.tombstone_retention,
+            max_in_flight: self.max_in_flight,
+            max_correlations: self.max_correlations,
+        }
+    }
+}
+
+impl<T> RequestExecutor<T>
+where
+    T: Transport,
+{
+    /// Creates an executor with the frozen CLT-01 A correlation bounds.
+    #[must_use]
+    pub fn new(transport: T) -> Self {
+        Self::with_result_peer_era(transport, ResultPeerEra::Legacy)
+    }
+
+    /// Creates an executor bound to the negotiated peer era.
+    ///
+    /// The caller must select this from the completed initialize handshake and
+    /// keep it immutable for the connection. The era controls exact result
+    /// decoding and whether legacy server-to-client requests reach the
+    /// handler boundary. [`Self::new`] retains the legacy-era default for
+    /// callers that have not yet integrated negotiation.
+    #[must_use]
+    pub fn with_result_peer_era(transport: T, result_peer_era: ResultPeerEra) -> Self {
+        Self::with_source_frame_receiver(transport, result_peer_era, None)
+    }
+
+    /// Creates an executor for a transport whose MCP era was already selected.
+    ///
+    /// Custom transports must complete their own bounded handshake before
+    /// constructing this executor. The selected era is then immutable for the
+    /// connection: modern executions use final-result decoding plus
+    /// request-owned progress and subscription handling, while exact legacy
+    /// executions retain the 2024-11-05 compatibility path. This constructor
+    /// deliberately has no `Auto` policy or retry surface, so it cannot replay
+    /// requests across transport instances.
+    #[must_use]
+    pub fn with_protocol_era(transport: T, protocol_era: ProtocolEra) -> Self {
+        Self::with_result_peer_era(transport, protocol_era.into())
+    }
+
+    /// Creates an executor whose one transport reader can retain admitted
+    /// source frames.
+    ///
+    /// The receiver remains owned by this executor's transport; callers use
+    /// this only for a transport that has already selected one immutable peer
+    /// era. Passing `None` retains the ordinary typed [`Transport`] ingress
+    /// behavior used by [`Self::new`] and [`Self::with_result_peer_era`].
+    #[must_use]
+    pub fn with_source_frame_receiver(
+        transport: T,
+        result_peer_era: ResultPeerEra,
+        receive_frame: Option<fn(&mut T, &Cx) -> Result<ReceivedTransportFrame, TransportError>>,
+    ) -> Self {
+        Self {
+            state: SharedExecutorState::new(ExecutorState {
+                transport,
+                receive_frame,
+                ingress_owner: IngressOwner::Unclaimed,
+                pending: HashMap::new(),
+                completed: HashMap::new(),
+                tombstones: HashMap::new(),
+                notifications: VecDeque::new(),
+                reverse_requests: VecDeque::new(),
+                pending_reverse_requests: HashMap::new(),
+                stream_notifications: HashMap::new(),
+                uncorrelated_responses: VecDeque::new(),
+                terminal_records: HashMap::new(),
+                terminal_expirations: HashMap::new(),
+                cancellation_events: VecDeque::new(),
+                deferred_cancellations: VecDeque::new(),
+                #[cfg(feature = "tasks")]
+                task_subscriptions: HashMap::new(),
+                next_generation: 0,
+                result_peer_era,
+                terminal_error: None,
+                shutdown: false,
+            }),
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT_EXECUTIONS,
+            max_correlations: DEFAULT_MAX_RESPONSE_CORRELATIONS,
+        }
+    }
+
+    /// Returns the immutable peer era governing this multiplexed connection.
+    #[must_use]
+    pub fn result_peer_era(&self) -> ResultPeerEra {
+        self.state.borrow().result_peer_era
+    }
+
+    /// Returns the immutable MCP era selected before this executor was built.
+    #[must_use]
+    pub fn protocol_era(&self) -> ProtocolEra {
+        match self.result_peer_era() {
+            ResultPeerEra::Legacy => ProtocolEra::Legacy2024,
+            ResultPeerEra::Modern => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Returns whether an admitted final response belongs to this executor.
+    ///
+    /// A connection-owned ingress arbiter uses this before handing a response
+    /// frame to the executor. Retained tombstones count as owned so a late
+    /// exact final cannot fall through to an adjacent request registry.
+    pub(crate) fn owns_response_id(&self, response_id: &RequestId) -> bool {
+        let Ok(key) = response_id.correlation_key() else {
+            return false;
+        };
+        let state = self.state.borrow();
+        state.pending.contains_key(&key) || state.tombstones.contains_key(&key)
+    }
+
+    /// Returns whether a progress notification names one live request owner.
+    ///
+    /// The caller must still pass the full admitted frame to [`Self::drive_frame`]
+    /// so semantic validation, stream retention, and idle-deadline policy
+    /// remain centralized here.
+    pub(crate) fn owns_progress_notification(&self, notification: &JsonRpcRequest) -> bool {
+        if notification.id.is_some() || notification.method != "notifications/progress" {
+            return false;
+        }
+        let Some(marker) = progress_notification_marker(notification) else {
+            return false;
+        };
+        let Some(progress_key) = progress_marker_key(&marker) else {
+            return false;
+        };
+        self.state
+            .borrow()
+            .pending
+            .values()
+            .filter(|pending| pending.advertised_progress_key.as_ref() == Some(&progress_key))
+            .take(2)
+            .count()
+            == 1
+    }
+
+    /// Returns whether a modern server cancellation names this executor's live
+    /// `subscriptions/listen` owner.
+    ///
+    /// Final MCP limits server-originated wire cancellation to that stream.
+    /// A connection ingress arbiter uses this predicate before handing the
+    /// complete admitted frame to [`Self::drive_frame`], which performs the
+    /// terminal transition. Foreign, malformed, and metadata-conflicting
+    /// controls deliberately remain outside this executor.
+    pub(crate) fn owns_modern_subscription_cancellation(
+        &self,
+        notification: &JsonRpcRequest,
+    ) -> bool {
+        let state = self.state.borrow();
+        if state.result_peer_era != ResultPeerEra::Modern {
+            return false;
+        }
+        let Ok(CancellationWireMessage::Modern2026 { params, .. }) =
+            CancellationWireMessage::decode(
+                ProtocolEra::Modern2026,
+                CancellationSender::Server,
+                notification,
+            )
+        else {
+            return false;
+        };
+        if let Some(metadata_subscription_id) = params
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            && !metadata_subscription_id.correlates_with(&params.request_id)
+        {
+            return false;
+        }
+        state.pending.values().any(|pending| {
+            pending.method == SUBSCRIPTIONS_LISTEN
+                && pending
+                    .record
+                    .request_id
+                    .correlates_with(&params.request_id)
+        })
+    }
+
+    /// Starts one request-owned execution after its request is committed.
+    ///
+    /// `request` must be a JSON-RPC request with an ID. Notifications have no
+    /// final result slot and are intentionally rejected by this surface.
+    /// The originating `cx` remains binding until the terminal election.
+    /// Service turns observe its cancellation and budget exhaustion even when
+    /// driven through another caller or a cloned executor. This synchronous
+    /// API installs no background observer and cannot preempt a blocking
+    /// transport read; callers must continue servicing the executor.
+    /// A finite poll quota bounds this call, including deferred control work.
+    /// This local admission bound applies even inside `Cx::masked` without
+    /// mutating the caller's shared cancellation state. Runtime cancellation
+    /// and deadline delivery still follow the original `Cx` mask semantics.
+    pub fn execute(&self, cx: &Cx, request: Request) -> McpResult<RequestExecution<T>> {
+        self.execute_with_timeout_policy(cx, request, RequestTimeoutPolicy::default())
+    }
+
+    /// Starts an execution with a per-request bounded timeout policy.
+    pub fn execute_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        self.execute_with_deadline_policy(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+        )
+    }
+
+    /// Starts a modern listener with its own bounded idle and absolute lifetime.
+    ///
+    /// Valid acknowledgements and accepted subscription events may restart its
+    /// idle timer. Progress and unrelated traffic never extend a subscription.
+    pub(crate) fn execute_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        if self.protocol_era() != ProtocolEra::Modern2026 || request.method != SUBSCRIPTIONS_LISTEN
+        {
+            return Err(McpError::invalid_params(
+                "Subscription timeout policy requires modern subscriptions/listen",
+            ));
+        }
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            &request.method,
+            request.params.as_ref(),
+        )
+        .map_err(|_| McpError::invalid_params("Invalid modern subscription request"))?;
+        self.execute_with_deadline_policy(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Subscription(timeout_policy),
+        )
+    }
+
+    fn execute_with_deadline_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: ExecutionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let request_id = request.id.clone().ok_or_else(|| {
+            McpError::invalid_params("Request execution requires a JSON-RPC request ID")
+        })?;
+        let correlation_key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Request execution requires a valid JSON-RPC request ID")
+        })?;
+        let advertised_progress_key = advertised_progress_marker(request.params.as_ref())
+            .as_ref()
+            .and_then(progress_marker_key);
+
+        let mut state = self.state.borrow_mut();
+        self.drain_abandoned_locked(cx, &mut state)?;
+        // Retire stopped request owners before a live sibling sends new
+        // application work. Its fresh Cx is transport authority, not a way
+        // to extend another execution's original lifetime.
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        // Servicing a deferred control can exhaust this caller's remaining
+        // budget. Do not admit another application write after that local
+        // stop, even when a custom transport omits its own checkpoint.
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        state.prune_tombstones(Instant::now());
+        state.prune_retained_terminals(Instant::now());
+        if state.shutdown {
+            return Err(McpError::internal_error(
+                "Client request executor is shut down",
+            ));
+        }
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if state.pending.contains_key(&correlation_key) {
+            return Err(McpError::invalid_request("Duplicate in-flight request ID"));
+        }
+        if let Some(progress_key) = advertised_progress_key.as_ref()
+            && state
+                .pending
+                .values()
+                .any(|pending| pending.advertised_progress_key.as_ref() == Some(progress_key))
+        {
+            return Err(McpError::invalid_request(
+                "Duplicate in-flight progress token",
+            ));
+        }
+        if state.tombstones.contains_key(&correlation_key) {
+            return Err(McpError::invalid_request(
+                "Tombstoned request ID cannot be reused",
+            ));
+        }
+        if state
+            .deferred_cancellations
+            .iter()
+            .any(|cancellation| cancellation.request_id.correlates_with(&request_id))
+        {
+            return Err(McpError::invalid_request(
+                "Request ID still owns a queued cancellation control",
+            ));
+        }
+        if state
+            .pending
+            .len()
+            .saturating_add(state.deferred_cancellations.len())
+            >= self.max_in_flight
+        {
+            return Err(McpError::internal_error(
+                "Client in-flight execution limit reached",
+            ));
+        }
+        let retained_terminals = state.completed.len().max(state.terminal_records.len());
+        if state
+            .pending
+            .len()
+            .saturating_add(state.tombstones.len())
+            .saturating_add(retained_terminals)
+            >= self.max_correlations
+        {
+            return Err(McpError::internal_error(
+                "Client response correlation limit reached",
+            ));
+        }
+        let generation = state
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| McpError::internal_error("Client execution generation exhausted"))?;
+        state.next_generation = generation;
+
+        state
+            .transport
+            .send(cx, &JsonRpcMessage::Request(request.clone()))
+            .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+
+        let committed_at = Instant::now();
+        let idle_deadline = committed_at
+            .checked_add(timeout_policy.idle_timeout())
+            .ok_or_else(|| {
+                McpError::internal_error("Client execution idle deadline exceeds the clock range")
+            })?;
+        let absolute_deadline = committed_at
+            .checked_add(timeout_policy.absolute_timeout())
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Client execution absolute deadline exceeds the clock range",
+                )
+            })?;
+        let owner_dropped = OwnerDropped::new();
+        state.pending.insert(
+            correlation_key.clone(),
+            PendingExecution {
+                caller: cx.cx.clone(),
+                record: PendingRequestRecord {
+                    correlation_key,
+                    request_id: request_id.clone(),
+                    execution_generation: generation,
+                    request_state: ExecutionTerminalState::Pending,
+                    send_committed: true,
+                    idle_deadline,
+                    absolute_deadline,
+                    terminal_state: ExecutionTerminalState::Pending,
+                    cancellation_committed: false,
+                    tombstone_generation: None,
+                },
+                owner_dropped: owner_dropped.clone(),
+                timeout_policy,
+                advertised_progress_key,
+                last_progress: None,
+                method: request.method.clone(),
+            },
+        );
+
+        Ok(RequestExecution {
+            request_id,
+            generation,
+            owner_dropped,
+            state: self.state.clone(),
+            #[cfg(feature = "tasks")]
+            method: request.method,
+            #[cfg(feature = "tasks")]
+            params: request.params,
+            #[cfg(feature = "tasks")]
+            task_operation: None,
+            tombstone_retention: self.tombstone_retention,
+            completed: false,
+        })
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn execute_task_tool_call(
+        &self,
+        cx: &Cx,
+        request: Request,
+    ) -> McpResult<RequestExecution<T>> {
+        self.require_modern_tasks_era()?;
+        let core_request = self.decode_final_core_request(&request)?;
+        if core_request.method() != TOOLS_CALL {
+            return Err(McpError::invalid_params(
+                "Tasks tool execution requires a final tools/call request",
+            ));
+        }
+        let mut execution = self.execute(cx, request)?;
+        execution.task_operation = Some(TaskExecutionOperation::ToolCall);
+        Ok(execution)
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_get(&self, cx: &Cx, request: Request) -> McpResult<RequestExecution<T>> {
+        self.require_modern_tasks_era()?;
+        let task = self.decode_tasks_get_request(&request)?;
+        let mut execution = self.execute(cx, request)?;
+        execution.task_operation = Some(TaskExecutionOperation::Get(task.task_id));
+        Ok(execution)
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_update(
+        &self,
+        cx: &Cx,
+        request: Request,
+        task: &Task,
+    ) -> McpResult<RequestExecution<T>> {
+        self.require_modern_tasks_era()?;
+        let Task::InputRequired {
+            base,
+            input_requests,
+        } = task
+        else {
+            return Err(McpError::invalid_params(
+                "tasks/update requires an input_required final task",
+            ));
+        };
+        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
+            McpError::invalid_params("Task input requests are not an admitted ledger")
+        })?;
+        let update = self.decode_tasks_update_request(&request, &ledger)?;
+        if update.task_id != base.task_id {
+            return Err(McpError::invalid_params(
+                "tasks/update request taskId does not match the retained task",
+            ));
+        }
+        let mut execution = self.execute(cx, request)?;
+        execution.task_operation = Some(TaskExecutionOperation::Update);
+        Ok(execution)
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_cancel(
+        &self,
+        cx: &Cx,
+        request: Request,
+    ) -> McpResult<RequestExecution<T>> {
+        self.require_modern_tasks_era()?;
+        self.decode_tasks_cancel_request(&request)?;
+        let mut execution = self.execute(cx, request)?;
+        execution.task_operation = Some(TaskExecutionOperation::Cancel);
+        Ok(execution)
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_subscription(
+        &self,
+        cx: &Cx,
+        request: Request,
+    ) -> McpResult<RequestExecution<T>> {
+        self.execute_tasks_subscription_with_timeout_policy(
+            cx,
+            request,
+            SubscriptionTimeoutPolicy::default(),
+        )
+    }
+
+    /// Starts an official Tasks listener with a bounded subscription lifetime.
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_subscription_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        self.require_modern_tasks_era()?;
+        let requested_filter = self.decode_tasks_subscription_request(&request)?;
+        let mut execution =
+            self.execute_subscription_with_timeout_policy(cx, request, timeout_policy)?;
+        execution.task_operation = Some(TaskExecutionOperation::Subscription);
+        self.state.borrow_mut().task_subscriptions.insert(
+            (execution.request_id.clone(), execution.generation),
+            TaskSubscription {
+                requested_filter,
+                accepted_filter: None,
+                notifications: VecDeque::new(),
+            },
+        );
+        Ok(execution)
+    }
+
+    /// Records activity already admitted by the connection-owned catalog
+    /// listener. This seam performs no decoding and is not exposed to callers.
+    pub(crate) fn record_subscription_activity(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<bool> {
+        execution.ensure_owner(&self.state)?;
+        let key = execution
+            .request_id
+            .correlation_key()
+            .map_err(|_| McpError::invalid_params("Subscription request ID is invalid"))?;
+        let mut state = self.state.borrow_mut();
+        if let Some(pending) = state.pending.get_mut(&key)
+            && pending.record.execution_generation == execution.generation
+        {
+            return Self::record_subscription_activity_at(pending, Instant::now());
+        }
+        Ok(false)
+    }
+
+    fn record_subscription_activity_at(
+        pending: &mut PendingExecution,
+        observed_at: Instant,
+    ) -> McpResult<bool> {
+        if !matches!(
+            pending.timeout_policy,
+            ExecutionTimeoutPolicy::Subscription(_)
+        ) || observed_at >= pending.record.idle_deadline
+            || observed_at >= pending.record.absolute_deadline
+        {
+            return Ok(false);
+        }
+        let next_idle = observed_at
+            .checked_add(pending.timeout_policy.idle_timeout())
+            .ok_or_else(|| {
+                McpError::internal_error("Subscription idle deadline exceeds the clock range")
+            })?;
+        pending.record.idle_deadline = next_idle.min(pending.record.absolute_deadline);
+        Ok(true)
+    }
+
+    /// Drives exactly one peer frame through the correlation registry.
+    ///
+    /// A malformed or closed transport fails all known owners with the same
+    /// typed local outcome and never sends a JSON-RPC response back to the
+    /// peer. Notifications are retained separately and never consume a final
+    /// response slot.
+    pub fn drive(&self, cx: &Cx) -> McpResult<()> {
+        self.drive_for_owner(&ExecutionTurn::new(cx), None)
+    }
+
+    fn drive_for_owner(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        waiting_owner: Option<(&RequestId, u64)>,
+    ) -> McpResult<()> {
+        let mut state = self.state.borrow_mut();
+        // Refuse mixed ingress before maintenance can perform transport
+        // effects, but do not claim an unowned reader for a stale waiter or
+        // an execution whose terminal is already available without a read.
+        if state.ingress_owner == IngressOwner::ExternalDriver {
+            return Err(McpError::invalid_request(
+                "Client request executor is driven by external admitted frames",
+            ));
+        }
+        self.prepare_drive_locked(cx, &mut state)?;
+        if waiting_owner.is_some_and(|(request_id, generation)| {
+            state
+                .completed
+                .contains_key(&(request_id.clone(), generation))
+        }) {
+            // Expiry may have just elected this waiter's outcome while a
+            // sibling remains live. No further peer read belongs to this wait.
+            return Ok(());
+        }
+        if let Some((request_id, generation)) = waiting_owner {
+            let key = request_id.correlation_key().map_err(|_| {
+                McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
+            })?;
+            if state
+                .pending
+                .get(&key)
+                .is_none_or(|pending| pending.record.execution_generation != generation)
+            {
+                // The handle may have lost its terminal receipt while another
+                // thread reused the wire ID. Neither a new read nor local
+                // cancellation below belongs to that replacement execution.
+                return Err(McpError::internal_error(
+                    "Request execution terminal result expired before it was consumed",
+                ));
+            }
+        }
+        // Maintenance may consume the last poll while deferring a control.
+        // A stopped caller cannot read past it or poison unrelated waiters.
+        if cx.checkpoint().is_err() {
+            if let Some((request_id, _)) = waiting_owner {
+                self.cancel_pending_locked(
+                    cx,
+                    &mut state,
+                    request_id,
+                    ExecutionTerminalReason::CallerCancelled,
+                )?;
+            }
+            return Err(McpError::request_cancelled());
+        }
+        // The mode election belongs to this admitted read, not to an
+        // observation that returned above without touching the transport.
+        self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
+        let (received, source) = match state.receive_frame {
+            Some(receive_frame) => match receive_frame(&mut state.transport, cx) {
+                Ok(frame) => {
+                    let (message, source) = frame.into_parts();
+                    (Ok(message), Some(source))
+                }
+                Err(error) => (Err(error), None),
+            },
+            // A typed Transport cannot retain the original source spelling.
+            None => (state.transport.recv(cx), None),
+        };
+        // An arbitrary synchronous Transport may block inside recv. This
+        // check cannot preempt that call, but a late frame or read failure
+        // must never replace a deadline that elapsed while it was blocked.
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        let message = match received {
+            Ok(message) => message,
+            Err(error) => {
+                let error = transport_error_to_mcp(error);
+                state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                return Err(error);
+            }
+        };
+        let (raw_result, raw_progress_params) = match source {
+            Some(source) => {
+                let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
+                    Ok(raw_result) => raw_result,
+                    Err(error) => {
+                        state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                        return Err(error);
+                    }
+                };
+                let raw_progress_params =
+                    match progress_params_source_from_admitted_frame(&message, &source) {
+                        Ok(raw_progress_params) => raw_progress_params,
+                        Err(error) => {
+                            state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                            return Err(error);
+                        }
+                    };
+                (raw_result, raw_progress_params)
+            }
+            None => (None, None),
+        };
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
+    }
+
+    /// Drives one source-preserving peer frame through the correlation registry.
+    ///
+    /// The frame is admitted by the sole negotiated transport reader before it
+    /// reaches this executor. Successful JSON-RPC responses retain the exact
+    /// `result` member source from that same frame; it is never reconstructed
+    /// from the typed value. Requests and notifications follow the identical
+    /// cancellation, reverse-request, and request-owned progress routes used
+    /// by [`Self::drive`].
+    ///
+    /// This method performs no transport read. A negotiated client can retain
+    /// its one reader and pass each admitted frame here without creating a
+    /// competing response path.
+    pub fn drive_frame(&self, cx: &Cx, frame: ReceivedTransportFrame) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        let (message, source) = frame.into_parts();
+        let mut state = self.state.borrow_mut();
+        self.claim_ingress_owner_locked(&mut state, IngressOwner::ExternalDriver)?;
+        self.prepare_drive_locked(cx, &mut state)?;
+        let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
+            Ok(raw_result) => raw_result,
+            Err(error) => {
+                state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                return Err(error);
+            }
+        };
+        let raw_progress_params =
+            match progress_params_source_from_admitted_frame(&message, &source) {
+                Ok(raw_progress_params) => raw_progress_params,
+                Err(error) => {
+                    state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                    return Err(error);
+                }
+            };
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
+    }
+
+    fn claim_ingress_owner_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        requested_owner: IngressOwner,
+    ) -> McpResult<()> {
+        match state.ingress_owner {
+            IngressOwner::Unclaimed => {
+                state.ingress_owner = requested_owner;
+                Ok(())
+            }
+            owner if owner == requested_owner => Ok(()),
+            IngressOwner::SelfReader => Err(McpError::invalid_request(
+                "Client request executor already owns transport ingress",
+            )),
+            IngressOwner::ExternalDriver => Err(McpError::invalid_request(
+                "Client request executor is driven by external admitted frames",
+            )),
+        }
+    }
+
+    fn prepare_drive_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+    ) -> McpResult<()> {
+        self.drain_abandoned_locked(cx, state)?;
+        self.expire_timeouts_locked(cx, state, Instant::now())?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        Ok(())
+    }
+
+    fn route_inbound_message_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        message: JsonRpcMessage,
+        raw_result: Option<String>,
+        raw_progress_params: Option<String>,
+    ) -> McpResult<()> {
+        if message.validate().is_err() {
+            let error = McpError::invalid_request("Peer sent an invalid JSON-RPC message");
+            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        match message {
+            JsonRpcMessage::Response(response) => {
+                self.route_response_with_raw_result_locked(state, response, raw_result)?;
+            }
+            JsonRpcMessage::Request(request) => {
+                if request.method == "notifications/cancelled" {
+                    self.route_cancellation_notification_locked(cx, state, &request)?;
+                } else if request.id.is_some() {
+                    if !server_request_is_admitted(state.result_peer_era, &request) {
+                        self.reject_reverse_request_locked(cx, state, request)?;
+                    } else if !legacy_reverse_request_params_are_admitted(
+                        state.result_peer_era,
+                        &request,
+                    ) {
+                        self.reject_reverse_request_with_error_locked(
+                            cx,
+                            state,
+                            request,
+                            McpError::invalid_params(
+                                "Peer reverse request parameters are not exact MCP 2024-11-05",
+                            ),
+                        )?;
+                    } else if let Err(error) = state.retain_reverse_request(request) {
+                        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                        return Err(error);
+                    }
+                } else {
+                    #[cfg(feature = "tasks")]
+                    let handled = self
+                        .route_task_subscription_acknowledgement_locked(state, &request)?
+                        || self.route_task_subscription_notification_locked(state, &request)?
+                        || self.route_stream_notification_locked(
+                            state,
+                            &request,
+                            raw_progress_params.as_deref(),
+                        )?;
+                    #[cfg(not(feature = "tasks"))]
+                    let handled = self.route_stream_notification_locked(
+                        state,
+                        &request,
+                        raw_progress_params.as_deref(),
+                    )?;
+                    if !handled && !state.retain_notification(request) {
+                        let error = McpError::internal_error("Client peer-activity queue is full");
+                        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Routes one already-admitted final response while retaining its exact
+    /// result-member source for request-owned decoding.
+    ///
+    /// This is the exact-source ingress companion to [`Self::drive`]. The
+    /// typed transport path does not fabricate a source after decoding; a raw
+    /// transport admission supplies the peer's original result source here.
+    pub fn route_response_with_raw_result(
+        &self,
+        cx: &Cx,
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+    ) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        let mut state = self.state.borrow_mut();
+        self.drain_abandoned_locked(cx, &mut state)?;
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        if state.shutdown {
+            return Err(McpError::internal_error(
+                "Client request executor is shut down",
+            ));
+        }
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if response.validate().is_err() {
+            let error = McpError::invalid_request("Peer sent an invalid JSON-RPC response");
+            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        self.route_response_with_raw_result_locked(&mut state, response, raw_result)?;
+        Ok(())
+    }
+
+    /// Waits for one execution's exact final response while routing peer
+    /// traffic for every other live execution.
+    /// The caller's finite poll quota spans the entire wait, including
+    /// unrelated frames and nested maintenance; it is not reset per frame.
+    pub fn wait(&self, cx: &Cx, execution: &mut RequestExecution<T>) -> McpResult<JsonRpcResponse> {
+        let (outcome, _) = self.wait_for_terminal(cx, execution)?;
+        match outcome {
+            ExecutionOutcome::Response(response) => Ok(response.response),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Takes an already-routed final response without reading the transport.
+    ///
+    /// A connection-owned ingress driver uses this for request-owned handles:
+    /// it alone admits frames through [`Self::drive_frame`], while callers
+    /// observe their own completed execution without accidentally claiming a
+    /// second transport reader. The returned response retains the normal
+    /// JSON-RPC error envelope; use [`Self::wait`] when self-reader mode is
+    /// intentionally selected instead.
+    pub fn try_take_response(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<JsonRpcResponse>> {
+        execution.ensure_owner(&self.state)?;
+        let Some((outcome, _)) = execution.take_terminal_outcome()? else {
+            return Ok(None);
+        };
+        match outcome {
+            ExecutionOutcome::Response(response) => Ok(Some(response.response)),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Takes one already-routed final response with its exact admitted result
+    /// source, without reading the transport.
+    ///
+    /// This is the source-preserving companion to [`Self::try_take_response`]
+    /// for a negotiated connection whose Client owns transport ingress.
+    pub fn try_take_response_with_raw_result(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        self.try_take_response_with_raw_result_and_stream(execution)
+            .map(|opt| opt.map(|(resp, raw, _stream)| (resp, raw)))
+    }
+
+    /// Takes one already-routed final response with its exact admitted result
+    /// source and request-owned stream notifications, without reading the transport.
+    pub fn try_take_response_with_raw_result_and_stream(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>, Vec<JsonRpcRequest>)>> {
+        execution.ensure_owner(&self.state)?;
+        let Some((outcome, stream)) = execution.take_terminal_outcome()? else {
+            return Ok(None);
+        };
+        match outcome {
+            ExecutionOutcome::Response(response) => {
+                Ok(Some((response.response, response.raw_result, stream)))
+            }
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Waits for a final response and returns preceding request-owned progress.
+    ///
+    /// The returned stream preserves peer arrival order and is drained exactly
+    /// once with the terminal outcome, so a caller cannot accidentally reuse
+    /// stale progress after consuming the final response.
+    pub fn wait_with_stream(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(JsonRpcResponse, Vec<JsonRpcRequest>)> {
+        let (outcome, stream) = self.wait_for_terminal(cx, execution)?;
+        match outcome {
+            ExecutionOutcome::Response(response) => Ok((response.response, stream)),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Waits for a final response and returns its exact admitted result source.
+    ///
+    /// The source is absent for a JSON-RPC error response and for typed
+    /// transport ingress that could not retain raw JSON.
+    pub fn wait_with_raw_result(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(JsonRpcResponse, Option<String>)> {
+        let (outcome, _) = self.wait_for_terminal(cx, execution)?;
+        match outcome {
+            ExecutionOutcome::Response(response) => Ok((response.response, response.raw_result)),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Waits for and decodes a final MCP result envelope.
+    ///
+    /// JSON-RPC errors become their local [`McpError`] equivalent. Successful
+    /// result envelopes are decoded through the negotiated peer era, retaining
+    /// inert unknown members and exact JSON-number lexemes.
+    pub fn wait_decoded(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(DecodedResult, Option<ResultPeerDiagnostic>)> {
+        let (outcome, _) = self.wait_for_terminal(cx, execution)?;
+        match outcome {
+            ExecutionOutcome::Response(response) => (*response).into_decoded(),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Waits for a decoded final result and all preceding request-owned progress.
+    pub fn wait_decoded_with_stream(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(
+        DecodedResult,
+        Option<ResultPeerDiagnostic>,
+        Vec<JsonRpcRequest>,
+    )> {
+        let (outcome, stream) = self.wait_for_terminal(cx, execution)?;
+        match outcome {
+            ExecutionOutcome::Response(response) => {
+                let (decoded, diagnostic) = (*response).into_decoded()?;
+                Ok((decoded, diagnostic, stream))
+            }
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn wait_task_tool_call(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<fastmcp_protocol::CreateTaskResult> {
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::ToolCall)
+        })?;
+        let core_request = self.decode_final_core_request_from_execution(execution)?;
+        let (response, result_source) = self.wait_with_raw_result(cx, execution)?;
+        let result_source = result_source.as_deref().ok_or_else(|| {
+            McpError::invalid_request("Peer tools/call Task result lost its admitted result source")
+        })?;
+        match core_request.decode_response_result(&response, result_source) {
+            Ok(CoreResult::Final(FinalCoreResult::ToolsCallTask { result })) => Ok(result),
+            Ok(_) | Err(_) => Err(McpError::invalid_request(
+                "Peer tools/call result is not a final Tasks creation result",
+            )),
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn wait_tasks_get(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<GetTaskResult> {
+        self.require_modern_tasks_era()?;
+        let expected = execution.task_id_for(|operation| match operation {
+            TaskExecutionOperation::Get(task_id) => Some(task_id),
+            TaskExecutionOperation::ToolCall
+            | TaskExecutionOperation::Update
+            | TaskExecutionOperation::Cancel
+            | TaskExecutionOperation::Subscription => None,
+        })?;
+        let response = self.wait(cx, execution)?;
+        let result = decode_task_response::<GetTaskResult>(&response, "tasks/get")?;
+        if result.task.base().task_id != expected {
+            return Err(McpError::invalid_request(
+                "tasks/get response taskId does not match its request",
+            ));
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn wait_tasks_update(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<UpdateTaskResult> {
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Update)
+        })?;
+        let response = self.wait(cx, execution)?;
+        decode_task_response(&response, "tasks/update")
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn wait_tasks_cancel(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<CancelTaskResult> {
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Cancel)
+        })?;
+        let response = self.wait(cx, execution)?;
+        decode_task_response(&response, "tasks/cancel")
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn take_tasks_subscription_notifications(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<Vec<TaskStatusNotification>> {
+        execution.ensure_owner(&self.state)?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let mut state = self.state.borrow_mut();
+        let subscription = state
+            .task_subscriptions
+            .get_mut(&(execution.request_id.clone(), execution.generation))
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription is no longer active"))?;
+        Ok(subscription.notifications.drain(..).collect())
+    }
+
+    /// Returns the exact filter acknowledged for one live Tasks subscription.
+    ///
+    /// The caller may poll this without reading transport ingress.  This keeps
+    /// the acknowledgement observable before the terminal response while the
+    /// connection-owned driver remains the sole reader.
+    #[cfg(feature = "tasks")]
+    pub fn tasks_subscription_acknowledgement(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        execution.ensure_owner(&self.state)?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let state = self.state.borrow();
+        let subscription = state
+            .task_subscriptions
+            .get(&(execution.request_id.clone(), execution.generation))
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription is no longer active"))?;
+        Ok(subscription.accepted_filter.clone())
+    }
+
+    /// Takes a terminal Tasks subscription response after its ingress was
+    /// already routed by the connection owner.
+    ///
+    /// This deliberately never reads the transport.  It is the incremental
+    /// companion to [`Self::wait_tasks_subscription`] for stdio relays that
+    /// must forward notifications as they arrive.
+    #[cfg(feature = "tasks")]
+    pub fn try_take_tasks_subscription_terminal(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        execution.ensure_owner(&self.state)?;
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let core_request = self.decode_final_core_request_from_execution(execution)?;
+        let key = (execution.request_id.clone(), execution.generation);
+        let Some(response) = self.try_take_response(execution)? else {
+            return Ok(None);
+        };
+        let terminal = match core_request.decode_response(&response) {
+            Ok(CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) => Ok(()),
+            Ok(_) | Err(_) => Err(McpError::invalid_request(
+                "Tasks subscription terminal result is not a matching subscriptions/listen completion",
+            )),
+        };
+        let subscription = self
+            .state
+            .borrow_mut()
+            .task_subscriptions
+            .remove(&key)
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription state is unavailable"))?;
+        terminal?;
+        subscription.accepted_filter.map(Some).ok_or_else(|| {
+            McpError::invalid_request("Tasks subscription terminated before acknowledgement")
+        })
+    }
+
+    #[cfg(feature = "tasks")]
+    pub fn wait_tasks_subscription(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(SubscriptionFilter, Vec<TaskStatusNotification>)> {
+        // Reject a foreign handle BEFORE the error-cleanup path below can
+        // remove a local subscription with the same numeric ID/generation.
+        // The operation tag alone proves neither executor nor connection.
+        execution.ensure_owner(&self.state)?;
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let core_request = self.decode_final_core_request_from_execution(execution)?;
+        let key = (execution.request_id.clone(), execution.generation);
+        let response = match self.wait(cx, execution) {
+            Ok(response) => response,
+            Err(error) => {
+                self.state.borrow_mut().task_subscriptions.remove(&key);
+                return Err(error);
+            }
+        };
+        let terminal = match core_request.decode_response(&response) {
+            Ok(CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) => Ok(()),
+            Ok(_) | Err(_) => Err(McpError::invalid_request(
+                "Tasks subscription terminal result is not a matching subscriptions/listen completion",
+            )),
+        };
+        let subscription = self
+            .state
+            .borrow_mut()
+            .task_subscriptions
+            .remove(&key)
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription state is unavailable"))?;
+        terminal?;
+        let accepted_filter = subscription.accepted_filter.ok_or_else(|| {
+            McpError::invalid_request("Tasks subscription terminated before acknowledgement")
+        })?;
+        Ok((
+            accepted_filter,
+            subscription.notifications.into_iter().collect(),
+        ))
+    }
+
+    /// Returns whether a notification could belong to one active Tasks
+    /// subscription.  The caller must still route the frame through
+    /// [`Self::drive_frame`], which validates the exact subscription ID,
+    /// acknowledgement order, and task filter.
+    #[cfg(feature = "tasks")]
+    pub fn owns_task_subscription_notification(&self, notification: &JsonRpcRequest) -> bool {
+        notification.id.is_none()
+            && matches!(
+                notification.method.as_str(),
+                "notifications/subscriptions/acknowledged" | TASK_STATUS_NOTIFICATION
+            )
+            && !self.state.borrow().task_subscriptions.is_empty()
+    }
+
+    /// Returns snapshots of every active request correlation.
+    #[must_use]
+    pub fn pending_records(&self) -> Vec<PendingRequestRecord> {
+        self.state
+            .borrow()
+            .pending
+            .values()
+            .map(|pending| pending.record.clone())
+            .collect()
+    }
+
+    /// Removes and returns retained peer notifications in arrival order.
+    pub fn take_notifications(&self) -> Vec<JsonRpcRequest> {
+        self.state.borrow_mut().notifications.drain(..).collect()
+    }
+
+    /// Removes and returns exact-legacy peer requests that require a client response.
+    ///
+    /// Each returned request retains its own response capability and
+    /// cancellation handle. Pass the same value to
+    /// [`Self::respond_to_reverse_request`] so an old callback cannot respond
+    /// to a later peer request that reuses its JSON-RPC ID. Outstanding handles
+    /// remain charged against the reverse-request capacity after dequeue.
+    /// Dropping the last clone cancels its local ownership; the next executor
+    /// turn reclaims the abandoned slot without sending a fabricated result.
+    pub fn take_reverse_requests(&self) -> Vec<ReverseRequest> {
+        self.state.borrow_mut().reverse_requests.drain(..).collect()
+    }
+
+    /// Sends one final result for an exact-legacy peer-authored reverse request.
+    pub fn respond_to_reverse_request(
+        &self,
+        cx: &Cx,
+        request: &ReverseRequest,
+        result: Value,
+    ) -> McpResult<()> {
+        let mut state = self.state.borrow_mut();
+        if state.shutdown {
+            return Err(McpError::internal_error(
+                "Client request executor is shut down",
+            ));
+        }
+        if state.terminal_error.is_some() {
+            return Err(McpError::internal_error(
+                "Client request executor connection is no longer usable",
+            ));
+        }
+        let request_id = request.request_id();
+        let key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("Client reverse response has an invalid JSON-RPC request ID")
+        })?;
+        let Some(active) = state.pending_reverse_requests.get(&key) else {
+            return Err(McpError::invalid_request(
+                "Client reverse response does not own a live peer request ID",
+            ));
+        };
+        if !Weak::ptr_eq(&active.owner, &Arc::downgrade(&request.owner))
+            || !active
+                .cancellation
+                .belongs_to_same_request(&request.cancellation)
+            || !active.request_id.correlates_with(request_id)
+            || !request.cancellation.is_open()
+        {
+            return Err(McpError::invalid_request(
+                "Client reverse response does not own a live peer request ID",
+            ));
+        }
+        let owned_request_id = active.request_id.clone();
+        state
+            .transport
+            .send(
+                cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    owned_request_id.clone(),
+                    result,
+                )),
+            )
+            .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+        request.cancellation.record_response_sent();
+        let removed = state.pending_reverse_requests.remove(&key);
+        debug_assert!(removed.is_some());
+        state
+            .reverse_requests
+            .retain(|request| !request.request_id().correlates_with(&owned_request_id));
+        Ok(())
+    }
+
+    /// Removes and returns bounded, typed local cancellation indications.
+    pub fn take_cancellation_events(&self) -> Vec<CancellationRequested> {
+        self.state
+            .borrow_mut()
+            .cancellation_events
+            .drain(..)
+            .collect()
+    }
+
+    /// Returns terminal receipts retained for unconsumed request executions.
+    #[must_use]
+    pub fn terminal_records(&self) -> Vec<ExecutionTerminalRecord> {
+        let mut state = self.state.borrow_mut();
+        state.prune_retained_terminals(Instant::now());
+        state.terminal_records.values().cloned().collect()
+    }
+
+    /// Selects explicit caller cancellation for one live execution.
+    ///
+    /// If `cx` has stopped, the local terminal is selected immediately and its
+    /// bounded control frame is queued without attempting I/O through that
+    /// context. The connection owner must service the executor with its live
+    /// context through [`Self::poll_timeouts_at`], [`Self::drive`], another
+    /// execution, or [`Self::shutdown`]. That turn sends the control before any
+    /// new application frame or peer read. Cancellation never creates or masks
+    /// a context, starts a worker, or silently retries a failed transport write.
+    /// Once a transport write is attempted, any error remains terminal to the
+    /// connection: the generic transport contract cannot prove whether a
+    /// cancellation racing that write left partial bytes on the wire.
+    pub fn cancel(&self, cx: &Cx, execution: &mut RequestExecution<T>) -> McpResult<()> {
+        self.cancel_in_turn(&ExecutionTurn::new(cx), execution)
+    }
+
+    fn cancel_in_turn(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<()> {
+        execution.ensure_owner(&self.state)?;
+        let mut state = self.state.borrow_mut();
+        let key = execution.request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
+        })?;
+        if state
+            .pending
+            .get(&key)
+            .is_none_or(|pending| pending.record.execution_generation != execution.generation)
+        {
+            // A retained handle is authority for one generation, not for
+            // every future use of its wire ID. Treat a retired generation
+            // like an already-elected terminal: no new control or mutation.
+            return Ok(());
+        }
+        self.cancel_pending_locked(
+            cx,
+            &mut state,
+            &execution.request_id,
+            ExecutionTerminalReason::CallerCancelled,
+        )
+    }
+
+    /// Accepts a peer subscription teardown for one request-owned execution.
+    ///
+    /// The peer's raw reason is intentionally not retained. Callers invoke
+    /// this only after their subscription policy accepts the teardown frame.
+    pub fn accept_subscription_teardown(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        execution.ensure_owner(&self.state)?;
+        let mut state = self.state.borrow_mut();
+        let is_active_modern_subscription = state.result_peer_era == ResultPeerEra::Modern
+            && state
+                .pending
+                .get(&execution.request_id.correlation_key().map_err(|_| {
+                    McpError::invalid_params(
+                        "Request execution owns an invalid JSON-RPC request ID",
+                    )
+                })?)
+                .is_some_and(|pending| {
+                    pending.record.execution_generation == execution.generation
+                        && pending.method == SUBSCRIPTIONS_LISTEN
+                });
+        if !is_active_modern_subscription {
+            return Err(McpError::invalid_request(
+                "Peer cancellation is only valid for an active modern subscriptions/listen request",
+            ));
+        }
+        self.cancel_pending_without_notification_locked(
+            cx,
+            &mut state,
+            &execution.request_id,
+            ExecutionTerminalReason::PeerSubscriptionTeardown,
+        )
+    }
+
+    /// Expires committed request deadlines at a runtime-supplied monotonic instant.
+    ///
+    /// Also observes each pending execution's original caller, using that
+    /// context's own clock and cancellation-mask semantics. `cx` authorizes
+    /// only this service turn's transport effects; it never replaces a
+    /// request's originating lifetime or revives an elected terminal.
+    /// The connection owner may also use this non-reading service turn with a
+    /// live context to flush controls queued by dropped or cancelled request
+    /// owners. A stopped context preserves those controls for later service.
+    pub fn poll_timeouts_at(&self, cx: &Cx, observed_at: Instant) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        let mut state = self.state.borrow_mut();
+        self.drain_abandoned_locked(cx, &mut state)?;
+        self.expire_timeouts_locked(cx, &mut state, observed_at)
+    }
+
+    /// Returns the earliest live request deadline for an external ingress
+    /// driver. It does not mutate correlation state or read the transport.
+    pub(crate) fn next_pending_deadline(&self) -> Option<Instant> {
+        self.state
+            .borrow()
+            .pending
+            .values()
+            .fold(None, |earliest, pending| {
+                let deadline = pending
+                    .record
+                    .idle_deadline
+                    .min(pending.record.absolute_deadline);
+                Some(earliest.map_or(deadline, |earliest| earliest.min(deadline)))
+            })
+    }
+
+    /// Releases every request owner after the connection's sole ingress driver
+    /// has selected a terminal transport or protocol failure. The driver owns
+    /// transport teardown; this only publishes the same terminal outcome to
+    /// request-owned handles.
+    pub(crate) fn fail_connection(&self, error: McpError) {
+        self.state
+            .borrow_mut()
+            .fail_all(error, ExecutionTerminalReason::ConnectionLost);
+    }
+
+    /// Lets the owning client publish an executor-selected failure before
+    /// admitting another request or allocating its next correlation ID.
+    pub(crate) fn terminal_error(&self) -> Option<McpError> {
+        self.state.borrow().terminal_error.clone()
+    }
+
+    /// Cancels live owners, releases their waiters, and closes the transport.
+    pub fn shutdown(&self, cx: &Cx) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        let mut state = self.state.borrow_mut();
+        if state.shutdown {
+            return Ok(());
+        }
+        let mut cleanup_error = self
+            .flush_deferred_cancellations_locked(cx, &mut state)
+            .err();
+        state.shutdown = true;
+        let request_ids = state
+            .pending
+            .values()
+            .map(|pending| pending.record.request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            if let Err(error) = self.cancel_pending_locked(
+                cx,
+                &mut state,
+                &request_id,
+                ExecutionTerminalReason::Shutdown,
+            ) {
+                cleanup_error.get_or_insert(error);
+            }
+        }
+        state.cancel_reverse_requests();
+        if let Err(error) = state.transport.close(cx) {
+            let error = transport_error_to_mcp(error);
+            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            cleanup_error.get_or_insert(error);
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
+        state.terminal_error.get_or_insert_with(|| {
+            McpError::internal_error("Client request executor is shut down")
+        });
+        Ok(())
+    }
+
+    /// Removes and returns unmatched final responses in arrival order.
+    ///
+    /// Unknown, duplicate, and expired-owner response IDs are retained as
+    /// bounded diagnostics instead of being guessed as another owner's result.
+    pub fn take_uncorrelated_responses(&self) -> Vec<JsonRpcResponse> {
+        self.state
+            .borrow_mut()
+            .uncorrelated_responses
+            .drain(..)
+            .collect()
+    }
+
+    fn handle_send_error_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        transport_error: TransportError,
+    ) -> McpError {
+        if matches!(&transport_error, TransportError::Codec(_))
+            || matches!(&transport_error, TransportError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            return transport_error_to_mcp(transport_error);
+        }
+        let error = transport_error_to_mcp(transport_error);
+        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+        error
+    }
+
+    fn reject_reverse_request_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        request: JsonRpcRequest,
+    ) -> McpResult<()> {
+        let error = McpError::method_not_found(&request.method);
+        self.reject_reverse_request_with_error_locked(cx, state, request, error)
+    }
+
+    fn reject_reverse_request_with_error_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        request: JsonRpcRequest,
+        error: McpError,
+    ) -> McpResult<()> {
+        let request_id = request.id.expect("reverse request has an ID");
+        let rejection =
+            JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()));
+        state
+            .transport
+            .send(cx, &rejection)
+            .map_err(|error| self.handle_send_error_locked(state, error))
+    }
+
+    fn wait_for_terminal(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<(ExecutionOutcome, Vec<JsonRpcRequest>)> {
+        execution.ensure_owner(&self.state)?;
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        loop {
+            if let Some(outcome) = execution.take_terminal_outcome()? {
+                return Ok(outcome);
+            }
+            let drive_result = if cx.checkpoint().is_err() {
+                self.cancel_in_turn(cx, execution)
+            } else {
+                self.drive_for_owner(cx, Some((&execution.request_id, execution.generation)))
+            };
+            // Cancellation selects its local terminal before attempting the
+            // bounded control write. Preserve that elected outcome even when
+            // the subsequent write or connection cleanup fails.
+            if let Some(outcome) = execution.take_terminal_outcome()? {
+                return Ok(outcome);
+            }
+            drive_result?;
+        }
+    }
+
+    fn route_response_with_raw_result_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+    ) -> McpResult<()> {
+        let Some(response_id) = response.id.clone() else {
+            let error = McpError::invalid_request("Peer response omitted a request ID");
+            state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
+            return Ok(());
+        };
+        let Ok(correlation_key) = response_id.correlation_key() else {
+            let error = McpError::invalid_request("Peer response used an invalid request ID");
+            state.fail_all(error, ExecutionTerminalReason::ConnectionLost);
+            return Ok(());
+        };
+        let retain_late_response_diagnostic =
+            state.tombstones.get(&correlation_key).map(|tombstone| {
+                debug_assert!(tombstone.generation > 0);
+                tombstone.retain_late_response_diagnostic
+            });
+        if let Some(retain_late_response_diagnostic) = retain_late_response_diagnostic {
+            if retain_late_response_diagnostic && !state.retain_uncorrelated_response(response) {
+                state.fail_all(
+                    McpError::internal_error("Client uncorrelated-response queue is full"),
+                    ExecutionTerminalReason::ConnectionLost,
+                );
+            }
+            return Ok(());
+        }
+        let Some(pending) = state.pending.get(&correlation_key) else {
+            if !state.retain_uncorrelated_response(response) {
+                state.fail_all(
+                    McpError::internal_error("Client uncorrelated-response queue is full"),
+                    ExecutionTerminalReason::ConnectionLost,
+                );
+            }
+            return Ok(());
+        };
+        let generation = pending.record.execution_generation;
+        let expires_at = Instant::now()
+            .checked_add(self.tombstone_retention)
+            .ok_or_else(|| {
+                McpError::internal_error("Tombstone retention exceeds the clock range")
+            })?;
+        let pending = state
+            .pending
+            .remove(&correlation_key)
+            .expect("the exact pending owner remains live until its terminal transition");
+        let owned_request_id = pending.record.request_id.clone();
+        state.tombstones.insert(
+            correlation_key,
+            Tombstone {
+                generation,
+                expires_at,
+                retain_late_response_diagnostic: true,
+            },
+        );
+        let accepts_task_result =
+            state.result_peer_era == ResultPeerEra::Modern && pending.method == TOOLS_CALL;
+        let retain_subscription_listen = pending.method == SUBSCRIPTIONS_LISTEN;
+        let decoded = match DecodedFinalResponse::admit(
+            response,
+            raw_result,
+            state.result_peer_era,
+            accepts_task_result,
+            retain_subscription_listen,
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                state
+                    .stream_notifications
+                    .remove(&(owned_request_id.clone(), generation));
+                state.retain_terminal(
+                    (owned_request_id.clone(), generation),
+                    ExecutionTerminalRecord {
+                        terminal_state: ExecutionTerminalState::Failed,
+                        terminal_reason: ExecutionTerminalReason::PeerProtocol,
+                        final_delivered: false,
+                        cancellation_committed: false,
+                        cancellation_transport_attempts: 0,
+                        local_cancellation_event: false,
+                        waiter_release: true,
+                        tombstone: true,
+                    },
+                    ExecutionOutcome::Failure(error),
+                );
+                return Ok(());
+            }
+        };
+        state.retain_terminal(
+            (owned_request_id.clone(), generation),
+            ExecutionTerminalRecord {
+                terminal_state: ExecutionTerminalState::Response,
+                terminal_reason: ExecutionTerminalReason::FinalResponse,
+                final_delivered: true,
+                cancellation_committed: false,
+                cancellation_transport_attempts: 0,
+                local_cancellation_event: false,
+                waiter_release: true,
+                tombstone: true,
+            },
+            ExecutionOutcome::Response(Box::new(decoded)),
+        );
+        Ok(())
+    }
+
+    fn drain_abandoned_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+    ) -> McpResult<()> {
+        let now = Instant::now();
+        state.prune_abandoned_reverse_requests();
+        state.prune_tombstones(now);
+        state.prune_retained_terminals(now);
+        self.flush_deferred_cancellations_locked(cx, state)?;
+        let abandoned = state
+            .pending
+            .values()
+            .filter(|pending| pending.owner_dropped.get())
+            .map(|pending| {
+                (
+                    pending.record.request_id.clone(),
+                    pending.record.execution_generation,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (request_id, generation) in abandoned {
+            let cancellation = self.cancel_pending_locked(
+                cx,
+                state,
+                &request_id,
+                ExecutionTerminalReason::CallerDropped,
+            );
+            // A dropped owner has no waiter that can consume the local
+            // outcome, so retain only its correlation tombstone.
+            state.release_terminal(&(request_id, generation));
+            cancellation?;
+        }
+        Ok(())
+    }
+
+    fn flush_deferred_cancellations_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+    ) -> McpResult<()> {
+        while !state.deferred_cancellations.is_empty() {
+            // Keep both maintenance and write admission inside this turn.
+            // If maintenance spends the last poll, leave the front control
+            // untouched rather than requeueing it behind its siblings.
+            if cx.checkpoint().is_err() || cx.checkpoint().is_err() {
+                break;
+            }
+            let cancellation = state
+                .deferred_cancellations
+                .pop_front()
+                .expect("a deferred cancellation remains queued under the executor lock");
+            self.write_admitted_cancellation_control_locked(cx, state, cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn send_cancellation_control_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        cancellation: PendingCancellationControl,
+    ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            return state.defer_cancellation(cancellation);
+        }
+        self.write_admitted_cancellation_control_locked(cx, state, cancellation)
+    }
+
+    /// The caller admits the write before removing a deferred control. A
+    /// transport failure after admission still fails the connection because
+    /// the generic transport cannot prove that no bytes reached the peer.
+    fn write_admitted_cancellation_control_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        cancellation: PendingCancellationControl,
+    ) -> McpResult<()> {
+        if let Some(record) = state
+            .terminal_records
+            .get_mut(&(cancellation.request_id, cancellation.generation))
+        {
+            record.cancellation_transport_attempts =
+                record.cancellation_transport_attempts.saturating_add(1);
+        }
+        if let Err(error) = state.transport.send(cx, &cancellation.message) {
+            let error = transport_error_to_mcp(error);
+            state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn cancel_pending_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        request_id: &RequestId,
+        reason: ExecutionTerminalReason,
+    ) -> McpResult<()> {
+        self.cancel_pending_with_notification_locked(cx, state, request_id, reason, true)
+    }
+
+    fn cancel_pending_without_notification_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        request_id: &RequestId,
+        reason: ExecutionTerminalReason,
+    ) -> McpResult<()> {
+        self.cancel_pending_with_notification_locked(cx, state, request_id, reason, false)
+    }
+
+    fn cancel_pending_with_notification_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        request_id: &RequestId,
+        reason: ExecutionTerminalReason,
+        notify_peer: bool,
+    ) -> McpResult<()> {
+        if let Some(cancellation) =
+            self.select_pending_cancellation_locked(state, request_id, reason, notify_peer)?
+        {
+            self.send_cancellation_control_locked(cx, state, cancellation)?;
+        }
+        Ok(())
+    }
+
+    fn select_pending_cancellation_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        request_id: &RequestId,
+        reason: ExecutionTerminalReason,
+        notify_peer: bool,
+    ) -> McpResult<Option<PendingCancellationControl>> {
+        let correlation_key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Request cancellation requires a valid JSON-RPC request ID")
+        })?;
+        let Some(pending) = state.pending.get(&correlation_key) else {
+            return Ok(None);
+        };
+        // MCP forbids client cancellation of initialize. A local owner still
+        // transitions to cancellation, but no peer notification is emitted.
+        let notify_peer = notify_peer && pending.method != INITIALIZE;
+        // Assemble the selected-era notification before the terminal CAS so a
+        // local encoding failure leaves the still-live owner unchanged.
+        let cancellation = if notify_peer {
+            Some(self.cancellation_control_message(state, request_id)?)
+        } else {
+            None
+        };
+        let Some(mut pending) = state.pending.remove(&correlation_key) else {
+            return Ok(None);
+        };
+        let owned_request_id = pending.record.request_id.clone();
+        pending.record.cancellation_committed = true;
+        pending.record.terminal_state = ExecutionTerminalState::Cancelled;
+        let generation = pending.record.execution_generation;
+        #[cfg(feature = "tasks")]
+        state
+            .task_subscriptions
+            .remove(&(owned_request_id.clone(), generation));
+        let expires_at = Instant::now()
+            .checked_add(self.tombstone_retention)
+            .ok_or_else(|| {
+                McpError::internal_error("Tombstone retention exceeds the clock range")
+            })?;
+        state.tombstones.insert(
+            correlation_key,
+            Tombstone {
+                generation,
+                expires_at,
+                retain_late_response_diagnostic: false,
+            },
+        );
+        state
+            .stream_notifications
+            .remove(&(owned_request_id.clone(), generation));
+        let mut error = match reason {
+            ExecutionTerminalReason::IdleTimeout => {
+                request_timeout_error(RequestTimeoutSource::Idle)
+            }
+            ExecutionTerminalReason::AbsoluteTimeout => {
+                request_timeout_error(RequestTimeoutSource::Absolute)
+            }
+            _ => McpError::request_cancelled(),
+        };
+        // Deadlines elect the same cancellation terminal as caller teardown,
+        // while retaining their cause for diagnostics at the client boundary.
+        error.code = McpErrorCode::RequestCancelled;
+        state.retain_terminal(
+            (owned_request_id.clone(), generation),
+            ExecutionTerminalRecord {
+                terminal_state: ExecutionTerminalState::Cancelled,
+                terminal_reason: reason,
+                final_delivered: false,
+                cancellation_committed: true,
+                cancellation_transport_attempts: 0,
+                local_cancellation_event: true,
+                waiter_release: true,
+                tombstone: true,
+            },
+            ExecutionOutcome::Failure(error),
+        );
+        if state.cancellation_events.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            // Cancellation is never held behind observer backpressure. The
+            // bounded observer queue evicts its oldest already-observed event
+            // so the current terminal transition retains its typed signal.
+            let _ = state.cancellation_events.pop_front();
+        }
+        state.cancellation_events.push_back(CancellationRequested {
+            request_id: owned_request_id.clone(),
+            reason,
+        });
+        Ok(cancellation.map(|message| PendingCancellationControl {
+            request_id: owned_request_id,
+            generation,
+            message,
+        }))
+    }
+
+    fn route_cancellation_notification_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        notification: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if notification.method != "notifications/cancelled" {
+            return Ok(false);
+        }
+        let era = match state.result_peer_era {
+            ResultPeerEra::Legacy => ProtocolEra::Legacy2024,
+            ResultPeerEra::Modern => ProtocolEra::Modern2026,
+        };
+        let Ok(cancellation) =
+            CancellationWireMessage::decode(era, CancellationSender::Server, notification)
+        else {
+            return Ok(true);
+        };
+        match cancellation {
+            CancellationWireMessage::Legacy2024 { params, .. } => {
+                let key = params.request_id.correlation_key().ok();
+                if let Some(active) = key
+                    .as_ref()
+                    .and_then(|key| state.pending_reverse_requests.remove(key))
+                {
+                    active.cancellation.cancel();
+                    state.reverse_requests.retain(|request| {
+                        !Weak::ptr_eq(&Arc::downgrade(&request.owner), &active.owner)
+                    });
+                }
+            }
+            CancellationWireMessage::Modern2026 { params, .. } => {
+                if let Some(metadata_subscription_id) = params
+                    .meta
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                    .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+                    && !metadata_subscription_id.correlates_with(&params.request_id)
+                {
+                    return Ok(true);
+                }
+                let active_subscription_id = state.pending.values().find_map(|pending| {
+                    (pending.method == SUBSCRIPTIONS_LISTEN
+                        && pending
+                            .record
+                            .request_id
+                            .correlates_with(&params.request_id))
+                    .then(|| pending.record.request_id.clone())
+                });
+                if let Some(active_subscription_id) = active_subscription_id {
+                    self.cancel_pending_without_notification_locked(
+                        cx,
+                        state,
+                        &active_subscription_id,
+                        ExecutionTerminalReason::PeerSubscriptionTeardown,
+                    )?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn cancellation_control_message(
+        &self,
+        state: &ExecutorState<T>,
+        request_id: &RequestId,
+    ) -> McpResult<JsonRpcMessage> {
+        cancellation_control_message_for_era(state.result_peer_era, request_id)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn route_task_subscription_acknowledgement_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        notification: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if notification.id.is_some()
+            || notification.method != "notifications/subscriptions/acknowledged"
+            || state.task_subscriptions.is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(params) = notification.params.clone() else {
+            return Ok(false);
+        };
+        let acknowledgement: FinalSubscriptionsAcknowledgedNotificationParams =
+            serde_json::from_value(params).map_err(|_| {
+                McpError::invalid_request("Tasks subscription acknowledgement is invalid")
+            })?;
+        let Some(subscription_id) = acknowledgement
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+        else {
+            return Ok(false);
+        };
+        let Some((owned_subscription_id, generation)) = state
+            .pending
+            .values()
+            .find(|pending| pending.record.request_id.correlates_with(&subscription_id))
+            .map(|pending| {
+                (
+                    pending.record.request_id.clone(),
+                    pending.record.execution_generation,
+                )
+            })
+        else {
+            return Ok(false);
+        };
+        let key = (owned_subscription_id, generation);
+        let Some(subscription) = state.task_subscriptions.get(&key) else {
+            return Ok(false);
+        };
+        if subscription.accepted_filter.is_some() {
+            return Err(McpError::invalid_request(
+                "Tasks subscription received a duplicate acknowledgement",
+            ));
+        }
+        validate_task_subscription_filter(
+            &subscription.requested_filter,
+            &acknowledgement.notifications,
+        )?;
+        let subscription = state.task_subscriptions.get_mut(&key).ok_or_else(|| {
+            McpError::internal_error("Tasks subscription disappeared during acknowledgement")
+        })?;
+        subscription.accepted_filter = Some(acknowledgement.notifications);
+        if let Some(pending) = state
+            .pending
+            .get_mut(&subscription_id.correlation_key().map_err(|_| {
+                McpError::invalid_request("Tasks subscription acknowledgement ID is invalid")
+            })?)
+        {
+            Self::record_subscription_activity_at(pending, Instant::now())?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn route_task_subscription_notification_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        notification: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if notification.id.is_some()
+            || notification.method != TASK_STATUS_NOTIFICATION
+            || state.task_subscriptions.is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(params) = notification.params.clone() else {
+            return Ok(false);
+        };
+        let task_notification: TaskStatusNotification = serde_json::from_value(serde_json::json!({
+            "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
+            "method": TASK_STATUS_NOTIFICATION,
+            "params": params,
+        }))
+        .map_err(|_| McpError::invalid_request("Tasks subscription event is invalid"))?;
+        let Some(subscription_id) = task_notification
+            .params
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+        else {
+            return Ok(false);
+        };
+        let Some((owned_subscription_id, generation)) = state
+            .pending
+            .values()
+            .find(|pending| pending.record.request_id.correlates_with(&subscription_id))
+            .map(|pending| {
+                (
+                    pending.record.request_id.clone(),
+                    pending.record.execution_generation,
+                )
+            })
+        else {
+            return Ok(false);
+        };
+        let key = (owned_subscription_id, generation);
+        let Some(subscription) = state.task_subscriptions.get(&key) else {
+            return Ok(false);
+        };
+        let Some(accepted_filter) = subscription.accepted_filter.as_ref() else {
+            return Err(McpError::invalid_request(
+                "Tasks subscription event arrived before acknowledgement",
+            ));
+        };
+        let accepted_task_ids = task_subscription_ids(accepted_filter).map_err(|_| {
+            McpError::internal_error("Tasks subscription retained an invalid acknowledgement")
+        })?;
+        if !accepted_task_ids.as_ref().is_some_and(|task_ids| {
+            task_ids
+                .iter()
+                .any(|task_id| task_id == &task_notification.params.task.base().task_id)
+        }) {
+            return Err(McpError::invalid_request(
+                "Tasks subscription event taskId is outside the acknowledged filter",
+            ));
+        }
+        if subscription.notifications.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            return Err(McpError::internal_error(
+                "Tasks subscription event queue is full",
+            ));
+        }
+        state
+            .task_subscriptions
+            .get_mut(&key)
+            .ok_or_else(|| {
+                McpError::internal_error("Tasks subscription disappeared during event routing")
+            })?
+            .notifications
+            .push_back(task_notification);
+        if let Some(pending) = state.pending.get_mut(
+            &subscription_id
+                .correlation_key()
+                .map_err(|_| McpError::invalid_request("Tasks subscription event ID is invalid"))?,
+        ) {
+            Self::record_subscription_activity_at(pending, Instant::now())?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn require_modern_tasks_era(&self) -> McpResult<()> {
+        if self.state.borrow().result_peer_era != ResultPeerEra::Modern {
+            return Err(McpError::invalid_request(
+                "The final Tasks extension requires a modern peer era",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_final_core_request(&self, request: &Request) -> McpResult<CoreRequest> {
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            &request.method,
+            request.params.as_ref(),
+        )
+        .map_err(|_| McpError::invalid_params("Invalid final core request for Tasks execution"))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_final_core_request_from_execution(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<CoreRequest> {
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            &execution.method,
+            execution.params.as_ref(),
+        )
+        .map_err(|_| McpError::invalid_params("Invalid final core request for Tasks execution"))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_request_wire(&self, request: &Request) -> McpResult<Value> {
+        let request_id = request.id.clone().ok_or_else(|| {
+            McpError::invalid_params("Tasks execution requires a JSON-RPC request ID")
+        })?;
+        Ok(serde_json::json!({
+            "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
+            "id": request_id,
+            "method": request.method,
+            "params": request.params,
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_tasks_get_request(&self, request: &Request) -> McpResult<GetTaskParams> {
+        TaskMethodRequest::<GetTaskParams>::decode(self.task_request_wire(request)?)
+            .map(|request| request.params)
+            .map_err(|_| McpError::invalid_params("Invalid final tasks/get request"))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_tasks_update_request(
+        &self,
+        request: &Request,
+        ledger: &TaskInputLedger,
+    ) -> McpResult<UpdateTaskParams> {
+        TaskMethodRequest::<UpdateTaskParams>::decode_update(
+            self.task_request_wire(request)?,
+            ledger,
+        )
+        .map(|request| request.params)
+        .map_err(|_| McpError::invalid_params("Invalid final tasks/update request"))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_tasks_cancel_request(&self, request: &Request) -> McpResult<CancelTaskParams> {
+        TaskMethodRequest::<CancelTaskParams>::decode_cancel(self.task_request_wire(request)?)
+            .map(|request| request.params)
+            .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel request"))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn decode_tasks_subscription_request(
+        &self,
+        request: &Request,
+    ) -> McpResult<SubscriptionFilter> {
+        if request.method != SUBSCRIPTIONS_LISTEN {
+            return Err(McpError::invalid_params(
+                "Tasks subscription execution requires subscriptions/listen",
+            ));
+        }
+        self.decode_final_core_request(request)?;
+        let params: FinalSubscriptionsListenParams = request
+            .params
+            .clone()
+            .ok_or_else(|| McpError::invalid_params("Tasks subscription requires parameters"))
+            .and_then(|params| {
+                serde_json::from_value(params).map_err(|_| {
+                    McpError::invalid_params("Tasks subscription parameters are invalid")
+                })
+            })?;
+        if task_subscription_ids(&params.notifications)
+            .map_err(|_| McpError::invalid_params("Tasks subscription filter is invalid"))?
+            .is_none()
+        {
+            return Err(McpError::invalid_params(
+                "Tasks subscription requires a taskIds filter",
+            ));
+        }
+        Ok(params.notifications)
+    }
+
+    fn expire_timeouts_locked(
+        &self,
+        cx: &ExecutionTurn<'_>,
+        state: &mut ExecutorState<T>,
+        observed_at: Instant,
+    ) -> McpResult<()> {
+        let expired = state
+            .pending
+            .values()
+            .filter_map(|pending| {
+                // A frame may be driven by a sibling or by connection-owned
+                // ingress. Always reconcile the original caller before that
+                // frame can extend progress or win this request's terminal.
+                let reason = if pending.caller.checkpoint().is_err() {
+                    Some(ExecutionTerminalReason::CallerCancelled)
+                } else if observed_at >= pending.record.absolute_deadline {
+                    Some(ExecutionTerminalReason::AbsoluteTimeout)
+                } else if observed_at >= pending.record.idle_deadline {
+                    Some(ExecutionTerminalReason::IdleTimeout)
+                } else {
+                    None
+                }?;
+                Some((pending.record.request_id.clone(), reason))
+            })
+            .collect::<Vec<_>>();
+        let mut controls = Vec::with_capacity(expired.len());
+        // Every observed caller stop or timeout wins its local terminal
+        // before any fallible I/O. HashMap iteration order must not turn a
+        // sibling's already-stopped lifetime into connection loss on the
+        // first failed control write.
+        for (request_id, reason) in expired {
+            if let Some(control) =
+                self.select_pending_cancellation_locked(state, &request_id, reason, true)?
+            {
+                controls.push(control);
+            }
+        }
+        for control in controls {
+            self.send_cancellation_control_locked(cx, state, control)?;
+        }
+        Ok(())
+    }
+
+    fn route_stream_notification_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        notification: &JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> McpResult<bool> {
+        if notification.method != "notifications/progress" {
+            return Ok(false);
+        }
+        let Some(params) = notification.params.as_ref().and_then(Value::as_object) else {
+            return Ok(false);
+        };
+        // Optional members must be absent or typed. In particular, a null or
+        // malformed total/message cannot acquire idle-timer authority.
+        if ["total", "message", "_meta"]
+            .iter()
+            .any(|key| params.get(*key).is_some_and(Value::is_null))
+        {
+            return Ok(false);
+        }
+        let decoded = match raw_params {
+            Some(raw_params) => {
+                ServerNotification::decode_with_raw_params(notification, raw_params)
+            }
+            None => ServerNotification::decode(notification),
+        };
+        let Ok(ServerNotification::Progress(progress)) = decoded else {
+            return Ok(false);
+        };
+        let Some(progress_key) = progress_marker_key(&progress.progress_token) else {
+            return Ok(false);
+        };
+        let matching_keys = state
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                (pending.advertised_progress_key.as_ref() == Some(&progress_key))
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        let [correlation_key] = matching_keys.as_slice() else {
+            return Ok(false);
+        };
+        let Some(pending) = state.pending.get(correlation_key) else {
+            return Ok(false);
+        };
+        if pending
+            .last_progress
+            .as_ref()
+            .is_some_and(|prior| progress.progress.cmp(prior).is_le())
+        {
+            return Ok(false);
+        }
+        let generation = pending.record.execution_generation;
+        let owned_request_id = pending.record.request_id.clone();
+        let stream_key = (owned_request_id, generation);
+        if state
+            .stream_notifications
+            .get(&stream_key)
+            .is_some_and(|stream| stream.len() >= MAX_RETAINED_PEER_ACTIVITY)
+        {
+            return Err(McpError::internal_error(
+                "Client request stream queue is full",
+            ));
+        }
+        let next_idle = if pending.timeout_policy.resets_idle_on_matching_progress() {
+            let reset_at = Instant::now();
+            let next_idle = reset_at
+                .checked_add(pending.timeout_policy.idle_timeout())
+                .ok_or_else(|| {
+                    McpError::internal_error("Client idle deadline exceeds the clock range")
+                })?;
+            Some(next_idle.min(pending.record.absolute_deadline))
+        } else {
+            None
+        };
+        // The public stream is a typed JSON-RPC value. Restore the admitted
+        // numeric lexemes directly instead of sending exact values through
+        // serde_json::to_value, which normalizes exponent spellings.
+        let mut retained = notification.clone();
+        let retained_params = retained
+            .params
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("typed progress admission requires object parameters");
+        retained_params.insert(
+            "progress".to_owned(),
+            Value::Number(serde_json::Number::from_string_unchecked(
+                progress.progress.as_str().to_owned(),
+            )),
+        );
+        if let Some(total) = &progress.total {
+            retained_params.insert(
+                "total".to_owned(),
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    total.as_str().to_owned(),
+                )),
+            );
+        }
+        if let ProgressMarker::Number(marker) = &progress.progress_token {
+            retained_params.insert(
+                "progressToken".to_owned(),
+                Value::Number(marker.to_number()),
+            );
+        }
+        let pending = state
+            .pending
+            .get_mut(correlation_key)
+            .expect("the admitted progress owner remains live until stream commit");
+        pending.last_progress = Some(progress.progress);
+        if let Some(next_idle) = next_idle {
+            pending.record.idle_deadline = next_idle;
+        }
+        let stream = state.stream_notifications.entry(stream_key).or_default();
+        stream.push_back(retained);
+        Ok(true)
+    }
+}
+
+fn progress_params_source_from_admitted_frame(
+    message: &JsonRpcMessage,
+    source: &[u8],
+) -> McpResult<Option<String>> {
+    if !matches!(message, JsonRpcMessage::Request(request)
+        if request.id.is_none() && request.method == "notifications/progress")
+    {
+        return Ok(None);
+    }
+    #[derive(serde::Deserialize)]
+    struct RawProgressEnvelope {
+        #[serde(default)]
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+    // ReceivedTransportFrame already owns duplicate-aware bounded admission;
+    // this pass only retains params from that same accepted source frame.
+    let raw = serde_json::from_slice::<RawProgressEnvelope>(source).map_err(|_| {
+        McpError::invalid_request("Admitted progress frame could not retain its exact parameters")
+    })?;
+    Ok(raw.params.map(|params| params.get().to_owned()))
+}
+
+fn exact_result_source_from_admitted_frame(
+    message: &JsonRpcMessage,
+    source: &[u8],
+) -> McpResult<Option<String>> {
+    let JsonRpcMessage::Response(response) = message else {
+        return Ok(None);
+    };
+    let admission = decode_strict_jsonrpc_response(source, source.len()).map_err(|_| {
+        McpError::invalid_request("Admitted peer response could not retain its exact result source")
+    })?;
+    if admission.response() != response {
+        return Err(McpError::invalid_request(
+            "Admitted peer response differs from its exact source frame",
+        ));
+    }
+    Ok(admission.into_parts().1)
+}
+
+/// Returns whether the selected protocol table admits an ID-bearing request
+/// from the server at the client ingress boundary.
+///
+/// This is deliberately table-driven instead of treating every JSON-RPC
+/// request as a callback. In particular, `completion/complete` is always
+/// client-to-server, elicitation is absent from both selected core tables,
+/// and the final table deliberately excludes historical reverse callbacks.
+fn server_request_is_admitted(peer_era: ResultPeerEra, request: &JsonRpcRequest) -> bool {
+    if request.id.is_none() {
+        return false;
+    }
+    match peer_era {
+        ResultPeerEra::Legacy => LEGACY_2024_11_05_METHODS.iter().any(|method| {
+            method.name == request.method
+                && method.envelope == Legacy2024EnvelopeKind::Request
+                && matches!(
+                    method.direction,
+                    Legacy2024Direction::ServerToClient | Legacy2024Direction::Bidirectional
+                )
+        }),
+        ResultPeerEra::Modern => FINAL_2026_07_28_METHODS.iter().any(|method| {
+            method.name == request.method
+                && method.envelope == Final2026EnvelopeKind::Request
+                && method.direction.admits_sender(Final2026Peer::Server)
+        }),
+    }
+}
+
+/// Applies the pinned method-level schema after the selected-era table has
+/// admitted a reverse request. Final-era request admission is unchanged: its
+/// active table contains no server-to-client request methods.
+fn legacy_reverse_request_params_are_admitted(
+    peer_era: ResultPeerEra,
+    request: &JsonRpcRequest,
+) -> bool {
+    match peer_era {
+        ResultPeerEra::Legacy => {
+            validate_legacy_2024_11_05_method_params(&request.method, request.params.as_ref())
+                .is_ok()
+        }
+        ResultPeerEra::Modern => true,
+    }
+}
+
+fn cancellation_control_message_for_era(
+    peer_era: ResultPeerEra,
+    request_id: &RequestId,
+) -> McpResult<JsonRpcMessage> {
+    let cancellation = match peer_era {
+        ResultPeerEra::Legacy => CancellationWireMessage::Legacy2024 {
+            sender: CancellationSender::Client,
+            params: CancelledParams {
+                request_id: request_id.clone(),
+                reason: None,
+                meta: None,
+            },
+        },
+        ResultPeerEra::Modern => CancellationWireMessage::Modern2026 {
+            sender: CancellationSender::Client,
+            params: FinalCancelledNotificationParams {
+                request_id: request_id.clone(),
+                reason: None,
+                meta: None,
+                additional: BTreeMap::new(),
+            },
+        },
+    };
+    cancellation
+        .encode()
+        .map(JsonRpcMessage::Request)
+        .map_err(|error| {
+            McpError::invalid_params(format!("Invalid cancellation control parameters: {error}"))
+        })
+}
+
+#[cfg(feature = "tasks")]
+fn decode_task_response<R>(response: &JsonRpcResponse, method: &'static str) -> McpResult<R>
+where
+    R: serde::de::DeserializeOwned,
+{
+    let result = response.result.clone().ok_or_else(|| {
+        McpError::invalid_request(format!("Peer {method} response did not contain a result"))
+    })?;
+    serde_json::from_value(result)
+        .map_err(|_| McpError::invalid_request(format!("Peer {method} result is invalid")))
+}
+
+#[cfg(feature = "tasks")]
+fn validate_task_subscription_filter(
+    requested_filter: &SubscriptionFilter,
+    accepted_filter: &SubscriptionFilter,
+) -> McpResult<()> {
+    let requested_task_ids = task_subscription_ids(requested_filter)
+        .map_err(|_| McpError::internal_error("Tasks subscription request filter is invalid"))?
+        .ok_or_else(|| McpError::internal_error("Tasks subscription omitted its taskIds filter"))?;
+    let accepted_task_ids = task_subscription_ids(accepted_filter).map_err(|_| {
+        McpError::invalid_request("Tasks subscription acknowledgement filter is invalid")
+    })?;
+    if let Some(accepted_task_ids) = accepted_task_ids {
+        for (index, task_id) in accepted_task_ids.iter().enumerate() {
+            if !requested_task_ids
+                .iter()
+                .any(|requested| requested == task_id)
+                || accepted_task_ids[..index]
+                    .iter()
+                    .any(|previous| previous == task_id)
+            {
+                return Err(McpError::invalid_request(
+                    "Tasks subscription acknowledgement contains an unrequested taskId",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One request-owned response stream handle.
+///
+/// Dropping a live handle promptly selects its local terminal transition and
+/// queues its one bounded cancellation notification. The next executor
+/// operation owns the transport send, so `Drop` never performs I/O while it
+/// holds the shared executor state.
+#[derive(Debug)]
+pub struct RequestExecution<T> {
+    request_id: RequestId,
+    generation: u64,
+    owner_dropped: OwnerDropped,
+    state: SharedExecutorState<T>,
+    // Only the Tasks decoders re-read the request that opened an execution.
+    #[cfg(feature = "tasks")]
+    method: String,
+    #[cfg(feature = "tasks")]
+    params: Option<Value>,
+    #[cfg(feature = "tasks")]
+    task_operation: Option<TaskExecutionOperation>,
+    tombstone_retention: Duration,
+    completed: bool,
+}
+
+impl<T> RequestExecution<T> {
+    /// A selected failure takes precedence over buffered subscription events.
+    pub(crate) fn terminal_error(&self) -> Option<McpError> {
+        match self
+            .state
+            .borrow()
+            .completed
+            .get(&(self.request_id.clone(), self.generation))
+        {
+            Some(ExecutionOutcome::Failure(error)) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact request ID committed for this execution.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Returns this request ID's monotonic local execution generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Distinguishes a consumed handle from a newly observed peer failure.
+    #[cfg(feature = "tasks")]
+    pub(crate) const fn is_completed(&self) -> bool {
+        self.completed
+    }
+
+    /// Removes request-owned streaming notifications in peer arrival order.
+    ///
+    /// Only structurally valid progress with this execution's exact token can
+    /// enter this queue; generic notifications remain executor-level activity.
+    pub fn take_stream_notifications(&mut self) -> McpResult<Vec<JsonRpcRequest>> {
+        if self.completed {
+            return Err(McpError::invalid_request(
+                "Request execution result was already consumed",
+            ));
+        }
+        Ok(self
+            .state
+            .borrow_mut()
+            .stream_notifications
+            .remove(&(self.request_id.clone(), self.generation))
+            .map_or_else(Vec::new, |events| events.into_iter().collect()))
+    }
+
+    fn ensure_owner(&self, state: &SharedExecutorState<T>) -> McpResult<()> {
+        if !SharedExecutorState::ptr_eq(&self.state, state) {
+            return Err(McpError::invalid_params(
+                "Request execution belongs to a different executor",
+            ));
+        }
+        if self.completed {
+            return Err(McpError::invalid_request(
+                "Request execution result was already consumed",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn ensure_task_operation(
+        &self,
+        accepts: impl FnOnce(&TaskExecutionOperation) -> bool,
+    ) -> McpResult<()> {
+        self.ensure_owner(&self.state)?;
+        if self
+            .task_operation
+            .as_ref()
+            .is_none_or(|operation| !accepts(operation))
+        {
+            return Err(McpError::invalid_params(
+                "Request execution does not own the required Tasks operation",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_id_for(
+        &self,
+        select: impl FnOnce(&TaskExecutionOperation) -> Option<&TaskId>,
+    ) -> McpResult<TaskId> {
+        self.ensure_owner(&self.state)?;
+        self.task_operation
+            .as_ref()
+            .and_then(select)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Request execution does not own the required Tasks operation",
+                )
+            })
+    }
+
+    fn take_terminal_outcome(
+        &mut self,
+    ) -> McpResult<Option<(ExecutionOutcome, Vec<JsonRpcRequest>)>> {
+        if self.completed {
+            return Err(McpError::invalid_request(
+                "Request execution result was already consumed",
+            ));
+        }
+        let mut state = self.state.borrow_mut();
+        let now = Instant::now();
+        state.prune_retained_terminals(now);
+        let key = (self.request_id.clone(), self.generation);
+        let outcome = state.completed.remove(&key);
+        let Some(outcome) = outcome else {
+            let correlation_key = self.request_id.correlation_key().map_err(|_| {
+                McpError::invalid_params("Request execution owns an invalid JSON-RPC request ID")
+            })?;
+            if state
+                .pending
+                .get(&correlation_key)
+                .is_some_and(|pending| pending.record.execution_generation == self.generation)
+            {
+                return Ok(None);
+            }
+            return Err(McpError::internal_error(
+                "Request execution terminal result expired before it was consumed",
+            ));
+        };
+        state.terminal_records.remove(&key);
+        state.terminal_expirations.remove(&key);
+        let stream = state
+            .stream_notifications
+            .remove(&key)
+            .map_or_else(Vec::new, |events| events.into_iter().collect());
+        self.completed = true;
+        Ok(Some((outcome, stream)))
+    }
+}
+
+impl<T> Drop for RequestExecution<T> {
+    fn drop(&mut self) {
+        let key = (self.request_id.clone(), self.generation);
+        if self.completed {
+            if let Ok(mut state) = self.state.try_borrow_mut() {
+                state.release_terminal(&key);
+                #[cfg(feature = "tasks")]
+                state.task_subscriptions.remove(&key);
+            }
+            return;
+        }
+
+        self.owner_dropped.set(true);
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return;
+        };
+        let Ok(correlation_key) = self.request_id.correlation_key() else {
+            return;
+        };
+        let Some(pending) = state.pending.get(&correlation_key) else {
+            state.release_terminal(&key);
+            #[cfg(feature = "tasks")]
+            state.task_subscriptions.remove(&key);
+            state.stream_notifications.remove(&key);
+            return;
+        };
+        if pending.record.execution_generation != self.generation {
+            state.release_terminal(&key);
+            #[cfg(feature = "tasks")]
+            state.task_subscriptions.remove(&key);
+            state.stream_notifications.remove(&key);
+            return;
+        }
+        let Some(pending) = state.pending.remove(&correlation_key) else {
+            return;
+        };
+        #[cfg(feature = "tasks")]
+        state
+            .task_subscriptions
+            .remove(&(self.request_id.clone(), self.generation));
+        state
+            .stream_notifications
+            .remove(&(self.request_id.clone(), self.generation));
+        let now = Instant::now();
+        let expires_at = now.checked_add(self.tombstone_retention).unwrap_or(now);
+        state.tombstones.insert(
+            correlation_key,
+            Tombstone {
+                generation: self.generation,
+                expires_at,
+                retain_late_response_diagnostic: false,
+            },
+        );
+        let cancellation = (pending.method != INITIALIZE)
+            .then(|| cancellation_control_message_for_era(state.result_peer_era, &self.request_id))
+            .transpose()
+            .ok()
+            .flatten();
+        state.retain_terminal(
+            key.clone(),
+            ExecutionTerminalRecord {
+                terminal_state: ExecutionTerminalState::Cancelled,
+                terminal_reason: ExecutionTerminalReason::CallerDropped,
+                final_delivered: false,
+                cancellation_committed: true,
+                cancellation_transport_attempts: 0,
+                local_cancellation_event: true,
+                waiter_release: true,
+                tombstone: true,
+            },
+            ExecutionOutcome::Failure(McpError::request_cancelled()),
+        );
+        if state.cancellation_events.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            let _ = state.cancellation_events.pop_front();
+        }
+        state.cancellation_events.push_back(CancellationRequested {
+            request_id: self.request_id.clone(),
+            reason: ExecutionTerminalReason::CallerDropped,
+        });
+        if let Some(message) = cancellation {
+            let _ = state.defer_cancellation(PendingCancellationControl {
+                request_id: self.request_id.clone(),
+                generation: self.generation,
+                message,
+            });
+        }
+        state.release_terminal(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastmcp_protocol::ExactJsonValue;
+    use fastmcp_transport::CodecError;
+
+    mod originating_caller {
+        use super::*;
+
+        fn executor(era: ProtocolEra) -> RequestExecutor<ScriptedTransport> {
+            RequestExecutor::with_protocol_era(ScriptedTransport::new([]), era)
+        }
+
+        fn call(id: i64) -> Request {
+            JsonRpcRequest::new(
+                TOOLS_CALL,
+                Some(serde_json::json!({
+                    "name": "caller_probe", "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                id,
+            )
+        }
+
+        fn final_response(id: i64) -> JsonRpcResponse {
+            JsonRpcResponse::success(
+                RequestId::Number(id),
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": "survived"}],
+                    "isError": false,
+                }),
+            )
+        }
+
+        fn frame(response: JsonRpcResponse) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(serde_json::to_vec(&response).unwrap()).unwrap()
+        }
+
+        fn cancellation_ids(executor: &RequestExecutor<ScriptedTransport>) -> Vec<RequestId> {
+            executor
+                .state
+                .borrow()
+                .transport
+                .sent
+                .iter()
+                .filter_map(|message| {
+                    let JsonRpcMessage::Request(request) = message else {
+                        return None;
+                    };
+                    if request.method != "notifications/cancelled" {
+                        return None;
+                    }
+                    assert!(request.id.is_none());
+                    Some(
+                        serde_json::from_value(
+                            request.params.as_ref().unwrap()["requestId"].clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn fresh_ingress_driver_cannot_override_a_cancelled_origin() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for raw_result_route in [false, true] {
+                    let executor = executor(era);
+                    let originating = Cx::for_testing();
+                    let live = Cx::for_testing();
+                    let mut cancelled = executor.execute(&originating, call(1)).unwrap();
+                    let mut sibling = executor.execute(&live, call(2)).unwrap();
+                    originating.set_cancel_requested(true);
+                    let driver = executor.clone();
+                    // Use both external ingress surfaces. Neither is passed
+                    // the stopped context, and no explicit cancel() is called.
+                    if raw_result_route {
+                        driver
+                            .route_response_with_raw_result(&live, final_response(1), None)
+                            .unwrap();
+                        driver
+                            .route_response_with_raw_result(&live, final_response(2), None)
+                            .unwrap();
+                    } else {
+                        driver.drive_frame(&live, frame(final_response(1))).unwrap();
+                        driver.drive_frame(&live, frame(final_response(2))).unwrap();
+                    }
+                    assert_eq!(
+                        executor.try_take_response(&mut cancelled).unwrap_err().code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(
+                        executor.try_take_response(&mut sibling).unwrap(),
+                        Some(final_response(2))
+                    );
+                    assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(1)]);
+                    assert!(
+                        executor.take_uncorrelated_responses().is_empty(),
+                        "late cancelled final escaped its tombstone"
+                    );
+                    assert!(executor.terminal_error().is_none());
+                    assert!(live.checkpoint().is_ok());
+                }
+            }
+        }
+
+        #[test]
+        fn fresh_waiter_observes_origin_cancellation_without_another_peer_read() {
+            let executor = RequestExecutor::new(ScriptedTransport::new([Ok(
+                JsonRpcMessage::Response(final_response(11)),
+            )]));
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(11)).unwrap();
+            originating.set_cancel_requested(true);
+            assert_eq!(
+                executor
+                    .clone()
+                    .wait(&live, &mut execution)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            // A returned cancellation alone would not prove pre-read refusal.
+            assert_eq!(executor.state.borrow().transport.received.len(), 1);
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(11)]);
+        }
+
+        #[derive(Debug)]
+        struct CancelDuringReceive {
+            inner: ScriptedTransport,
+            originating: Cx,
+        }
+
+        impl Transport for CancelDuringReceive {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.inner.send(cx, message)
+            }
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.originating.set_cancel_requested(true);
+                self.inner.recv(cx)
+            }
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.inner.close(cx)
+            }
+        }
+
+        #[test]
+        fn origin_cancellation_during_receive_preserves_the_sibling_frame() {
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let executor = RequestExecutor::new(CancelDuringReceive {
+                inner: ScriptedTransport::new([Ok(JsonRpcMessage::Response(final_response(22)))]),
+                originating: originating.clone(),
+            });
+            let mut cancelled = executor.execute(&originating, call(21)).unwrap();
+            let mut sibling = executor.execute(&live, call(22)).unwrap();
+            assert!(originating.checkpoint().is_ok());
+            executor.drive(&live).unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor.try_take_response(&mut sibling).unwrap(),
+                Some(final_response(22))
+            );
+            assert!(executor.terminal_error().is_none());
+            assert!(live.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn originating_deadline_uses_its_own_clock_not_the_service_callers_budget() {
+            use asupersync::runtime::RuntimeBuilder;
+            use asupersync::time::{TimerDriverHandle, VirtualClock};
+            use asupersync::{Budget, Time};
+
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let originating = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            let live = Cx::for_testing();
+            let executor = executor(ProtocolEra::Modern2026);
+            let mut execution = executor.execute(&originating, call(31)).unwrap();
+            let observed_at = Instant::now();
+            clock.advance(9_999_999);
+            executor.poll_timeouts_at(&live, observed_at).unwrap();
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            clock.advance(1);
+            executor.poll_timeouts_at(&live, observed_at).unwrap();
+            // Neither response-wait timeout nor the live service caller's
+            // budget changed; only the origin's virtual deadline elapsed.
+            assert!(executor.pending_records().is_empty());
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(31)]);
+            assert!(live.checkpoint().is_ok());
+            drop(execution);
+            drop(executor);
+            drop(originating);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn final_response_elected_before_origin_cancellation_stays_final() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(41)).unwrap();
+            executor
+                .drive_frame(&live, frame(final_response(41)))
+                .unwrap();
+            originating.set_cancel_requested(true);
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap(),
+                Some(final_response(41))
+            );
+            assert!(cancellation_ids(&executor).is_empty());
+            assert!(executor.take_cancellation_events().is_empty());
+        }
+
+        #[test]
+        fn origin_mask_defers_only_its_own_cancellation_until_next_service_turn() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(51)).unwrap();
+            originating.set_cancel_requested(true);
+            originating
+                .masked(|| executor.poll_timeouts_at(&live, Instant::now()))
+                .unwrap();
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(51)]);
+        }
+
+        #[test]
+        fn new_execution_services_origin_cancellation_before_application_send() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut first = executor.execute(&originating, call(61)).unwrap();
+            originating.set_cancel_requested(true);
+            let second = executor.clone().execute(&live, call(62)).unwrap();
+            {
+                let state = executor.state.borrow();
+                let methods = state
+                    .transport
+                    .sent
+                    .iter()
+                    .map(|message| match message {
+                        JsonRpcMessage::Request(request) => request.method.as_str(),
+                        _ => panic!("client must not send a response here"),
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(methods, [TOOLS_CALL, "notifications/cancelled", TOOLS_CALL]);
+            }
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(61)]);
+            assert_eq!(
+                executor.try_take_response(&mut first).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor.pending_records()[0].request_id,
+                *second.request_id()
+            );
+        }
+
+        #[test]
+        fn stopped_service_defers_controls_without_deferring_origin_terminals() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let stopped = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(71)).unwrap();
+            originating.set_cancel_requested(true);
+            stopped.set_cancel_requested(true);
+            executor.poll_timeouts_at(&stopped, Instant::now()).unwrap();
+            assert!(executor.pending_records().is_empty());
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(71)]);
+        }
+
+        #[test]
+        fn all_observed_origin_cancellations_win_before_a_control_send_fails() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let first = executor.execute(&originating, call(81)).unwrap();
+            let second = executor.execute(&originating, call(82)).unwrap();
+            let sibling = executor.execute(&live, call(83)).unwrap();
+            originating.set_cancel_requested(true);
+            executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+            assert!(executor.poll_timeouts_at(&live, Instant::now()).is_err());
+            let state = executor.state.borrow();
+            for execution in [&first, &second] {
+                let key = (execution.request_id.clone(), execution.generation);
+                assert_eq!(
+                    state.terminal_records[&key].terminal_reason,
+                    ExecutionTerminalReason::CallerCancelled
+                );
+            }
+            let key = (sibling.request_id.clone(), sibling.generation);
+            assert_eq!(
+                state.terminal_records[&key].terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
+        }
+
+        #[test]
+        fn connection_failure_preserves_stopped_origins_without_wire_effects() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                let executor = executor(era);
+                let originating = Cx::for_testing();
+                let live = Cx::for_testing();
+                let mut first = executor.execute(&originating, call(101)).unwrap();
+                let mut second = executor.execute(&originating, call(102)).unwrap();
+                let mut sibling = executor.execute(&live, call(103)).unwrap();
+                originating.set_cancel_requested(true);
+                let failure = McpError::internal_error("reader disconnected");
+                // This is the connection-owned reader's actual terminal entry
+                // point. Do not service timeouts/cancellation first: that
+                // would hide the failure fanout's missing origin observation.
+                executor.fail_connection(failure.clone());
+                executor.fail_connection(McpError::internal_error("duplicate failure"));
+                {
+                    let state = executor.state.borrow();
+                    assert_eq!(state.transport.sent.len(), 3);
+                    assert!(state.pending.is_empty());
+                    assert!(state.deferred_cancellations.is_empty());
+                    assert!(state.tombstones.is_empty());
+                    for execution in [&first, &second] {
+                        let record = &state.terminal_records
+                            [&(execution.request_id.clone(), execution.generation)];
+                        assert_eq!(record.terminal_state, ExecutionTerminalState::Cancelled);
+                        assert_eq!(
+                            record.terminal_reason,
+                            ExecutionTerminalReason::CallerCancelled
+                        );
+                        assert!(record.cancellation_committed && record.local_cancellation_event);
+                        assert!(record.waiter_release);
+                        assert_eq!(record.cancellation_transport_attempts, 0);
+                        assert!(!record.final_delivered && !record.tombstone);
+                    }
+                    let sibling_record =
+                        &state.terminal_records[&(sibling.request_id.clone(), sibling.generation)];
+                    assert_eq!(
+                        sibling_record.terminal_state,
+                        ExecutionTerminalState::Failed
+                    );
+                    assert_eq!(
+                        sibling_record.terminal_reason,
+                        ExecutionTerminalReason::ConnectionLost
+                    );
+                    assert!(!sibling_record.local_cancellation_event);
+                }
+                let events = executor.take_cancellation_events();
+                assert_eq!(events.len(), 2);
+                for id in [101, 102] {
+                    assert!(events.iter().any(|event| {
+                        event.request_id == RequestId::Number(id)
+                            && event.reason == ExecutionTerminalReason::CallerCancelled
+                    }));
+                }
+                assert!(cancellation_ids(&executor).is_empty());
+                assert_eq!(
+                    executor.try_take_response(&mut first).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor.try_take_response(&mut second).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap_err()
+                        .message,
+                    failure.message
+                );
+                // Request-local cancellation must not erase the connection's
+                // real failure or allow another application write through it.
+                assert_eq!(
+                    executor.execute(&live, call(104)).unwrap_err().message,
+                    failure.message
+                );
+                assert_eq!(executor.state.borrow().transport.sent.len(), 3);
+                assert!(live.checkpoint().is_ok());
+            }
+        }
+
+        #[test]
+        fn connection_failure_never_rewrites_already_elected_terminals() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let stopped_service = Cx::for_testing();
+            let mut completed = executor.execute(&originating, call(111)).unwrap();
+            let mut cancelled = executor.execute(&originating, call(112)).unwrap();
+            let mut sibling = executor.execute(&live, call(113)).unwrap();
+            executor
+                .drive_frame(&live, frame(final_response(111)))
+                .unwrap();
+            stopped_service.set_cancel_requested(true);
+            executor.cancel(&stopped_service, &mut cancelled).unwrap();
+            let cancellation_key = (cancelled.request_id.clone(), cancelled.generation);
+            let cancellation_record =
+                executor.state.borrow().terminal_records[&cancellation_key].clone();
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            originating.set_cancel_requested(true);
+            let failure = McpError::internal_error("terminal transport loss");
+            executor.fail_connection(failure.clone());
+            assert_eq!(
+                executor.state.borrow().terminal_records[&cancellation_key],
+                cancellation_record
+            );
+            assert_eq!(
+                executor.try_take_response(&mut completed).unwrap(),
+                Some(final_response(111))
+            );
+            assert_eq!(
+                executor.try_take_response(&mut cancelled).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(
+                executor
+                    .try_take_response(&mut sibling)
+                    .unwrap_err()
+                    .message,
+                failure.message
+            );
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(executor.state.borrow().transport.sent.len(), 3);
+        }
+
+        #[test]
+        fn connection_failure_respects_origin_mask_but_remains_terminal() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let originating = Cx::for_testing();
+            let mut execution = executor.execute(&originating, call(121)).unwrap();
+            originating.set_cancel_requested(true);
+            let failure = McpError::internal_error("lost while origin was masked");
+            originating.masked(|| executor.fail_connection(failure.clone()));
+            // The mask defers local cancellation, not transport failure.
+            // Unmasking cannot revise the already-elected failure afterward.
+            executor.fail_connection(McpError::internal_error("later observation"));
+            let records = executor.terminal_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].terminal_state, ExecutionTerminalState::Failed);
+            assert_eq!(
+                records[0].terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
+            assert!(!records[0].cancellation_committed);
+            assert_eq!(
+                executor
+                    .try_take_response(&mut execution)
+                    .unwrap_err()
+                    .message,
+                failure.message
+            );
+            assert!(executor.take_cancellation_events().is_empty());
+            assert!(cancellation_ids(&executor).is_empty());
+        }
+
+        #[test]
+        fn connection_failure_observes_origin_deadline_without_a_service_turn() {
+            use asupersync::runtime::RuntimeBuilder;
+            use asupersync::time::{TimerDriverHandle, VirtualClock};
+            use asupersync::{Budget, Time};
+
+            for elapsed in [9_999_999, 10_000_000] {
+                let clock = Arc::new(VirtualClock::new());
+                let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(timer)
+                    .build()
+                    .unwrap();
+                let originating = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+                );
+                let live = Cx::for_testing();
+                let executor = executor(ProtocolEra::Modern2026);
+                let mut execution = executor.execute(&originating, call(131)).unwrap();
+                let mut sibling = executor.execute(&live, call(132)).unwrap();
+                clock.advance(elapsed);
+                let failure = McpError::internal_error("failure at virtual deadline");
+                executor.fail_connection(failure.clone());
+                let stopped = elapsed == 10_000_000;
+                let error = executor.try_take_response(&mut execution).unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if stopped {
+                        McpErrorCode::RequestCancelled
+                    } else {
+                        failure.code
+                    }
+                );
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap_err()
+                        .message,
+                    failure.message
+                );
+                assert_eq!(
+                    executor.take_cancellation_events().len(),
+                    usize::from(stopped)
+                );
+                assert!(cancellation_ids(&executor).is_empty());
+                assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+                drop(execution);
+                drop(sibling);
+                drop(executor);
+                drop(originating);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn cancelled_initialize_owner_never_emits_forbidden_wire_cancellation() {
+            let executor = executor(ProtocolEra::Legacy2024);
+            let originating = Cx::for_testing();
+            let live = Cx::for_testing();
+            let mut execution = executor
+                .execute(
+                    &originating,
+                    JsonRpcRequest::new(
+                        INITIALIZE,
+                        Some(serde_json::json!({
+                            "protocolVersion": "2024-11-05", "capabilities": {},
+                            "clientInfo": {"name": "origin", "version": "1"},
+                        })),
+                        91_i64,
+                    ),
+                )
+                .unwrap();
+            originating.set_cancel_requested(true);
+            executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut execution).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert!(cancellation_ids(&executor).is_empty());
+            assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        received: VecDeque<Result<JsonRpcMessage, TransportError>>,
+        received_frames: VecDeque<Result<ReceivedTransportFrame, TransportError>>,
+        sent: Vec<JsonRpcMessage>,
+        send_error: Option<std::io::ErrorKind>,
+    }
+
+    impl ScriptedTransport {
+        fn new(received: impl IntoIterator<Item = Result<JsonRpcMessage, TransportError>>) -> Self {
+            Self {
+                received: received.into_iter().collect(),
+                received_frames: VecDeque::new(),
+                sent: Vec::new(),
+                send_error: None,
+            }
+        }
+
+        fn with_source_frames(
+            received_frames: impl IntoIterator<Item = Result<ReceivedTransportFrame, TransportError>>,
+        ) -> Self {
+            Self {
+                received: VecDeque::new(),
+                received_frames: received_frames.into_iter().collect(),
+                sent: Vec::new(),
+                send_error: None,
+            }
+        }
+    }
+
+    impl Transport for ScriptedTransport {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            if let Some(kind) = self.send_error {
+                return Err(TransportError::Io(std::io::Error::from(kind)));
+            }
+            self.sent.push(message.clone());
+            Ok(())
+        }
+
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.received
+                .pop_front()
+                .unwrap_or(Err(TransportError::Closed))
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn receive_scripted_source_frame(
+        transport: &mut ScriptedTransport,
+        _cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        transport
+            .received_frames
+            .pop_front()
+            .unwrap_or(Err(TransportError::Closed))
+    }
+
+    mod execution_identity {
+        use super::*;
+
+        type Executor = RequestExecutor<ScriptedTransport>;
+        type Execution = RequestExecution<ScriptedTransport>;
+
+        fn executor(era: ProtocolEra) -> Executor {
+            RequestExecutor::with_protocol_era(ScriptedTransport::new([]), era)
+        }
+
+        fn request_with_id(id: RequestId) -> Request {
+            let mut value = request(7);
+            value.id = Some(id);
+            value
+        }
+
+        fn retired_response(id: RequestId) -> JsonRpcResponse {
+            // An error envelope is valid in both eras, independently of the
+            // method-specific success schema. This test concerns ownership.
+            JsonRpcResponse::error(
+                Some(id),
+                fastmcp_protocol::JsonRpcError {
+                    code: (-32603).into(),
+                    message: "retired execution".to_owned(),
+                    data: None,
+                },
+            )
+        }
+
+        fn retire_and_expire(executor: &Executor, cx: &Cx, old: &Execution) {
+            executor
+                .route_response_with_raw_result(cx, retired_response(old.request_id.clone()), None)
+                .unwrap();
+            let now = Instant::now();
+            let mut state = executor.state.borrow_mut();
+            let key = old.request_id.correlation_key().unwrap();
+            // Simulate the retention deadline, not a different ID allocator:
+            // run the real pruning paths while keeping the old handle alive.
+            state.tombstones.get_mut(&key).unwrap().expires_at = now;
+            *state
+                .terminal_expirations
+                .get_mut(&(old.request_id.clone(), old.generation))
+                .unwrap() = now;
+            state.prune_tombstones(now);
+            state.prune_retained_terminals(now);
+            assert!(!state.tombstones.contains_key(&key));
+            assert!(
+                !state
+                    .completed
+                    .contains_key(&(old.request_id.clone(), old.generation))
+            );
+        }
+
+        fn cancellation_ids(executor: &Executor) -> Vec<RequestId> {
+            executor
+                .state
+                .borrow()
+                .transport
+                .sent
+                .iter()
+                .filter_map(|message| {
+                    let JsonRpcMessage::Request(request) = message else {
+                        return None;
+                    };
+                    if request.method != "notifications/cancelled" {
+                        return None;
+                    }
+                    assert!(request.id.is_none());
+                    Some(
+                        serde_json::from_value(
+                            request.params.as_ref().unwrap()["requestId"].clone(),
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn retired_cancel_cannot_target_a_reused_id_or_numeric_alias() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for (old_id, new_id) in [
+                    (RequestId::Number(7), RequestId::Number(7)),
+                    (RequestId::Number(7), RequestId::Integer("7e0".to_owned())),
+                    (
+                        RequestId::String("same-id".to_owned()),
+                        RequestId::String("same-id".to_owned()),
+                    ),
+                ] {
+                    for stopped_service in [false, true] {
+                        let executor = executor(era);
+                        let cx = Cx::for_testing();
+                        let service = Cx::for_testing();
+                        let mut old = executor
+                            .execute(&cx, request_with_id(old_id.clone()))
+                            .unwrap();
+                        retire_and_expire(&executor, &cx, &old);
+                        let mut current = executor
+                            .execute(&cx, request_with_id(new_id.clone()))
+                            .unwrap();
+                        assert_ne!(old.generation(), current.generation());
+                        if stopped_service {
+                            service.set_cancel_requested(true);
+                        }
+                        executor.clone().cancel(&service, &mut old).unwrap();
+                        assert!(executor.try_take_response(&mut current).unwrap().is_none());
+                        assert_eq!(executor.pending_records().len(), 1);
+                        assert_eq!(
+                            executor.pending_records()[0].execution_generation,
+                            current.generation()
+                        );
+                        assert!(cancellation_ids(&executor).is_empty());
+                        assert!(executor.take_cancellation_events().is_empty());
+                        assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                        // The exact current handle still has its authority,
+                        // including when its ID is a numeric spelling alias.
+                        executor.clone().cancel(&cx, &mut current).unwrap();
+                        let controls = cancellation_ids(&executor);
+                        assert_eq!(controls.len(), 1);
+                        assert!(controls[0].correlates_with(&new_id));
+                        assert_eq!(
+                            executor.try_take_response(&mut current).unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
+                    }
+                }
+            }
+        }
+
+        fn listen(id: RequestId) -> Request {
+            JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": fastmcp_protocol::FinalRequestMeta::new(
+                        fastmcp_protocol::ClientCapabilities::default()
+                    ),
+                    "notifications": {"toolsListChanged": true},
+                })),
+                id,
+            )
+        }
+
+        #[test]
+        fn retired_teardown_cannot_cancel_a_new_subscription_with_the_same_id() {
+            for old_was_subscription in [false, true] {
+                let executor = executor(ProtocolEra::Modern2026);
+                let cx = Cx::for_testing();
+                let id = RequestId::Number(17);
+                let prior = if old_was_subscription {
+                    listen(id.clone())
+                } else {
+                    request_with_id(id.clone())
+                };
+                let mut old = executor.execute(&cx, prior).unwrap();
+                retire_and_expire(&executor, &cx, &old);
+                let mut current = executor
+                    .execute_subscription_with_timeout_policy(
+                        &cx,
+                        listen(id),
+                        SubscriptionTimeoutPolicy::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    executor
+                        .accept_subscription_teardown(&cx, &mut old)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest
+                );
+                assert!(executor.try_take_response(&mut current).unwrap().is_none());
+                assert_eq!(
+                    executor.pending_records()[0].execution_generation,
+                    current.generation()
+                );
+                assert!(executor.take_cancellation_events().is_empty());
+                executor
+                    .accept_subscription_teardown(&cx, &mut current)
+                    .unwrap();
+                assert_eq!(
+                    executor.try_take_response(&mut current).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(
+                    cancellation_ids(&executor).is_empty(),
+                    "peer teardown must not echo a control"
+                );
+            }
+        }
+
+        #[test]
+        fn stale_wait_turn_cannot_read_or_cancel_the_replacement_execution() {
+            for stopped_service in [false, true] {
+                let executor = executor(ProtocolEra::Legacy2024);
+                let cx = Cx::for_testing();
+                let service = Cx::for_testing();
+                let old = executor.execute(&cx, request(27)).unwrap();
+                retire_and_expire(&executor, &cx, &old);
+                let mut current = executor.execute(&cx, request(27)).unwrap();
+                let response = retired_response(current.request_id.clone());
+                executor
+                    .state
+                    .borrow_mut()
+                    .transport
+                    .received
+                    .push_back(Ok(JsonRpcMessage::Response(response.clone())));
+                if stopped_service {
+                    service.set_cancel_requested(true);
+                }
+                // Model the unlock/relock boundary inside wait_for_terminal:
+                // its remembered owner was retired before this drive acquired
+                // the shared state. No ten-minute sleep or unsafe race needed.
+                assert!(
+                    executor
+                        .drive_for_owner(
+                            &ExecutionTurn::new(&service),
+                            Some((&old.request_id, old.generation)),
+                        )
+                        .is_err()
+                );
+                assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                assert!(cancellation_ids(&executor).is_empty());
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                assert!(executor.terminal_error().is_none());
+                assert_eq!(executor.clone().wait(&cx, &mut current).unwrap(), response);
+            }
+        }
+
+        fn response_frame(response: &JsonRpcResponse) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(serde_json::to_vec(response).unwrap()).unwrap()
+        }
+
+        #[test]
+        fn stale_waiter_refusal_does_not_claim_the_external_drivers_ingress() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                for stopped_service in [false, true] {
+                    let executor = executor(era);
+                    let cx = Cx::for_testing();
+                    let service = Cx::for_testing();
+                    let old = executor.execute(&cx, request(37)).unwrap();
+                    retire_and_expire(&executor, &cx, &old);
+                    let mut current = executor.execute(&cx, request(37)).unwrap();
+                    let response = retired_response(current.request_id.clone());
+                    executor
+                        .state
+                        .borrow_mut()
+                        .transport
+                        .received
+                        .push_back(Ok(JsonRpcMessage::Response(response.clone())));
+                    if stopped_service {
+                        service.set_cancel_requested(true);
+                    }
+                    assert!(
+                        executor
+                            .drive_for_owner(
+                                &ExecutionTurn::new(&service),
+                                Some((&old.request_id, old.generation)),
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(
+                        executor.state.borrow().ingress_owner,
+                        IngressOwner::Unclaimed
+                    );
+                    assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                    assert!(cancellation_ids(&executor).is_empty());
+                    // No reset, fresh executor or replacement connection is
+                    // used: the actual external driver must still be able to
+                    // claim ingress and complete this replacement request.
+                    executor
+                        .drive_frame(&cx, response_frame(&response))
+                        .unwrap();
+                    assert_eq!(
+                        executor.state.borrow().ingress_owner,
+                        IngressOwner::ExternalDriver
+                    );
+                    assert_eq!(
+                        executor.try_take_response(&mut current).unwrap(),
+                        Some(response)
+                    );
+                    assert_eq!(executor.state.borrow().transport.received.len(), 1);
+                }
+            }
+        }
+
+        #[test]
+        fn timeout_reconciliation_without_a_read_preserves_unclaimed_ingress() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let cx = Cx::for_testing();
+            let mut expired = executor.execute(&cx, request(47)).unwrap();
+            let mut sibling = executor.execute(&cx, request(48)).unwrap();
+            let response = retired_response(sibling.request_id.clone());
+            {
+                let mut state = executor.state.borrow_mut();
+                state
+                    .pending
+                    .get_mut(&expired.request_id.correlation_key().unwrap())
+                    .unwrap()
+                    .record
+                    .idle_deadline = Instant::now();
+                state
+                    .transport
+                    .received
+                    .push_back(Ok(JsonRpcMessage::Response(response.clone())));
+            }
+            executor
+                .drive_for_owner(
+                    &ExecutionTurn::new(&cx),
+                    Some((&expired.request_id, expired.generation)),
+                )
+                .unwrap();
+            assert_eq!(
+                executor.state.borrow().ingress_owner,
+                IngressOwner::Unclaimed
+            );
+            assert_eq!(executor.state.borrow().transport.received.len(), 1);
+            assert_eq!(
+                executor.try_take_response(&mut expired).unwrap_err().code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(47)]);
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut sibling).unwrap(),
+                Some(response)
+            );
+            assert!(executor.terminal_error().is_none());
+        }
+
+        #[test]
+        fn existing_external_mode_refuses_self_reader_before_deferred_control_effects() {
+            let executor = executor(ProtocolEra::Modern2026);
+            let cx = Cx::for_testing();
+            let mut completed = executor.execute(&cx, request(57)).unwrap();
+            let response = retired_response(completed.request_id.clone());
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut completed).unwrap(),
+                Some(response)
+            );
+            let mut active = executor.execute(&cx, request(58)).unwrap();
+            let abandoned = executor.execute(&cx, request(59)).unwrap();
+            drop(abandoned);
+            let sent = executor.state.borrow().transport.sent.len();
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert_eq!(
+                executor
+                    .drive_for_owner(
+                        &ExecutionTurn::new(&cx),
+                        Some((&active.request_id, active.generation)),
+                    )
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidRequest
+            );
+            // Moving the mutating claim later must not move the incompatible
+            // mode refusal after a maintenance write. The original external
+            // driver retains sole authority to service these queued controls.
+            assert_eq!(executor.state.borrow().transport.sent.len(), sent);
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert_eq!(
+                executor.state.borrow().ingress_owner,
+                IngressOwner::ExternalDriver
+            );
+            assert!(executor.try_take_response(&mut active).unwrap().is_none());
+            let response = retired_response(active.request_id.clone());
+            executor
+                .drive_frame(&cx, response_frame(&response))
+                .unwrap();
+            assert_eq!(
+                executor.try_take_response(&mut active).unwrap(),
+                Some(response)
+            );
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            assert_eq!(cancellation_ids(&executor), vec![RequestId::Number(59)]);
+        }
+
+        #[cfg(feature = "tasks")]
+        mod foreign_subscription {
+            use super::*;
+
+            fn subscribed(cx: &Cx, task: &str) -> (Executor, Execution) {
+                let executor = executor(ProtocolEra::Modern2026);
+                let task_id = TaskId::parse(task).unwrap();
+                let execution = executor
+                    .execute_tasks_subscription(cx, tasks_subscription_request(73, &task_id))
+                    .unwrap();
+                executor
+                    .drive_frame(
+                        cx,
+                        source_frame(tasks_subscription_acknowledgement(73, &task_id)),
+                    )
+                    .unwrap();
+                executor
+                    .drive_frame(cx, source_frame(tasks_status_notification(73, &task_id)))
+                    .unwrap();
+                (executor, execution)
+            }
+
+            fn assert_live_subscription(executor: &Executor, execution: &Execution, task: &str) {
+                let filter = executor
+                    .clone()
+                    .tasks_subscription_acknowledgement(execution)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    task_subscription_ids(&filter).unwrap().unwrap(),
+                    vec![TaskId::parse(task).unwrap()]
+                );
+                let events = executor
+                    .clone()
+                    .take_tasks_subscription_notifications(execution)
+                    .unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    serde_json::to_value(&events[0]).unwrap()["params"]["taskId"],
+                    task
+                );
+                assert!(
+                    executor
+                        .take_tasks_subscription_notifications(execution)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(executor.pending_records().len(), 1);
+            }
+
+            fn same_wire_identity(left: &Execution, right: &Execution) {
+                assert_eq!(left.request_id(), right.request_id());
+                assert_eq!(left.generation(), right.generation());
+                assert!(!SharedExecutorState::ptr_eq(&left.state, &right.state));
+            }
+
+            #[test]
+            fn foreign_handle_cannot_observe_another_executors_acknowledgement() {
+                let cx = Cx::for_testing();
+                let (first, foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(
+                    second
+                        .tasks_subscription_acknowledgement(&foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+
+            #[test]
+            fn foreign_handle_cannot_drain_another_executors_notifications() {
+                let cx = Cx::for_testing();
+                let (first, foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(
+                    second
+                        .take_tasks_subscription_notifications(&foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+
+            #[test]
+            fn foreign_wait_refusal_cannot_remove_local_subscription_state() {
+                let cx = Cx::for_testing();
+                let (first, mut foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(
+                    second
+                        .wait_tasks_subscription(&cx, &mut foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                // The original error path already returned InvalidParams,
+                // but removed the local entry with this same (ID, generation).
+                // Retained accepted filters AND events prove absence of that
+                // destructive side effect; the error code alone cannot.
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+                assert!(second.terminal_error().is_none());
+            }
+
+            #[test]
+            fn foreign_terminal_poll_leaves_both_subscription_owners_live() {
+                let cx = Cx::for_testing();
+                let (first, mut foreign) = subscribed(&cx, "task-first");
+                let (second, local) = subscribed(&cx, "task-second");
+                same_wire_identity(&foreign, &local);
+                assert_eq!(
+                    second
+                        .try_take_tasks_subscription_terminal(&mut foreign)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                assert_live_subscription(&second, &local, "task-second");
+                assert_live_subscription(&first, &foreign, "task-first");
+            }
+        }
+    }
+
+    fn request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "id": id,
+                "_meta": {"progressToken": id},
+            })),
+            id,
+        )
+    }
+
+    fn response(id: i64, result: serde_json::Value) -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn source_frame(message: JsonRpcMessage) -> ReceivedTransportFrame {
+        let source = serde_json::to_vec(&message).expect("scripted message serializes");
+        ReceivedTransportFrame::admit(source.into_boxed_slice())
+            .expect("scripted source frame passes transport admission")
+    }
+
+    fn legacy_reverse_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            id,
+        ))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn tasks_subscription_request(id: i64, task_id: &TaskId) -> JsonRpcRequest {
+        let mut notifications = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut notifications, vec![task_id.clone()])
+            .expect("compose a bounded Tasks subscription filter");
+        JsonRpcRequest::new(
+            SUBSCRIPTIONS_LISTEN,
+            Some(serde_json::json!({
+                "_meta": fastmcp_protocol::FinalRequestMeta::new(fastmcp_protocol::ClientCapabilities::default()),
+                "notifications": notifications,
+            })),
+            id,
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn task_tool_call_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            TOOLS_CALL,
+            Some(serde_json::json!({
+                "name": "long-running-tool",
+                "arguments": {},
+                "_meta": fastmcp_protocol::FinalRequestMeta::new(fastmcp_protocol::ClientCapabilities::default()),
+            })),
+            id,
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn tasks_subscription_acknowledgement(id: i64, task_id: &TaskId) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/subscriptions/acknowledged",
+            Some(serde_json::json!({
+                "_meta": {"io.modelcontextprotocol/subscriptionId": id},
+                "notifications": {"taskIds": [task_id]},
+            })),
+        ))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn tasks_status_notification(id: i64, task_id: &TaskId) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::notification(
+            TASK_STATUS_NOTIFICATION,
+            Some(serde_json::json!({
+                "_meta": {"io.modelcontextprotocol/subscriptionId": id},
+                "taskId": task_id,
+                "status": "working",
+                "createdAt": "2026-07-28T12:00:00.000Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                "ttlMs": null,
+            })),
+        ))
+    }
+
+    #[test]
+    fn unit_clt_01_a_positive() {
+        assert_eq!(
+            clt_01_a_manifest_digest().as_bytes(),
+            &[
+                0x52, 0x7c, 0x4b, 0xdb, 0x5b, 0xdd, 0xff, 0x10, 0x95, 0xb3, 0x27, 0xf7, 0x92, 0x5b,
+                0xcf, 0x73, 0xba, 0x6e, 0xd0, 0x05, 0x22, 0x5b, 0x8b, 0x59, 0x91, 0x6b, 0x0b, 0x7e,
+                0xe3, 0x88, 0x62, 0xb7,
+            ],
+        );
+        let executor = RequestExecutor::new(ScriptedTransport::new([
+            Ok(response(999, serde_json::json!({"unknown": true}))),
+            Ok(response(
+                2,
+                serde_json::json!({"kind": "input-required", "x": [1, 2]}),
+            )),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/message",
+                Some(serde_json::json!({"level": "info"})),
+            ))),
+            Ok(response(
+                1,
+                serde_json::json!({"kind": "complete", "extra": {"n": 9007199254740993u64}}),
+            )),
+        ]));
+        let cx = Cx::for_testing();
+        let mut first = executor
+            .execute(&cx, request(1))
+            .expect("first request commits");
+        let mut second = executor
+            .execute(&cx, request(2))
+            .expect("second request commits");
+
+        let records = executor.pending_records();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            record.correlation_key
+                == record
+                    .request_id
+                    .correlation_key()
+                    .expect("committed request IDs remain canonicalizable")
+                && record.send_committed
+                && record.request_state == ExecutionTerminalState::Pending
+                && record.terminal_state == ExecutionTerminalState::Pending
+                && !record.cancellation_committed
+                && record.tombstone_generation.is_none()
+                && record.idle_deadline <= record.absolute_deadline
+        }));
+
+        let first_response = executor
+            .wait(&cx, &mut first)
+            .expect("reordered first response");
+        assert_eq!(first_response.id, Some(RequestId::Number(1)));
+        assert_eq!(
+            first_response.result,
+            Some(serde_json::json!({"kind": "complete", "extra": {"n": 9007199254740993u64}}))
+        );
+        let second_response = executor
+            .wait(&cx, &mut second)
+            .expect("stored second response");
+        assert_eq!(second_response.id, Some(RequestId::Number(2)));
+        assert_eq!(
+            second_response.result,
+            Some(serde_json::json!({"kind": "input-required", "x": [1, 2]}))
+        );
+        let notifications = executor.take_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(executor.pending_records().len(), 0);
+        let uncorrelated = executor.take_uncorrelated_responses();
+        assert_eq!(uncorrelated.len(), 1);
+        assert_eq!(uncorrelated[0].id, Some(RequestId::Number(999)));
+
+        let malformed = RequestExecutor::new(ScriptedTransport::new([Err(TransportError::Codec(
+            CodecError::Json(
+                serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON"),
+            ),
+        ))]));
+        let mut malformed_first = malformed
+            .execute(&cx, request(11))
+            .expect("first malformed-owner request commits");
+        let mut malformed_second = malformed
+            .execute(&cx, request(12))
+            .expect("second malformed-owner request commits");
+        let error = malformed
+            .drive(&cx)
+            .expect_err("malformed peer ingress fails locally without a peer response");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        assert_eq!(
+            malformed
+                .wait(&cx, &mut malformed_first)
+                .expect_err("first owner receives the fanout failure")
+                .code,
+            fastmcp_core::McpErrorCode::InternalError,
+        );
+        assert_eq!(
+            malformed
+                .wait(&cx, &mut malformed_second)
+                .expect_err("second owner receives the same fanout failure")
+                .code,
+            fastmcp_core::McpErrorCode::InternalError,
+        );
+        assert_eq!(malformed.state.borrow().transport.sent.len(), 2);
+
+        let closed = RequestExecutor::new(ScriptedTransport::new([Err(TransportError::Closed)]));
+        let mut closed_first = closed
+            .execute(&cx, request(13))
+            .expect("first connection-loss owner request commits");
+        let mut closed_second = closed
+            .execute(&cx, request(14))
+            .expect("second connection-loss owner request commits");
+        assert!(closed.drive(&cx).is_err());
+        assert_eq!(
+            closed
+                .wait(&cx, &mut closed_first)
+                .expect_err("first owner receives connection loss")
+                .code,
+            fastmcp_core::McpErrorCode::InternalError,
+        );
+        assert_eq!(
+            closed
+                .wait(&cx, &mut closed_second)
+                .expect_err("second owner receives connection loss")
+                .code,
+            fastmcp_core::McpErrorCode::InternalError,
+        );
+
+        let abandoned = RequestExecutor::new(ScriptedTransport::new([
+            Ok(response(31, serde_json::json!({"late": true}))),
+            Ok(response(32, serde_json::json!({"current": true}))),
+        ]));
+        let dropped = abandoned
+            .execute(&cx, request(31))
+            .expect("abandoned request commits");
+        drop(dropped);
+        let mut current = abandoned
+            .execute(&cx, request(32))
+            .expect("next request drains the cancelled owner first");
+        let current_response = abandoned
+            .wait(&cx, &mut current)
+            .expect("late tombstone response cannot poison the next generation");
+        assert_eq!(current_response.id, Some(RequestId::Number(32)));
+        assert_eq!(abandoned.state.borrow().transport.sent.len(), 3);
+
+        let backpressured = RequestExecutor::new(ScriptedTransport {
+            received: VecDeque::new(),
+            received_frames: VecDeque::new(),
+            sent: Vec::new(),
+            send_error: Some(std::io::ErrorKind::WouldBlock),
+        });
+        assert!(backpressured.execute(&cx, request(21)).is_err());
+        assert_eq!(backpressured.pending_records().len(), 0);
+        assert!(backpressured.execute(&cx, request(22)).is_err());
+    }
+
+    #[test]
+    fn modern_reverse_request_is_rejected_without_mutating_legacy_handler_state() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(legacy_reverse_request(700))]),
+            ResultPeerEra::Modern,
+        );
+        let _execution = executor
+            .execute(&cx, request(42))
+            .expect("outer request commits before modern peer ingress");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("modern legacy-shaped reverse request is rejected locally");
+
+        assert!(executor.take_reverse_requests().is_empty());
+        assert_eq!(executor.pending_records(), pending_before);
+        let state = executor.state.borrow();
+        assert!(state.pending_reverse_requests.is_empty());
+        assert_eq!(state.reverse_requests.len(), 0);
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Response(rejection) = &state.transport.sent[1] else {
+            panic!("modern reverse request receives one JSON-RPC error response");
+        };
+        assert_eq!(rejection.id, Some(RequestId::Number(700)));
+        let error = rejection
+            .error
+            .as_ref()
+            .expect("rejection carries an error");
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
+        assert_eq!(error.message, "Method not found");
+    }
+
+    #[test]
+    fn legacy_reverse_request_remains_available_to_the_handler_boundary() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(legacy_reverse_request(700))]),
+            ResultPeerEra::Legacy,
+        );
+        let _execution = executor
+            .execute(&cx, request(42))
+            .expect("outer request commits before legacy peer ingress");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("legacy reverse request reaches the handler boundary");
+
+        let reverse_requests = executor.take_reverse_requests();
+        assert_eq!(reverse_requests.len(), 1);
+        assert_eq!(reverse_requests[0].request_id(), &RequestId::Number(700));
+        assert_eq!(
+            reverse_requests[0].request().method,
+            "sampling/createMessage"
+        );
+        assert_eq!(executor.pending_records(), pending_before);
+        executor
+            .respond_to_reverse_request(&cx, &reverse_requests[0], serde_json::json!({"ok": true}))
+            .expect("legacy handler result is sent for its exact request ID");
+
+        let state = executor.state.borrow();
+        assert!(state.pending_reverse_requests.is_empty());
+        assert!(state.reverse_requests.is_empty());
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Response(response) = &state.transport.sent[1] else {
+            panic!("legacy handler result is a JSON-RPC response");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(700)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    fn reverse_request_capacity_includes_dequeued_live_owners() {
+        for release_one in [true, false] {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(
+                (0..=MAX_RETAINED_PEER_ACTIVITY)
+                    .map(|index| Ok(legacy_reverse_request(i64::try_from(index).unwrap()))),
+            ));
+            let mut owners = Vec::new();
+            for _ in 0..MAX_RETAINED_PEER_ACTIVITY {
+                executor.drive(&cx).expect("the admitted live owner fits");
+                owners.extend(executor.take_reverse_requests());
+            }
+            {
+                let state = executor.state.borrow();
+                assert!(state.reverse_requests.is_empty());
+                assert_eq!(
+                    state.pending_reverse_requests.len(),
+                    MAX_RETAINED_PEER_ACTIVITY
+                );
+            }
+            if release_one {
+                executor
+                    .respond_to_reverse_request(&cx, &owners[0], serde_json::json!({"ok": true}))
+                    .expect("responding releases one active slot");
+                executor
+                    .drive(&cx)
+                    .expect("exactly one replacement owner fits");
+                let replacement = executor.take_reverse_requests();
+                assert_eq!(replacement.len(), 1);
+                assert_eq!(
+                    executor.state.borrow().pending_reverse_requests.len(),
+                    MAX_RETAINED_PEER_ACTIVITY
+                );
+                assert!(!owners[1].cancellation().is_cancel_requested());
+            } else {
+                let error = executor
+                    .drive(&cx)
+                    .expect_err("dequeue alone must not permit another active reverse request");
+                assert_eq!(error.message, "Client reverse-request capacity is full");
+                let state = executor.state.borrow();
+                assert!(state.pending_reverse_requests.is_empty());
+                assert!(state.reverse_requests.is_empty());
+                assert!(state.transport.sent.is_empty());
+                assert!(
+                    owners
+                        .iter()
+                        .all(|owner| owner.cancellation().is_cancel_requested())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_request_drop_reclaims_capacity_and_cancels_only_the_last_clone() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(
+            (0..=MAX_RETAINED_PEER_ACTIVITY).map(|_| Ok(legacy_reverse_request(700))),
+        ));
+        for _ in 0..=MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .drive(&cx)
+                .expect("abandoned prior ownership is reclaimed");
+            let mut owners = executor.take_reverse_requests();
+            let owner = owners.pop().expect("one reverse owner was admitted");
+            let clone = owner.clone();
+            let cancellation = owner.cancellation().clone();
+            drop(owner);
+            assert!(!cancellation.is_cancel_requested());
+            executor
+                .poll_timeouts_at(&cx, Instant::now())
+                .expect("live clone remains owned during maintenance");
+            assert_eq!(executor.state.borrow().pending_reverse_requests.len(), 1);
+            drop(clone);
+            assert!(cancellation.is_cancel_requested());
+            executor
+                .poll_timeouts_at(&cx, Instant::now())
+                .expect("maintenance releases abandoned ownership");
+            assert!(executor.state.borrow().pending_reverse_requests.is_empty());
+        }
+        assert!(executor.state.borrow().transport.sent.is_empty());
+    }
+
+    #[test]
+    fn reverse_request_live_clone_prevents_same_id_replacement() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new([
+            Ok(legacy_reverse_request(700)),
+            Ok(legacy_reverse_request(700)),
+        ]));
+        executor.drive(&cx).unwrap();
+        let mut owners = executor.take_reverse_requests();
+        let owner = owners.pop().unwrap();
+        let clone = owner.clone();
+        drop(owner);
+        let error = executor
+            .drive(&cx)
+            .expect_err("one surviving clone still owns the first request incarnation");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(clone.cancellation().is_cancel_requested());
+        assert!(executor.state.borrow().transport.sent.is_empty());
+        assert!(
+            executor
+                .respond_to_reverse_request(&cx, &clone, serde_json::json!({"late": true}))
+                .is_err()
+        );
+        assert!(executor.state.borrow().transport.sent.is_empty());
+    }
+
+    #[test]
+    fn unit_clt_01_a_planted_negative() {
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let cx = Cx::for_testing();
+        let _first = executor
+            .execute(&cx, request(7))
+            .expect("baseline request commits");
+        let before = executor.pending_records();
+        let error = executor
+            .execute(&cx, request(7))
+            .expect_err("changing only the correlation ID to a duplicate must fail");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+        assert_eq!(executor.pending_records(), before);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        assert!(executor.take_notifications().is_empty());
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+    }
+
+    #[test]
+    fn executor_progress_preserves_exact_values_and_orders_mathematically() {
+        fn progress_frame(progress: &str) -> ReceivedTransportFrame {
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":4.2e1,"progress":{progress},"total":-7.30E-12,"message":"bounded progress"}}}}"#,
+            );
+            ReceivedTransportFrame::admit(source.into_bytes().into_boxed_slice())
+                .expect("the source frame admits exact bounded progress numbers")
+        }
+
+        let increasing = [
+            "-1e400",
+            "-1",
+            "-1e-400",
+            "-0.00e+4",
+            "1e-400",
+            "1.0000000000000000000001e-400",
+            "9007199254740992",
+            "9007199254740993",
+            "1e400",
+        ];
+        for external_ingress in [false, true] {
+            let frames = increasing.iter().map(|value| Ok(progress_frame(value)));
+            let executor = RequestExecutor::with_source_frame_receiver(
+                ScriptedTransport::with_source_frames(frames),
+                ResultPeerEra::Modern,
+                (!external_ingress).then_some(receive_scripted_source_frame),
+            );
+            let cx = Cx::for_testing();
+            let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+            let absolute = executor.pending_records()[0].absolute_deadline;
+            for value in increasing {
+                if external_ingress {
+                    executor
+                        .drive_frame(&cx, progress_frame(value))
+                        .expect("external ingress routes exact progress");
+                } else {
+                    executor
+                        .drive(&cx)
+                        .expect("self-owned ingress routes exact progress");
+                }
+                let stream = execution
+                    .take_stream_notifications()
+                    .expect("stream is live");
+                assert_eq!(
+                    stream.len(),
+                    1,
+                    "strictly increasing {value} must be delivered"
+                );
+                let params = stream[0].params.as_ref().expect("progress has parameters");
+                assert_eq!(params["progress"].as_number().unwrap().as_str(), value);
+                assert_eq!(params["total"].as_number().unwrap().as_str(), "-7.30E-12");
+                assert_eq!(
+                    params["progressToken"].as_number().unwrap().as_str(),
+                    "4.2e1"
+                );
+                assert_eq!(executor.pending_records()[0].absolute_deadline, absolute);
+            }
+            let before = executor.pending_records();
+            let repeated = progress_frame("10e399");
+            if external_ingress {
+                executor
+                    .drive_frame(&cx, repeated)
+                    .expect("equal value is ignored");
+            } else {
+                executor
+                    .state
+                    .borrow_mut()
+                    .transport
+                    .received_frames
+                    .push_back(Ok(repeated));
+                executor.drive(&cx).expect("equal value is ignored");
+            }
+            assert!(execution.take_stream_notifications().unwrap().is_empty());
+            assert_eq!(
+                executor.pending_records(),
+                before,
+                "equal values cannot reset idle"
+            );
+            assert_eq!(executor.take_notifications().len(), 1);
+        }
+    }
+
+    #[test]
+    fn executor_progress_token_owns_by_canonical_identity_not_spelling() {
+        fn progress_frame(token: &str) -> ReceivedTransportFrame {
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/progress","params":{{"progressToken":{token},"progress":1,"total":2,"message":"bounded progress"}}}}"#,
+            );
+            ReceivedTransportFrame::admit(source.into_bytes().into_boxed_slice())
+                .expect("the source frame admits an exact progress token")
+        }
+
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames(std::iter::empty()),
+            ResultPeerEra::Modern,
+            None,
+        );
+        let cx = Cx::for_testing();
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        let before = executor.pending_records();
+        // One digit away from 4.2e1, this spelling names 43: not the owner.
+        executor
+            .drive_frame(&cx, progress_frame("4.3e1"))
+            .expect("an unowned progress token is an ordinary notification");
+        assert!(execution.take_stream_notifications().unwrap().is_empty());
+        assert_eq!(executor.pending_records(), before);
+        assert_eq!(executor.take_notifications().len(), 1);
+        // Another spelling of 42 is the owner, and keeps its own lexeme.
+        executor
+            .drive_frame(&cx, progress_frame("420e-1"))
+            .expect("the canonical owner receives progress");
+        let stream = execution.take_stream_notifications().unwrap();
+        assert_eq!(stream.len(), 1);
+        let params = stream[0].params.as_ref().expect("progress has parameters");
+        assert_eq!(
+            params["progressToken"].as_number().unwrap().as_str(),
+            "420e-1"
+        );
+    }
+
+    #[test]
+    fn executor_progress_invalid_optional_fields_leave_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ProtocolEra::Modern2026,
+        );
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        let valid = serde_json::json!({
+            "progressToken": 42, "progress": 1, "total": 0,
+            "message": "progress may exceed total", "_meta": {}
+        });
+        for (member, invalid) in [
+            ("total", serde_json::json!("2")),
+            ("total", Value::Null),
+            ("message", serde_json::json!(2)),
+            ("message", Value::Null),
+            ("_meta", serde_json::json!([])),
+            ("_meta", Value::Null),
+            (
+                "total",
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    "1e10000".to_owned(),
+                )),
+            ),
+            (
+                "progress",
+                Value::Number(serde_json::Number::from_string_unchecked(
+                    "1e10000".to_owned(),
+                )),
+            ),
+        ] {
+            let before = executor.pending_records();
+            let mut invalid_params = valid.clone();
+            invalid_params[member] = invalid;
+            executor
+                .state
+                .borrow_mut()
+                .transport
+                .received
+                .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(invalid_params),
+                ))));
+            executor
+                .drive(&cx)
+                .expect("invalid progress is uncorrelated activity");
+            assert_eq!(
+                executor.pending_records(),
+                before,
+                "invalid {member} cannot reset timers"
+            );
+            assert!(execution.take_stream_notifications().unwrap().is_empty());
+            assert!(
+                executor
+                    .state
+                    .borrow()
+                    .pending
+                    .values()
+                    .next()
+                    .unwrap()
+                    .last_progress
+                    .is_none()
+            );
+            assert_eq!(executor.take_notifications().len(), 1);
+        }
+        executor
+            .state
+            .borrow_mut()
+            .transport
+            .received
+            .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(valid),
+            ))));
+        executor
+            .drive(&cx)
+            .expect("unchanged valid sibling is accepted");
+        assert_eq!(execution.take_stream_notifications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn executor_progress_queue_overflow_leaves_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor.execute(&cx, request(42)).expect("request commits");
+        for progress in 0..=MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .state
+                .borrow_mut()
+                .transport
+                .received
+                .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progressToken": 42, "progress": progress})),
+                ))));
+        }
+        for _ in 0..MAX_RETAINED_PEER_ACTIVITY {
+            executor
+                .drive(&cx)
+                .expect("a bounded stream slot remains available");
+        }
+        let before = executor.pending_records();
+        let prior = executor
+            .state
+            .borrow()
+            .pending
+            .values()
+            .next()
+            .unwrap()
+            .last_progress
+            .clone();
+        assert!(
+            executor.drive(&cx).is_err(),
+            "one additional event exceeds stream capacity"
+        );
+        assert_eq!(
+            executor.pending_records(),
+            before,
+            "a rejected event cannot reset idle"
+        );
+        assert_eq!(
+            executor
+                .state
+                .borrow()
+                .pending
+                .values()
+                .next()
+                .unwrap()
+                .last_progress,
+            prior
+        );
+        assert_eq!(
+            execution.take_stream_notifications().unwrap().len(),
+            MAX_RETAINED_PEER_ACTIVITY
+        );
+        executor
+            .state
+            .borrow_mut()
+            .transport
+            .received
+            .push_back(Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 42, "progress": MAX_RETAINED_PEER_ACTIVITY})),
+            ))));
+        executor
+            .drive(&cx)
+            .expect("the same rejected value is accepted after capacity returns");
+        assert_eq!(execution.take_stream_notifications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn executor_progress_tokens_reject_active_numeric_aliases_and_allow_terminal_reuse() {
+        fn with_marker(id: i64, marker: &str) -> JsonRpcRequest {
+            let mut request = request(id);
+            request.params.as_mut().unwrap()["_meta"]["progressToken"] =
+                Value::Number(serde_json::Number::from_string_unchecked(marker.to_owned()));
+            request
+        }
+
+        for (first, alias) in [
+            ("1", "1.0"),
+            ("1", "1e0"),
+            ("0", "-0.0e+4"),
+            ("0", "0e-9999"),
+            ("9007199254740993", "9007199254740993e0"),
+        ] {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+            let mut initial = executor
+                .execute(&cx, with_marker(41, first))
+                .expect("the first exact token owner commits");
+            let before = executor.pending_records();
+            let generation = executor.state.borrow().next_generation;
+            let error = executor
+                .execute(&cx, with_marker(42, alias))
+                .expect_err("a numeric alias cannot create a second live token owner");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(executor.pending_records(), before);
+            assert_eq!(executor.state.borrow().next_generation, generation);
+            assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+            executor
+                .cancel(&cx, &mut initial)
+                .expect("the exact first owner is retired");
+            let _successor = executor
+                .execute(&cx, with_marker(42, alias))
+                .expect("a retired progress token can serve another request ID");
+            assert_eq!(executor.pending_records().len(), 1);
+        }
+    }
+
+    #[test]
+    fn executor_wait_observes_timeout_before_receiving_sibling_frame() {
+        for source_ingress in [false, true] {
+            let sibling_response = response(42, serde_json::json!({"kind": "complete"}));
+            let transport = if source_ingress {
+                let source = serde_json::to_vec(&sibling_response).unwrap();
+                ScriptedTransport::with_source_frames([Ok(ReceivedTransportFrame::admit(
+                    source.into_boxed_slice(),
+                )
+                .unwrap())])
+            } else {
+                ScriptedTransport::new([Ok(sibling_response)])
+            };
+            let executor = RequestExecutor::with_source_frame_receiver(
+                transport,
+                ResultPeerEra::Legacy,
+                source_ingress.then_some(receive_scripted_source_frame),
+            );
+            let cx = Cx::for_testing();
+            let mut expired = executor.execute(&cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&cx, request(42)).unwrap();
+            let key = RequestId::Number(41).correlation_key().unwrap();
+            executor
+                .state
+                .borrow_mut()
+                .pending
+                .get_mut(&key)
+                .unwrap()
+                .record
+                .idle_deadline = Instant::now();
+
+            let error = executor
+                .wait(&cx, &mut expired)
+                .expect_err("idle timeout wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": "idle"}))
+            );
+            {
+                let state = executor.state.borrow();
+                assert_eq!(
+                    state.transport.received.len() + state.transport.received_frames.len(),
+                    1,
+                    "an expired waiter must not consume or block on a sibling's frame"
+                );
+            }
+            assert_eq!(executor.pending_records().len(), 1);
+            let result = executor
+                .wait(&cx, &mut sibling)
+                .expect("the sibling remains usable");
+            assert_eq!(result.id, Some(RequestId::Number(42)));
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(executor.take_uncorrelated_responses().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_drive_expires_owner_before_routing_late_response() {
+        struct DelayedTransport {
+            receive_after: Option<Instant>,
+            received: Option<Result<JsonRpcMessage, TransportError>>,
+            sent: Vec<JsonRpcMessage>,
+        }
+
+        impl Transport for DelayedTransport {
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.sent.push(message.clone());
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                if let Some(receive_after) = self.receive_after {
+                    std::thread::sleep(receive_after.saturating_duration_since(Instant::now()));
+                }
+                self.received.take().unwrap_or(Err(TransportError::Closed))
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        for (late, failed_read) in [(false, false), (true, false), (true, true)] {
+            let executor = RequestExecutor::new(DelayedTransport {
+                receive_after: None,
+                received: Some(if failed_read {
+                    Err(TransportError::Closed)
+                } else {
+                    Ok(response(42, serde_json::json!({"kind": "complete"})))
+                }),
+                sent: Vec::new(),
+            });
+            let cx = Cx::for_testing();
+            let policy = RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(2))
+                .expect("finite receive test policy");
+            let mut execution = executor
+                .execute_with_timeout_policy(&cx, request(42), policy)
+                .expect("request commits before the response-wait deadline");
+            if late {
+                let deadline = executor.pending_records()[0].idle_deadline;
+                executor.state.borrow_mut().transport.receive_after =
+                    Some(deadline + Duration::from_millis(1));
+            }
+            let drive_result = executor.drive(&cx);
+            assert_eq!(drive_result.is_err(), failed_read);
+            let outcome = executor.wait(&cx, &mut execution);
+            if late {
+                let error = outcome.expect_err("a post-deadline receive cannot replace timeout");
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert_eq!(
+                    error.data,
+                    Some(serde_json::json!({"timeoutSource": "idle"}))
+                );
+                assert_eq!(executor.take_cancellation_events().len(), 1);
+                assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+            } else {
+                assert_eq!(outcome.unwrap().id, Some(RequestId::Number(42)));
+                assert!(executor.take_cancellation_events().is_empty());
+                assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+            }
+            assert!(executor.pending_records().is_empty());
+            assert!(executor.take_uncorrelated_responses().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_wait_preserves_selected_timeout_when_control_send_fails() {
+        for caller_cancelled in [false, true] {
+            let cx = Cx::for_testing();
+            let connection_cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+            let mut execution = executor.execute(&cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+            if caller_cancelled {
+                cx.set_cancel_requested(true);
+            } else {
+                let key = RequestId::Number(41).correlation_key().unwrap();
+                executor
+                    .state
+                    .borrow_mut()
+                    .pending
+                    .get_mut(&key)
+                    .unwrap()
+                    .record
+                    .idle_deadline = Instant::now();
+            }
+            let error = executor
+                .wait(&cx, &mut execution)
+                .expect_err("local cancellation wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            if !caller_cancelled {
+                assert_eq!(
+                    error.data,
+                    Some(serde_json::json!({"timeoutSource": "idle"}))
+                );
+            }
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            if caller_cancelled {
+                assert_eq!(executor.pending_records().len(), 1);
+                executor
+                    .poll_timeouts_at(&connection_cx, Instant::now())
+                    .expect_err("the deferred control still exposes a real broken pipe");
+            }
+            assert_eq!(
+                executor
+                    .wait(&connection_cx, &mut sibling)
+                    .expect_err("the sibling receives connection loss")
+                    .code,
+                McpErrorCode::InternalError,
+            );
+            assert!(executor.pending_records().is_empty());
+            assert!(executor.terminal_records().is_empty());
+        }
+    }
+
+    #[test]
+    fn stopped_caller_cancellation_preserves_memory_transport_siblings() {
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for stopped in [
+            cancelled,
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(0)),
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_cost_quota(0)),
+            Cx::for_testing_with_budget(
+                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+            ),
+        ] {
+            let connection_cx = Cx::for_testing();
+            let (transport, mut peer) =
+                fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+            let executor = RequestExecutor::new(transport);
+            let mut cancelled = executor.execute(&connection_cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            for expected in [41, 42] {
+                let JsonRpcMessage::Request(received) = peer.recv(&connection_cx).unwrap() else {
+                    panic!("the two application requests reach the real peer");
+                };
+                assert_eq!(received.id, Some(RequestId::Number(expected)));
+            }
+            let error = executor.wait(&stopped, &mut cancelled).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(executor.pending_records().len(), 1);
+            assert!(executor.state.borrow().terminal_error.is_none());
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            executor
+                .poll_timeouts_at(&stopped, Instant::now())
+                .expect("a stopped service turn leaves cancellation queued");
+            assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            assert!(executor.state.borrow().terminal_error.is_none());
+
+            peer.send(
+                &connection_cx,
+                &response(41, serde_json::json!({"late": true})),
+            )
+            .unwrap();
+            peer.send(
+                &connection_cx,
+                &response(42, serde_json::json!({"sibling": true})),
+            )
+            .unwrap();
+            let received = executor
+                .wait(&connection_cx, &mut sibling)
+                .expect("live connection service flushes control and retains the sibling result");
+            assert_eq!(received.id, Some(RequestId::Number(42)));
+            assert!(executor.take_uncorrelated_responses().is_empty());
+            assert!(executor.state.borrow().deferred_cancellations.is_empty());
+            let next = executor.execute(&connection_cx, request(43)).unwrap();
+            let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap() else {
+                panic!("the deferred cancellation reaches the peer exactly once");
+            };
+            assert!(control.is_notification());
+            assert_eq!(control.method, "notifications/cancelled");
+            assert_eq!(control.params.as_ref().unwrap()["requestId"], 41);
+            let JsonRpcMessage::Request(application) = peer.recv(&connection_cx).unwrap() else {
+                panic!("the next application request follows the single cancellation");
+            };
+            assert_eq!(application.id, Some(RequestId::Number(43)));
+            assert_eq!(executor.take_cancellation_events().len(), 1);
+            assert!(stopped.checkpoint().is_err());
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn deferred_control_maintenance_exhaustion_preserves_sibling_ownership() {
+        for driver in ["execute", "drive", "wait"] {
+            let connection_cx = Cx::for_testing();
+            let executor = RequestExecutor::new(ScriptedTransport::new([Ok(response(
+                42,
+                serde_json::json!({"sibling": true}),
+            ))]));
+            let dropped = executor.execute(&connection_cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            let mut waiting =
+                (driver == "wait").then(|| executor.execute(&connection_cx, request(43)).unwrap());
+            drop(dropped);
+            let limited = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(1));
+            let result = match driver {
+                "execute" => executor.execute(&limited, request(43)).map(drop),
+                "drive" => executor.drive(&limited),
+                "wait" => executor
+                    .wait(&limited, waiting.as_mut().unwrap())
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                result
+                    .expect_err("control maintenance exhausts the local caller")
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            let expected_controls = if driver == "wait" { 2 } else { 1 };
+            let committed_requests = if driver == "wait" { 3 } else { 2 };
+            {
+                let state = executor.state.borrow();
+                assert!(state.terminal_error.is_none());
+                assert_eq!(state.transport.sent.len(), committed_requests);
+                assert_eq!(state.transport.received.len(), 1);
+                assert_eq!(state.pending.len(), 1);
+                assert_eq!(state.deferred_cancellations.len(), expected_controls);
+                assert!(
+                    state
+                        .pending
+                        .contains_key(&RequestId::Number(42).correlation_key().unwrap())
+                );
+            }
+
+            assert_eq!(
+                executor
+                    .wait(&connection_cx, &mut sibling)
+                    .expect("live connection service still completes the untouched sibling")
+                    .id,
+                Some(RequestId::Number(42))
+            );
+            let state = executor.state.borrow();
+            assert!(state.terminal_error.is_none());
+            assert!(state.pending.is_empty());
+            assert!(state.deferred_cancellations.is_empty());
+            assert_eq!(
+                state.transport.sent.len(),
+                committed_requests + expected_controls
+            );
+            assert!(state.transport.received.is_empty());
+        }
+    }
+
+    #[test]
+    fn finite_poll_budget_bounds_memory_transport_service_turns() {
+        for driver in ["execute", "drive", "wait"] {
+            for quota in [1, 16] {
+                let connection_cx = Cx::for_testing();
+                let (transport, mut peer) =
+                    fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+                let executor = RequestExecutor::new(transport);
+                let abandoned = executor.execute(&connection_cx, request(41)).unwrap();
+                let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+                let mut waiting = (driver == "wait")
+                    .then(|| executor.execute(&connection_cx, request(43)).unwrap());
+                for id in 41..=if waiting.is_some() { 43 } else { 42 } {
+                    let JsonRpcMessage::Request(received) = peer.recv(&connection_cx).unwrap()
+                    else {
+                        panic!("application request reaches the real peer");
+                    };
+                    assert_eq!(received.id, Some(RequestId::Number(id)));
+                }
+                drop(abandoned);
+                peer.send(
+                    &connection_cx,
+                    &response(42, serde_json::json!({"sibling": true})),
+                )
+                .unwrap();
+                if waiting.is_some() {
+                    peer.send(
+                        &connection_cx,
+                        &response(43, serde_json::json!({"waiting": true})),
+                    )
+                    .unwrap();
+                }
+                let caller =
+                    Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(quota));
+                let mut started = None;
+                let result = match driver {
+                    "execute" => executor.execute(&caller, request(43)).map(|execution| {
+                        started = Some(execution);
+                    }),
+                    "drive" => executor.drive(&caller),
+                    "wait" => executor
+                        .wait(&caller, waiting.as_mut().unwrap())
+                        .map(|response| {
+                            assert_eq!(response.id, Some(RequestId::Number(43)));
+                        }),
+                    _ => unreachable!(),
+                };
+                if quota == 1 {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    let state = executor.state.borrow();
+                    assert_eq!(state.pending.len(), 1);
+                    assert!(
+                        state
+                            .pending
+                            .contains_key(&RequestId::Number(42).correlation_key().unwrap())
+                    );
+                    assert_eq!(
+                        state.deferred_cancellations.len(),
+                        if driver == "wait" { 2 } else { 1 }
+                    );
+                } else {
+                    result.expect("changing only the quota admits the same real transport work");
+                    assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                }
+                assert!(executor.terminal_error().is_none());
+                assert!(!caller.is_cancel_requested());
+                assert_eq!(caller.budget().poll_quota, quota);
+                assert_eq!(
+                    executor.wait(&connection_cx, &mut sibling).unwrap().result,
+                    Some(serde_json::json!({"sibling": true}))
+                );
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap() else {
+                    panic!("the abandoned owner's cancellation reaches the real peer");
+                };
+                assert_eq!(control.method, "notifications/cancelled");
+                assert_eq!(control.params.unwrap()["requestId"], 41);
+                if quota == 1 && driver == "wait" {
+                    let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap()
+                    else {
+                        panic!("the cancelled wait has its own control");
+                    };
+                    assert_eq!(control.method, "notifications/cancelled");
+                    assert_eq!(control.params.unwrap()["requestId"], 43);
+                }
+                if let Some(mut execution) = started {
+                    let JsonRpcMessage::Request(application) = peer.recv(&connection_cx).unwrap()
+                    else {
+                        panic!("the admitted application follows maintenance");
+                    };
+                    assert_eq!(application.id, Some(RequestId::Number(43)));
+                    peer.send(
+                        &connection_cx,
+                        &response(43, serde_json::json!({"new": true})),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        executor.wait(&connection_cx, &mut execution).unwrap().id,
+                        Some(RequestId::Number(43))
+                    );
+                }
+                assert!(executor.pending_records().is_empty());
+                assert!(executor.terminal_error().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn finite_poll_budget_distinguishes_local_admission_from_runtime_masking() {
+        for quota in [1, 16] {
+            for cancelled in [false, true] {
+                let connection_cx = Cx::for_testing();
+                let (transport, mut peer) =
+                    fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+                let executor = RequestExecutor::new(transport);
+                let mut sibling = executor.execute(&connection_cx, request(41)).unwrap();
+                peer.recv(&connection_cx).unwrap();
+                let caller =
+                    Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(quota));
+                caller.set_cancel_requested(cancelled);
+
+                let result = caller.masked(|| executor.execute(&caller, request(42)));
+                if quota == 1 {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                } else {
+                    let mut admitted = result.expect("runtime cancellation is masked at admission");
+                    let JsonRpcMessage::Request(application) = peer.recv(&connection_cx).unwrap()
+                    else {
+                        panic!("the masked call with sufficient local budget reaches the peer");
+                    };
+                    assert_eq!(application.id, Some(RequestId::Number(42)));
+                    executor.cancel(&connection_cx, &mut admitted).unwrap();
+                    let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap()
+                    else {
+                        panic!("the admitted execution retains its cancellation owner");
+                    };
+                    assert_eq!(control.method, "notifications/cancelled");
+                    assert_eq!(control.params.unwrap()["requestId"], 42);
+                }
+                if cancelled {
+                    assert_eq!(
+                        executor.execute(&caller, request(44)).unwrap_err().code,
+                        McpErrorCode::RequestCancelled,
+                        "the same caller outside the runtime mask is refused"
+                    );
+                }
+                assert_eq!(caller.is_cancel_requested(), cancelled);
+                assert_eq!(caller.budget().poll_quota, quota);
+                assert_eq!(executor.pending_records().len(), 1);
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+
+                // A fresh request with live authority has a distinct ID from
+                // both refusals, so a stray refused write cannot impersonate it.
+                let mut next = executor.execute(&connection_cx, request(43)).unwrap();
+                let JsonRpcMessage::Request(application) = peer.recv(&connection_cx).unwrap()
+                else {
+                    panic!("only the newly admitted application reaches the peer");
+                };
+                assert_eq!(application.id, Some(RequestId::Number(43)));
+                peer.send(
+                    &connection_cx,
+                    &response(41, serde_json::json!({"sibling": true})),
+                )
+                .unwrap();
+                peer.send(&connection_cx, &response(43, serde_json::json!({})))
+                    .unwrap();
+                executor.wait(&connection_cx, &mut next).unwrap();
+                assert_eq!(
+                    executor.wait(&connection_cx, &mut sibling).unwrap().result,
+                    Some(serde_json::json!({"sibling": true}))
+                );
+                assert!(executor.pending_records().is_empty());
+                assert!(executor.terminal_error().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn finite_poll_budget_is_not_refilled_by_unrelated_peer_frames() {
+        for quota in [3, 16] {
+            let connection_cx = Cx::for_testing();
+            let (transport, mut peer) =
+                fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+            let executor = RequestExecutor::new(transport);
+            let mut waiting = executor.execute(&connection_cx, request(41)).unwrap();
+            let mut sibling = executor.execute(&connection_cx, request(42)).unwrap();
+            for _ in 0..2 {
+                peer.recv(&connection_cx).unwrap();
+            }
+            peer.send(
+                &connection_cx,
+                &response(42, serde_json::json!({"sibling": true})),
+            )
+            .unwrap();
+            peer.send(
+                &connection_cx,
+                &response(41, serde_json::json!({"waiting": true})),
+            )
+            .unwrap();
+            let caller =
+                Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(quota));
+            let result = executor.wait(&caller, &mut waiting);
+            if quota == 3 {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+            } else {
+                assert_eq!(
+                    result.unwrap().result,
+                    Some(serde_json::json!({"waiting": true}))
+                );
+            }
+            assert_eq!(
+                executor.wait(&connection_cx, &mut sibling).unwrap().result,
+                Some(serde_json::json!({"sibling": true}))
+            );
+            assert!(!caller.is_cancel_requested());
+            assert_eq!(caller.budget().poll_quota, quota);
+            assert!(executor.pending_records().is_empty());
+            assert!(executor.terminal_error().is_none());
+        }
+    }
+
+    #[test]
+    fn finite_poll_budget_preserves_deferred_control_order() {
+        let connection_cx = Cx::for_testing();
+        let (transport, mut peer) =
+            fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+        let executor = RequestExecutor::new(transport);
+        let mut owners = Vec::new();
+        for id in 41..=43 {
+            owners.push(executor.execute(&connection_cx, request(id)).unwrap());
+            peer.recv(&connection_cx).unwrap();
+        }
+        for owner in owners {
+            drop(owner);
+        }
+        // Two polls admit the first control. The last poll enters maintenance
+        // for the second control but must not rotate it behind the third.
+        let limited = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(3));
+        executor.poll_timeouts_at(&limited, Instant::now()).unwrap();
+        assert_eq!(executor.state.borrow().deferred_cancellations.len(), 2);
+        let JsonRpcMessage::Request(first) = peer.recv(&connection_cx).unwrap() else {
+            panic!("maintenance and write polls admit exactly the first queued control");
+        };
+        assert_eq!(first.method, "notifications/cancelled");
+        assert_eq!(first.params.unwrap()["requestId"], 41);
+        executor
+            .poll_timeouts_at(&connection_cx, Instant::now())
+            .unwrap();
+        for id in 42..=43 {
+            let JsonRpcMessage::Request(control) = peer.recv(&connection_cx).unwrap() else {
+                panic!("remaining controls keep their original order");
+            };
+            assert_eq!(control.method, "notifications/cancelled");
+            assert_eq!(control.params.unwrap()["requestId"], id);
+        }
+        assert!(executor.state.borrow().deferred_cancellations.is_empty());
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.terminal_error().is_none());
+        assert!(!limited.is_cancel_requested());
+        assert_eq!(limited.budget().poll_quota, 3);
+    }
+
+    #[test]
+    fn deferred_cancellation_is_flushed_before_expired_id_reuse() {
+        let connection_cx = Cx::for_testing();
+        let stopped = Cx::for_testing();
+        stopped.set_cancel_requested(true);
+        let mut executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        executor.tombstone_retention = Duration::ZERO;
+        let mut old = executor.execute(&connection_cx, request(41)).unwrap();
+        executor.cancel(&stopped, &mut old).unwrap();
+        executor.poll_timeouts_at(&stopped, Instant::now()).unwrap();
+        {
+            let state = executor.state.borrow();
+            assert!(state.tombstones.is_empty());
+            assert_eq!(state.deferred_cancellations.len(), 1);
+            assert_eq!(state.transport.sent.len(), 1);
+        }
+        let replacement = executor
+            .execute(
+                &connection_cx,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({"replacement": true})),
+                    RequestId::Integer("41e0".to_owned()),
+                ),
+            )
+            .expect("live service flushes the old control before reusing its canonical ID");
+        executor
+            .poll_timeouts_at(&connection_cx, Instant::now())
+            .unwrap();
+        let state = executor.state.borrow();
+        assert!(state.deferred_cancellations.is_empty());
+        assert_eq!(state.transport.sent.len(), 3);
+        let JsonRpcMessage::Request(control) = &state.transport.sent[1] else {
+            panic!("old control precedes replacement commit");
+        };
+        assert_eq!(control.method, "notifications/cancelled");
+        assert_eq!(control.params.as_ref().unwrap()["requestId"], 41);
+        let JsonRpcMessage::Request(application) = &state.transport.sent[2] else {
+            panic!("replacement commits only after the old control");
+        };
+        assert_eq!(application.id.as_ref(), Some(replacement.request_id()));
+        assert!(state.terminal_error.is_none());
+    }
+
+    #[test]
+    fn cancellation_racing_transport_send_remains_terminal_without_retry() {
+        struct CancellingTransport {
+            sent: Vec<JsonRpcMessage>,
+            control_attempts: usize,
+        }
+
+        impl Transport for CancellingTransport {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                if matches!(message, JsonRpcMessage::Request(request)
+                    if request.method == "notifications/cancelled")
+                {
+                    self.control_attempts += 1;
+                    cx.set_cancel_requested(true);
+                    return Err(TransportError::Cancelled);
+                }
+                self.sent.push(message.clone());
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                panic!("ambiguous cancellation-write failure must prevent further reads");
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(CancellingTransport {
+            sent: Vec::new(),
+            control_attempts: 0,
+        });
+        let mut cancelled = executor.execute(&cx, request(41)).unwrap();
+        let mut sibling = executor.execute(&cx, request(42)).unwrap();
+        executor
+            .cancel(&cx, &mut cancelled)
+            .expect_err("a generic transport error cannot prove that no control bytes committed");
+        let live = Cx::for_testing();
+        assert_eq!(
+            executor.wait(&live, &mut cancelled).unwrap_err().code,
+            McpErrorCode::RequestCancelled
+        );
+        assert!(executor.wait(&live, &mut sibling).is_err());
+        executor.poll_timeouts_at(&live, Instant::now()).unwrap();
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.control_attempts, 1);
+        assert_eq!(state.transport.sent.len(), 2);
+        assert!(state.deferred_cancellations.is_empty());
+        assert!(state.pending.is_empty());
+        assert!(state.terminal_error.is_some());
+    }
+
+    #[test]
+    fn executor_timeout_batch_elects_all_expired_owners_before_failed_control_send() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut idle = executor.execute(&cx, request(41)).unwrap();
+        let mut absolute = executor.execute(&cx, request(42)).unwrap();
+        let mut live = executor.execute(&cx, request(43)).unwrap();
+        let observed_at = Instant::now();
+        {
+            let mut state = executor.state.borrow_mut();
+            state
+                .pending
+                .get_mut(&RequestId::Number(41).correlation_key().unwrap())
+                .unwrap()
+                .record
+                .idle_deadline = observed_at;
+            let absolute_owner = state
+                .pending
+                .get_mut(&RequestId::Number(42).correlation_key().unwrap())
+                .unwrap();
+            absolute_owner.record.idle_deadline = observed_at;
+            absolute_owner.record.absolute_deadline = observed_at;
+            state.transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+        }
+        assert!(executor.poll_timeouts_at(&cx, observed_at).is_err());
+        {
+            let state = executor.state.borrow();
+            let idle_record = &state.terminal_records[&(idle.request_id.clone(), idle.generation)];
+            let absolute_record =
+                &state.terminal_records[&(absolute.request_id.clone(), absolute.generation)];
+            let live_record = &state.terminal_records[&(live.request_id.clone(), live.generation)];
+            assert_eq!(
+                idle_record.terminal_reason,
+                ExecutionTerminalReason::IdleTimeout
+            );
+            assert_eq!(
+                absolute_record.terminal_reason,
+                ExecutionTerminalReason::AbsoluteTimeout
+            );
+            assert_eq!(
+                live_record.terminal_reason,
+                ExecutionTerminalReason::ConnectionLost
+            );
+            assert_eq!(
+                idle_record.cancellation_transport_attempts
+                    + absolute_record.cancellation_transport_attempts,
+                1,
+                "only the first attempted control write fails, independent of owner iteration order"
+            );
+            assert_eq!(live_record.cancellation_transport_attempts, 0);
+        }
+        let events = executor.take_cancellation_events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.request_id == RequestId::Number(41)
+                && event.reason == ExecutionTerminalReason::IdleTimeout
+        }));
+        assert!(events.iter().any(|event| {
+            event.request_id == RequestId::Number(42)
+                && event.reason == ExecutionTerminalReason::AbsoluteTimeout
+        }));
+        for (execution, source) in [(&mut idle, "idle"), (&mut absolute, "absolute")] {
+            let error = executor
+                .wait(&cx, execution)
+                .expect_err("each elapsed deadline wins");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": source}))
+            );
+        }
+        assert_eq!(
+            executor
+                .wait(&cx, &mut live)
+                .expect_err("only the live sibling loses its connection")
+                .code,
+            McpErrorCode::InternalError,
+        );
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.terminal_records().is_empty());
+    }
+
+    #[test]
+    fn unit_clt_01_b_positive() {
+        assert_eq!(
+            clt_01_b_manifest_digest().as_bytes(),
+            &[
+                0x8f, 0xae, 0x58, 0xf3, 0x7a, 0xe8, 0x54, 0xb1, 0x89, 0xc7, 0x42, 0x9a, 0x75, 0xd8,
+                0xf7, 0x4b, 0x4b, 0x88, 0xda, 0x1e, 0x1d, 0xd7, 0xd5, 0x9a, 0x8d, 0x88, 0x0e, 0xd1,
+                0x97, 0xa5, 0x78, 0xc6,
+            ],
+        );
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new([
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                "sampling/createMessage",
+                Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+                700,
+            ))),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 42, "progress": 0.5})),
+            ))),
+            Ok(response(42, serde_json::json!({"kind": "complete"}))),
+        ]));
+        let mut execution = executor
+            .execute(&cx, request(42))
+            .expect("public executor commits the request");
+
+        executor.drive(&cx).expect("reverse request is retained");
+        let reverse = executor.take_reverse_requests();
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse[0].request_id(), &RequestId::Number(700));
+        executor
+            .respond_to_reverse_request(&cx, &reverse[0], serde_json::json!({"ok": true}))
+            .expect("reverse request receives a JSON-RPC result");
+
+        let idle_before_progress = executor.pending_records()[0].idle_deadline;
+        executor
+            .drive(&cx)
+            .expect("exact valid progress enters the request-owned stream");
+        let stream = execution
+            .take_stream_notifications()
+            .expect("live execution owns its stream");
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].method, "notifications/progress");
+        assert!(executor.pending_records()[0].idle_deadline >= idle_before_progress);
+        let final_response = executor
+            .wait(&cx, &mut execution)
+            .expect("stream notification precedes exact final response");
+        assert_eq!(final_response.id, Some(RequestId::Number(42)));
+
+        let explicit = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut explicitly_cancelled = explicit
+            .execute(&cx, request(43))
+            .expect("explicit-cancellation request commits");
+        let caller_cancelled = Cx::for_testing();
+        caller_cancelled.set_cancel_requested(true);
+        assert_eq!(
+            explicit
+                .wait(&caller_cancelled, &mut explicitly_cancelled)
+                .expect_err("caller cancellation selects and releases its exact waiter")
+                .code,
+            fastmcp_core::McpErrorCode::RequestCancelled,
+        );
+        assert_eq!(explicit.terminal_records().len(), 0);
+        assert_eq!(
+            explicit.take_cancellation_events(),
+            vec![CancellationRequested {
+                request_id: RequestId::Number(43),
+                reason: ExecutionTerminalReason::CallerCancelled,
+            }],
+        );
+
+        let timed = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let short = RequestTimeoutPolicy::new(Duration::from_millis(1), Duration::from_millis(2))
+            .expect("bounded timeout policy");
+        let mut idle_execution = timed
+            .execute_with_timeout_policy(&cx, request(44), short)
+            .expect("idle timeout request commits");
+        let idle_deadline = timed.pending_records()[0].idle_deadline;
+        timed
+            .poll_timeouts_at(&cx, idle_deadline)
+            .expect("idle deadline selects cancellation");
+        let idle_error = timed.wait(&cx, &mut idle_execution).unwrap_err();
+        assert_eq!(idle_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(idle_error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            idle_error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        assert_eq!(
+            timed.take_cancellation_events()[0].reason,
+            ExecutionTerminalReason::IdleTimeout,
+        );
+
+        let absolute = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let flood_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_millis(2))
+                .expect("bounded absolute timeout policy");
+        let mut absolute_execution = absolute
+            .execute_with_timeout_policy(&cx, request(45), flood_policy)
+            .expect("absolute timeout request commits");
+        let absolute_deadline = absolute.pending_records()[0].absolute_deadline;
+        absolute
+            .poll_timeouts_at(&cx, absolute_deadline)
+            .expect("absolute deadline cannot be reset by peer activity");
+        let absolute_error = absolute.wait(&cx, &mut absolute_execution).unwrap_err();
+        assert_eq!(absolute_error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            absolute_error.message,
+            "Request timed out at the absolute deadline"
+        );
+        assert_eq!(
+            absolute_error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert_eq!(
+            absolute.take_cancellation_events()[0].reason,
+            ExecutionTerminalReason::AbsoluteTimeout,
+        );
+
+        let subscription = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut subscribed = subscription
+            .execute(
+                &cx,
+                JsonRpcRequest::new(SUBSCRIPTIONS_LISTEN, Some(serde_json::json!({})), 46),
+            )
+            .expect("subscription-owned request commits");
+        subscription
+            .accept_subscription_teardown(&cx, &mut subscribed)
+            .expect("accepted teardown selects local cancellation");
+        assert!(subscription.wait(&cx, &mut subscribed).is_err());
+        assert_eq!(
+            subscription.take_cancellation_events()[0].reason,
+            ExecutionTerminalReason::PeerSubscriptionTeardown,
+        );
+
+        let mut pagination = OpaquePagination::new(PaginationBounds::default(), Instant::now());
+        assert!(
+            pagination
+                .accept_page(Some(String::new()), 0, 0, Instant::now())
+                .expect("empty opaque cursor remains present")
+        );
+        assert_eq!(pagination.next_cursor(), Some(""));
+        assert!(
+            pagination
+                .accept_page(Some(String::new()), 0, 0, Instant::now())
+                .expect("repeated opaque cursor remains present")
+        );
+        assert!(
+            !pagination
+                .accept_page(None, 0, 0, Instant::now())
+                .expect("only cursor absence completes pagination")
+        );
+
+        let shutdown = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut closing = shutdown
+            .execute(&cx, request(47))
+            .expect("shutdown-owned request commits");
+        shutdown
+            .shutdown(&cx)
+            .expect("bounded shutdown closes transport");
+        assert!(shutdown.wait(&cx, &mut closing).is_err());
+        assert_eq!(shutdown.terminal_records().len(), 0);
+    }
+
+    #[test]
+    fn unit_clt_01_b_planted_negative() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new([Ok(JsonRpcMessage::Request(
+            JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 101, "progress": 0.5})),
+            ),
+        ))]));
+        let mut execution = executor
+            .execute(&cx, request(100))
+            .expect("baseline request commits");
+        let before = executor.pending_records();
+        executor
+            .drive(&cx)
+            .expect("changing only the progress token leaves the owner untouched");
+        assert_eq!(executor.pending_records(), before);
+        assert!(
+            execution
+                .take_stream_notifications()
+                .expect("unrelated progress has no stream owner")
+                .is_empty()
+        );
+        assert_eq!(executor.take_notifications().len(), 1);
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
+    }
+
+    #[test]
+    fn request_executor_clone_preserves_raw_results_and_prompt_drop_cancellation() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let clone = executor.clone();
+        assert_eq!(clone.result_peer_era(), ResultPeerEra::Modern);
+
+        let mut completed = executor
+            .execute(&cx, request(80))
+            .expect("primary clone commits its request");
+        let dropped = clone
+            .execute(&cx, request(81))
+            .expect("secondary clone shares the same multiplexed core");
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let typed_result: Value = serde_json::from_str(raw_result).expect("raw result is JSON");
+        clone
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(80), typed_result),
+                Some(raw_result.to_owned()),
+            )
+            .expect("raw routing admits the completed owner's matching source");
+        let (_, preserved_raw_result) = executor
+            .wait_with_raw_result(&cx, &mut completed)
+            .expect("a response routed by one clone belongs to the exact owner");
+        assert_eq!(preserved_raw_result.as_deref(), Some(raw_result));
+
+        drop(dropped);
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(
+            executor.take_cancellation_events(),
+            vec![CancellationRequested {
+                request_id: RequestId::Number(81),
+                reason: ExecutionTerminalReason::CallerDropped,
+            }],
+        );
+
+        assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+        clone
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(81),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("the raw ingress drains cancellation before discarding the tombstoned final");
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.sent.len(), 3);
+        let JsonRpcMessage::Request(cancellation) = &state.transport.sent[2] else {
+            panic!("the dropped owner emits a cancellation notification");
+        };
+        assert_eq!(
+            cancellation
+                .params
+                .as_ref()
+                .and_then(|params| params.get("requestId")),
+            Some(&Value::from(81)),
+        );
+    }
+
+    #[test]
+    fn request_executor_raw_result_mismatch_rejects_only_its_owner() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut rejected = executor
+            .execute(&cx, request(82))
+            .expect("first owner commits");
+        let mut admitted = executor
+            .execute(&cx, request(83))
+            .expect("second owner commits");
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let admitted_result: Value = serde_json::from_str(raw_result).expect("raw result is JSON");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(82),
+                    serde_json::json!({"resultType":"complete","opaque":{"decimal":12001}}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("mismatched raw source is routed to its exact owner");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(RequestId::Number(83), admitted_result),
+                Some(raw_result.to_owned()),
+            )
+            .expect("matching raw source is routed to its exact owner");
+
+        assert_eq!(
+            executor
+                .wait_with_raw_result(&cx, &mut rejected)
+                .expect_err("changing only the typed result rejects its owner")
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+        let (_, preserved_raw_result) = executor
+            .wait_with_raw_result(&cx, &mut admitted)
+            .expect("the exact sibling result remains admitted");
+        assert_eq!(preserved_raw_result.as_deref(), Some(raw_result));
+        assert_eq!(
+            executor
+                .execute(&cx, request(82))
+                .expect_err("a peer-protocol terminal outcome also retires its canonical ID")
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+    }
+
+    #[test]
+    fn normal_drive_never_fabricates_a_raw_result_source() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let typed_result: Value = serde_json::from_str(raw_result).expect("raw result is JSON");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(84),
+                typed_result,
+            )))]),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(84))
+            .expect("normal transport request commits");
+
+        let (_, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("normal drive preserves the typed response for the waiter");
+        assert!(retained_source.is_none());
+    }
+
+    #[test]
+    fn drive_frame_preserves_the_exact_result_source_for_its_request_owner() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":84,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one complete source frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(84))
+            .expect("request commits before the source-preserving ingress frame");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the admitted frame completes only its exact request owner");
+
+        let (response, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("the request owner retains its admitted source result");
+        assert_eq!(response.id, Some(RequestId::Number(84)));
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn drive_frame_retains_a_listen_complete_source_instead_of_generic_complete_decode() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":2,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one listen terminal source frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut listen = executor
+            .execute(
+                &cx,
+                JsonRpcRequest::new(
+                    SUBSCRIPTIONS_LISTEN,
+                    Some(serde_json::json!({"notifications":{"toolsListChanged":true}})),
+                    2,
+                ),
+            )
+            .expect("listen request commits before its terminal frame");
+        executor
+            .drive_frame(&cx, frame)
+            .expect("a listen terminal is not forced through generic complete-result decoding");
+        let (response, retained_source) = executor
+            .try_take_response_with_raw_result(&mut listen)
+            .expect("typed listen surface can take the retained source")
+            .expect("the listen terminal is already routed");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn drive_frame_rejects_a_listen_complete_payload_on_an_ordinary_tools_call() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":2,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one listen-shaped complete frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut call = executor
+            .execute(&cx, request(2))
+            .expect("ordinary tools/call commits before the listen-shaped payload");
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the protocol failure is retained on the request owner");
+        let error = executor
+            .try_take_response_with_raw_result(&mut call)
+            .expect_err("changing only the method must reject a listen complete payload");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, "Peer final result failed protocol decoding");
+    }
+
+    #[test]
+    fn source_aware_executor_drive_retains_the_exact_result_source() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":7.30e-2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":84,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the selected-reader source frame is admitted");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(84))
+            .expect("source-aware request commits before its response is read");
+
+        let (_, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("the executor's one source-aware reader retains raw result spelling");
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn externally_driven_completion_makes_wait_observe_state_without_reading() {
+        let cx = Cx::for_testing();
+        let queued_self_reader_frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","id":999,"result":{"resultType":"complete"}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the unused self-reader frame is admitted");
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let externally_driven_frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":85,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the external completion frame is admitted");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(queued_self_reader_frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("owner commits before selected ingress dispatch");
+
+        executor
+            .drive_frame(&cx, externally_driven_frame)
+            .expect("the external sole reader completes its request owner");
+        let (_, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("wait consumes the already-routed outcome without another transport read");
+
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+    }
+
+    #[test]
+    fn externally_driven_ingress_rejects_a_forced_second_self_reader() {
+        let cx = Cx::for_testing();
+        let queued_self_reader_frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","id":86,"result":{"resultType":"complete"}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the competing self-reader frame is admitted");
+        let external_progress = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":86,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the external owner first claims ingress");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(queued_self_reader_frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(86))
+            .expect("request commits before the forced two-reader attempt");
+
+        executor
+            .drive_frame(&cx, external_progress)
+            .expect("external frame claims the sole ingress owner");
+        let error = executor
+            .drive(&cx)
+            .expect_err("a self-reader cannot consume a frame after external ingress is selected");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+        assert_eq!(
+            execution
+                .take_stream_notifications()
+                .expect("the external owner retains its progress")
+                .len(),
+            1
+        );
+        let error = executor
+            .wait(&cx, &mut execution)
+            .expect_err("a pending external execution must not make wait read transport");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+    }
+
+    #[test]
+    fn drive_frame_routes_matching_progress_to_its_request_owner() {
+        let cx = Cx::for_testing();
+        let frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":85,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("matching progress frame is admitted before routing");
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("matching-progress request commits");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("matching progress routes without a second reader");
+
+        let stream = execution
+            .take_stream_notifications()
+            .expect("live owner retains its matching progress");
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].method, "notifications/progress");
+        assert!(executor.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn drive_frame_wrong_progress_token_is_not_owned_by_the_adjacent_request() {
+        let cx = Cx::for_testing();
+        let frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":86,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("near-identical progress frame is admitted before routing");
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("only the request ID differs from the matching positive");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("foreign progress remains connection-level activity");
+
+        assert_eq!(executor.pending_records(), pending_before);
+        assert!(
+            execution
+                .take_stream_notifications()
+                .expect("foreign progress has no request owner")
+                .is_empty()
+        );
+        assert_eq!(executor.take_notifications().len(), 1);
+    }
+
+    #[test]
+    fn drive_frame_flushes_dropped_owner_cancellation_before_its_late_final() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete"}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":87,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("late final source is admitted before routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let dropped = executor
+            .execute(&cx, request(87))
+            .expect("owner commits before its request-owned handle drops");
+        drop(dropped);
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the sole ingress frame first drains the dropped owner's cancellation");
+
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+        assert_eq!(
+            executor.take_cancellation_events(),
+            vec![CancellationRequested {
+                request_id: RequestId::Number(87),
+                reason: ExecutionTerminalReason::CallerDropped,
+            }],
+        );
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Request(cancellation) = &state.transport.sent[1] else {
+            panic!("dropped execution emits one modern cancellation control");
+        };
+        assert_eq!(cancellation.method, "notifications/cancelled");
+    }
+
+    #[test]
+    fn completed_canonical_id_blocks_alias_reuse_until_tombstone_expiry() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut completed = executor
+            .execute(&cx, request(85))
+            .expect("baseline request commits");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Integer("85e0".to_owned()),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("a numeric response alias completes the baseline owner");
+
+        let alias = || {
+            JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"id": "same-canonical-id"})),
+                RequestId::Integer("85e0".to_owned()),
+            )
+        };
+        assert_eq!(
+            executor
+                .execute(&cx, alias())
+                .expect_err("an unconsumed terminal outcome retains its canonical ID")
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+        assert_eq!(
+            executor
+                .wait(&cx, &mut completed)
+                .expect("baseline owner consumes its exact final response")
+                .id,
+            Some(RequestId::Integer("85e0".to_owned())),
+        );
+        assert_eq!(
+            executor
+                .execute(&cx, alias())
+                .expect_err("consuming the terminal outcome cannot reopen its canonical ID")
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+
+        let key = RequestId::Number(85)
+            .correlation_key()
+            .expect("numeric test ID is canonical");
+        executor
+            .state
+            .borrow_mut()
+            .tombstones
+            .get_mut(&key)
+            .expect("normal terminal outcome retains a canonical tombstone")
+            .expires_at = Instant::now();
+        let mut replacement = executor
+            .execute(&cx, alias())
+            .expect("only tombstone expiry permits the canonical replacement");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(85),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("the post-expiry final belongs to the replacement owner");
+        assert_eq!(
+            executor
+                .wait(&cx, &mut replacement)
+                .expect("the canonical replacement receives its own final")
+                .id,
+            Some(RequestId::Number(85)),
+        );
+    }
+
+    #[test]
+    fn normal_terminal_late_duplicate_negative_cannot_complete_an_adjacent_owner() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut completed = executor
+            .execute(&cx, request(86))
+            .expect("baseline request commits");
+        let raw_result = r#"{"resultType":"complete"}"#;
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(86),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("baseline owner receives its terminal response");
+        executor
+            .wait(&cx, &mut completed)
+            .expect("baseline owner consumes its terminal response");
+        let mut adjacent = executor
+            .execute(&cx, request(87))
+            .expect("an unrelated owner remains admissible");
+        let pending_before_late_duplicate = executor.pending_records();
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(86),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("changing only the late final ID targets the retired owner");
+        assert_eq!(executor.pending_records(), pending_before_late_duplicate);
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(87),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("only the adjacent owner's final may complete it");
+        assert_eq!(
+            executor
+                .wait(&cx, &mut adjacent)
+                .expect("the late duplicate cannot poison the adjacent owner")
+                .id,
+            Some(RequestId::Number(87)),
+        );
+        let late_duplicates = executor.take_uncorrelated_responses();
+        assert_eq!(late_duplicates.len(), 1);
+        assert_eq!(late_duplicates[0].id, Some(RequestId::Number(86)));
+    }
+
+    #[test]
+    fn numeric_aliases_share_admission_response_and_tombstone_ownership() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut owner = executor
+            .execute(&cx, request(86))
+            .expect("baseline numeric owner commits");
+
+        let alias = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"id": "alias"})),
+            RequestId::Integer("86e0".to_owned()),
+        );
+        let error = executor
+            .execute(&cx, alias)
+            .expect_err("a numeric alias cannot create a second pending owner");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.pending_records().len(), 1);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Integer("86e0".to_owned()),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("a numeric response alias completes the original owner");
+        let response = executor
+            .wait(&cx, &mut owner)
+            .expect("the original owner receives its aliased final response");
+        assert_eq!(response.id, Some(RequestId::Integer("86e0".to_owned())));
+
+        let tombstoned = executor
+            .execute(&cx, request(87))
+            .expect("second owner commits before caller drop");
+        drop(tombstoned);
+        let alias = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"id": "tombstone-alias"})),
+            RequestId::Integer("87e0".to_owned()),
+        );
+        let error = executor
+            .execute(&cx, alias)
+            .expect_err("a numeric alias cannot reuse a tombstoned owner");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Integer("87e0".to_owned()),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("a numeric alias is discarded by its matching tombstone");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(87),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("a second late numeric alias remains owned by the tombstone");
+        let alias = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({"id": "tombstone-second-late-alias"})),
+            RequestId::Number(87),
+        );
+        let error = executor
+            .execute(&cx, alias)
+            .expect_err("a late response never consumes the tombstone before its expiry");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+    }
+
+    #[test]
+    fn numeric_alias_tombstone_expiry_allows_a_new_owner() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let dropped = executor
+            .execute(&cx, request(89))
+            .expect("baseline numeric owner commits before drop");
+        drop(dropped);
+        let key = RequestId::Number(89)
+            .correlation_key()
+            .expect("numeric test ID is canonical");
+        executor
+            .state
+            .borrow_mut()
+            .tombstones
+            .get_mut(&key)
+            .expect("dropped owner installs its tombstone")
+            .expires_at = Instant::now();
+
+        let mut replacement = executor
+            .execute(
+                &cx,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({"id": "replacement-alias"})),
+                    RequestId::Integer("89e0".to_owned()),
+                ),
+            )
+            .expect("changing only tombstone expiry permits the canonical replacement");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(89),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("the expired canonical tombstone no longer suppresses its replacement");
+        assert_eq!(
+            executor
+                .wait(&cx, &mut replacement)
+                .expect("the replacement owns the post-expiry final")
+                .id,
+            Some(RequestId::Number(89)),
+        );
+    }
+
+    #[test]
+    fn shutdown_propagates_deferred_drop_cancellation_send_failure() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let dropped = executor
+            .execute(&cx, request(88))
+            .expect("owner commits before its prompt drop");
+        drop(dropped);
+        executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+
+        let error = executor
+            .shutdown(&cx)
+            .expect_err("shutdown must expose deferred cancellation cleanup failure");
+        assert_ne!(error.code, McpErrorCode::RequestCancelled);
+        let state = executor.state.borrow();
+        assert!(state.shutdown);
+        assert!(state.terminal_error.is_some());
+        assert!(state.deferred_cancellations.is_empty());
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn shutdown_propagates_active_owner_cancellation_send_failure() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let active = executor
+            .execute(&cx, request(90))
+            .expect("owner commits before shutdown cancellation");
+        executor.state.borrow_mut().transport.send_error = Some(std::io::ErrorKind::BrokenPipe);
+
+        let error = executor
+            .shutdown(&cx)
+            .expect_err("shutdown must expose active-owner cancellation send failure");
+        assert_ne!(error.code, McpErrorCode::RequestCancelled);
+        let state = executor.state.borrow();
+        assert!(state.shutdown);
+        assert!(state.terminal_error.is_some());
+        assert!(state.pending.is_empty());
+        assert_eq!(state.terminal_records.len(), 1);
+        drop(state);
+        drop(active);
+        assert_eq!(executor.terminal_records().len(), 0);
+    }
+
+    #[test]
+    fn completed_terminal_state_is_released_on_consumption_but_correlation_retires_until_expiry() {
+        let cx = Cx::for_testing();
+        let mut executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        executor.max_correlations = 1;
+        let mut first = executor
+            .execute(&cx, request(91))
+            .expect("first owner fits the bounded retained-correlation budget");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(91),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("first owner receives its terminal result");
+        assert_eq!(executor.state.borrow().completed.len(), 1);
+        assert_eq!(executor.terminal_records().len(), 1);
+        assert_eq!(
+            executor
+                .execute(&cx, request(92))
+                .expect_err("an unconsumed completed result occupies the bounded budget")
+                .code,
+            McpErrorCode::InternalError,
+        );
+
+        executor
+            .wait(&cx, &mut first)
+            .expect("consuming the terminal result releases its retained state");
+        assert!(executor.state.borrow().completed.is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(
+            executor
+                .execute(&cx, request(92))
+                .expect_err("the retained tombstone occupies correlation capacity before expiry")
+                .code,
+            McpErrorCode::InternalError,
+        );
+        let first_key = RequestId::Number(91)
+            .correlation_key()
+            .expect("numeric test ID is canonical");
+        executor
+            .state
+            .borrow_mut()
+            .tombstones
+            .get_mut(&first_key)
+            .expect("normal terminal result retires its canonical correlation")
+            .expires_at = Instant::now();
+        let replacement = executor
+            .execute(&cx, request(92))
+            .expect("tombstone expiry releases capacity for the near-identical owner");
+        drop(replacement);
+    }
+
+    #[test]
+    fn completed_terminal_retention_is_released_on_handle_drop_and_expiry() {
+        let cx = Cx::for_testing();
+        let mut executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        executor.max_correlations = 1;
+        let completed = executor
+            .execute(&cx, request(93))
+            .expect("first owner fits the bounded retained-correlation budget");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(93),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("first owner receives its terminal result");
+        drop(completed);
+        assert!(executor.state.borrow().completed.is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        let completed_key = RequestId::Number(93)
+            .correlation_key()
+            .expect("numeric test ID is canonical");
+        executor
+            .state
+            .borrow_mut()
+            .tombstones
+            .get_mut(&completed_key)
+            .expect("dropping the completed handle preserves its response tombstone")
+            .expires_at = Instant::now();
+
+        let mut expired = executor
+            .execute(&cx, request(94))
+            .expect("the completed correlation releases capacity only after tombstone expiry");
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(94),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("sibling owner receives its terminal result");
+        let key = (RequestId::Number(94), expired.generation());
+        executor
+            .state
+            .borrow_mut()
+            .terminal_expirations
+            .insert(key, Instant::now());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(
+            executor
+                .wait(&cx, &mut expired)
+                .expect_err("changing only terminal retention to expired releases the outcome")
+                .code,
+            McpErrorCode::InternalError,
+        );
+        assert!(executor.state.borrow().completed.is_empty());
+    }
+
+    #[test]
+    fn raw_routing_expired_owner_negative_discards_final_after_lifecycle_gates() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut expired = executor
+            .execute(&cx, request(85))
+            .expect("request commits before raw ingress");
+        {
+            let mut state = executor.state.borrow_mut();
+            let pending = state
+                .pending
+                .get_mut(
+                    &RequestId::Number(85)
+                        .correlation_key()
+                        .expect("numeric test ID is a valid correlation key"),
+                )
+                .expect("request remains pending before the planted deadline");
+            pending.record.absolute_deadline = Instant::now();
+        }
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(85),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(r#"{"resultType":"complete"}"#.to_owned()),
+            )
+            .expect("raw ingress gates expiry before it considers the final response");
+
+        let error = executor
+            .wait(&cx, &mut expired)
+            .expect_err("changing only the lifetime to expired rejects the final");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(error.message, "Request timed out at the absolute deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "absolute"}))
+        );
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+    }
+
+    #[test]
+    fn raw_routing_late_dropped_response_negative_cannot_complete_adjacent_owner() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let dropped = executor
+            .execute(&cx, request(86))
+            .expect("first owner commits");
+        drop(dropped);
+        let mut adjacent = executor
+            .execute(&cx, request(87))
+            .expect("the next owner flushes the dropped owner's cancellation");
+        let raw_result = r#"{"resultType":"complete"}"#;
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(86),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("the tombstone consumes only its late raw final");
+        assert_eq!(executor.pending_records().len(), 1);
+        assert_eq!(
+            executor.pending_records()[0].request_id,
+            RequestId::Number(87)
+        );
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(87),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                Some(raw_result.to_owned()),
+            )
+            .expect("only the adjacent owner's exact raw final completes it");
+        let response = executor
+            .wait(&cx, &mut adjacent)
+            .expect("late dropped response must not poison the adjacent owner");
+        assert_eq!(response.id, Some(RequestId::Number(87)));
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+    }
+
+    #[test]
+    fn modern_executor_cancellation_omits_optional_final_metadata() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(47))
+            .expect("modern request commits before cancellation");
+
+        executor
+            .cancel(&cx, &mut execution)
+            .expect("final cancellation needs no synthesized metadata");
+
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Request(cancellation) = &state.transport.sent[1] else {
+            panic!("cancellation is a JSON-RPC notification");
+        };
+        assert!(cancellation.is_notification());
+        assert_eq!(cancellation.method, "notifications/cancelled");
+        let params = cancellation
+            .params
+            .as_ref()
+            .expect("final cancellation carries parameters");
+        assert_eq!(params.get("requestId"), Some(&serde_json::json!(47)));
+        assert!(params.get("_meta").is_none());
+        assert!(params.get("awaitCleanup").is_none());
+    }
+
+    #[test]
+    fn malformed_modern_peer_cancellation_leaves_owner_state_unchanged() {
+        let cx = Cx::for_testing();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({"reason": "missing request ID"})),
+            )))]),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(48))
+            .expect("baseline modern request commits");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive(&cx)
+            .expect("invalid peer cancellation is ignored without terminating the client");
+        assert_eq!(executor.pending_records(), pending_before);
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        executor
+            .cancel(&cx, &mut execution)
+            .expect("the still-live owner remains locally cancellable");
+    }
+
+    #[test]
+    fn unit_clt_01_final_result_stream_reverse_and_peer_cancellation_positive() {
+        let cx = Cx::for_testing();
+        let complete =
+            serde_json::from_str(r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#)
+                .expect("exact-number result is valid JSON");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    "sampling/createMessage",
+                    Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+                    700,
+                ))),
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progressToken": 42, "progress": 0.5})),
+                ))),
+                Ok(response(42, complete)),
+            ]),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(42))
+            .expect("request commits before peer traffic arrives");
+
+        executor
+            .drive(&cx)
+            .expect("modern legacy-shaped reverse request is rejected");
+        assert!(executor.take_reverse_requests().is_empty());
+        {
+            let state = executor.state.borrow();
+            let sent = &state.transport.sent;
+            assert_eq!(sent.len(), 2);
+            let JsonRpcMessage::Response(rejection) = &sent[1] else {
+                panic!("modern reverse request receives an error response");
+            };
+            assert_eq!(rejection.id, Some(RequestId::Number(700)));
+            assert_eq!(
+                rejection.error.as_ref().map(|error| error.code.clone()),
+                Some(i32::from(McpErrorCode::MethodNotFound).into())
+            );
+        }
+
+        let (decoded, diagnostic, stream) = executor
+            .wait_decoded_with_stream(&cx, &mut execution)
+            .expect("progress precedes a complete final result");
+        assert!(diagnostic.is_none());
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].method, "notifications/progress");
+        assert!(matches!(decoded, DecodedResult::Complete(_)));
+        let complete = match decoded {
+            DecodedResult::Complete(complete) => complete,
+            DecodedResult::InputRequired(_) | DecodedResult::Deferred(_) => return,
+        };
+        let opaque = complete
+            .extras
+            .members()
+            .iter()
+            .find(|member| member.name == "opaque")
+            .expect("unknown result member is retained inertly");
+        assert!(matches!(opaque.value, ExactJsonValue::Object(_)));
+        let opaque = match &opaque.value {
+            ExactJsonValue::Object(opaque) => opaque,
+            ExactJsonValue::Null
+            | ExactJsonValue::Bool(_)
+            | ExactJsonValue::String(_)
+            | ExactJsonValue::Number(_)
+            | ExactJsonValue::Array(_) => return,
+        };
+        assert_eq!(
+            opaque.get("decimal"),
+            Some(&ExactJsonValue::Number("1.20e+4".to_owned()))
+        );
+        assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+
+        let cancelled = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({"requestId": 43, "reason": "peer text"})),
+                ))),
+                Ok(response(43, serde_json::json!({}))),
+            ]),
+            ResultPeerEra::Modern,
+        );
+        let mut cancelled_execution = cancelled
+            .execute(&cx, request(43))
+            .expect("request commits before peer cancellation");
+        let pending_before = cancelled.pending_records();
+        cancelled
+            .drive(&cx)
+            .expect("server cancellation for a non-subscription is ignored");
+        assert_eq!(cancelled.pending_records(), pending_before);
+        cancelled
+            .wait(&cx, &mut cancelled_execution)
+            .expect("the ordinary request remains owned by its terminal response");
+        assert_eq!(cancelled.state.borrow().transport.sent.len(), 1);
+        assert_eq!(cancelled.take_cancellation_events().len(), 0);
+        assert!(cancelled.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn unit_clt_01_final_result_planted_negative_is_owner_scoped() {
+        let cx = Cx::for_testing();
+        let rejected = serde_json::from_str(r#"{"resultType":null,"opaque":{"decimal":1.20e+4}}"#)
+            .expect("planted negative remains structurally valid JSON");
+        let accepted =
+            serde_json::from_str(r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#)
+                .expect("near-identical positive remains valid JSON");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([Ok(response(60, rejected)), Ok(response(61, accepted))]),
+            ResultPeerEra::Modern,
+        );
+        let mut rejected_execution = executor
+            .execute(&cx, request(60))
+            .expect("first request commits");
+        let mut accepted_execution = executor
+            .execute(&cx, request(61))
+            .expect("second request commits");
+
+        assert_eq!(
+            executor
+                .wait_decoded(&cx, &mut rejected_execution)
+                .expect_err("only explicit null instead of complete is rejected")
+                .code,
+            McpErrorCode::InvalidRequest,
+        );
+        let (accepted, diagnostic) = executor
+            .wait_decoded(&cx, &mut accepted_execution)
+            .expect("the other owner remains eligible for its final result");
+        assert!(diagnostic.is_none());
+        assert!(matches!(accepted, DecodedResult::Complete(_)));
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_tool_call_preserves_completed_task_result_source() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"task","taskId":"task-escaped","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"structuredContent":{"z":1.20e+4,"message":"line\nquoted\" value"},"content":[]}}"#;
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute_task_tool_call(&cx, task_tool_call_request(72))
+            .expect("final tools/call commits before source-aware Task ingress");
+
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":72,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the complete Tasks JSON-RPC frame is admitted with exact result bytes");
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the executor routes the Tasks result from admitted raw frame source");
+        let created = executor
+            .wait_task_tool_call(&cx, &mut execution)
+            .expect("the public Tasks path decodes from the admitted source");
+        let Task::Completed { result, .. } = created.task else {
+            panic!("the completed Task branch must reach the public result");
+        };
+        let expected_nested_result =
+            r#"{"structuredContent":{"z":1.20e+4,"message":"line\nquoted\" value"},"content":[]}"#;
+        assert_eq!(
+            serde_json::to_string(&result).expect("completed Task result re-emits"),
+            expected_nested_result,
+            "escaped strings, member order, and numeric spelling survive the public Tasks path"
+        );
+    }
+
+    #[cfg(not(feature = "tasks"))]
+    #[test]
+    fn feature_off_executor_retains_final_raw_result_source_without_tasks_symbols() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","content":[],"isError":false,"opaque":{"z":1.20e+4}}"#;
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(73))
+            .expect("feature-off core request commits before frame ingress");
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":73,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("feature-off final JSON-RPC frame is admitted");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("feature-off executor routes an ordinary final result");
+        let (_response, result_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("feature-off raw result source remains available");
+        assert_eq!(result_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_lifecycle_positive() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").expect("bounded task id");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([
+                Ok(source_frame(response(
+                    72,
+                    serde_json::json!({
+                        "resultType": "task",
+                        "taskId": task_id,
+                        "status": "working",
+                        "createdAt": "2026-07-28T12:00:00.000Z",
+                        "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                        "ttlMs": null,
+                    }),
+                ))),
+                Ok(source_frame(tasks_subscription_acknowledgement(
+                    73, &task_id,
+                ))),
+                Ok(source_frame(tasks_status_notification(73, &task_id))),
+                Ok(source_frame(response(
+                    73,
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": 73},
+                    }),
+                ))),
+            ]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut task_execution = executor
+            .execute_task_tool_call(&cx, task_tool_call_request(72))
+            .expect("final tools/call commits before the peer creates its Task");
+        let created = executor
+            .wait_task_tool_call(&cx, &mut task_execution)
+            .expect("final tools/call returns the typed durable Task handle");
+        assert_eq!(created.task.base().task_id, task_id);
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .expect("final Tasks subscription commits after exact local admission");
+
+        let (accepted_filter, notifications) = executor
+            .wait_tasks_subscription(&cx, &mut subscription)
+            .expect("acknowledged exact Tasks stream terminates through its owner");
+        assert_eq!(
+            task_subscription_ids(&accepted_filter).expect("accepted filter remains typed"),
+            Some(vec![task_id.clone()]),
+        );
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].params.task.base().task_id, task_id);
+        assert!(executor.state.borrow().task_subscriptions.is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn stdio_task_subscription_activity_refreshes_only_idle_and_absolute_expiry_is_isolated() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").expect("bounded task ID");
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([
+                Ok(tasks_subscription_acknowledgement(73, &task_id)),
+                Ok(tasks_status_notification(73, &task_id)),
+            ]),
+            ProtocolEra::Modern2026,
+        );
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .expect("Tasks listener commits with subscription defaults");
+        let initial = executor.pending_records().remove(0);
+        assert_eq!(
+            initial
+                .absolute_deadline
+                .duration_since(initial.idle_deadline),
+            SubscriptionTimeoutPolicy::default().absolute_timeout()
+                - SubscriptionTimeoutPolicy::default().idle_timeout(),
+        );
+        assert!(initial.idle_deadline > Instant::now() + Duration::from_mins(4));
+
+        let mut sibling = executor
+            .execute_with_timeout_policy(
+                &cx,
+                request(74),
+                RequestTimeoutPolicy::from_application_timeout_ms(7_200_000).unwrap(),
+            )
+            .expect("independent ordinary request commits");
+        let key = RequestId::Number(73).correlation_key().unwrap();
+        for _ in 0..2 {
+            let near_idle = Instant::now() + Duration::from_secs(1);
+            executor
+                .state
+                .borrow_mut()
+                .pending
+                .get_mut(&key)
+                .unwrap()
+                .record
+                .idle_deadline = near_idle;
+            executor
+                .drive(&cx)
+                .expect("matching acknowledged activity is admitted");
+            let state = executor.state.borrow();
+            let pending = &state.pending[&key];
+            assert!(pending.record.idle_deadline > near_idle);
+            assert_eq!(pending.record.absolute_deadline, initial.absolute_deadline);
+        }
+        assert_eq!(
+            executor
+                .take_tasks_subscription_notifications(&subscription)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            executor
+                .tasks_subscription_acknowledgement(&subscription)
+                .unwrap()
+                .is_some()
+        );
+
+        executor
+            .poll_timeouts_at(&cx, initial.absolute_deadline)
+            .unwrap();
+        executor
+            .poll_timeouts_at(&cx, initial.absolute_deadline)
+            .unwrap();
+        let cancellation_events = executor.take_cancellation_events();
+        assert_eq!(cancellation_events.len(), 1);
+        assert_eq!(
+            cancellation_events[0].reason,
+            ExecutionTerminalReason::AbsoluteTimeout
+        );
+        assert_eq!(executor.pending_records().len(), 1);
+        assert_eq!(
+            executor.pending_records()[0].request_id,
+            RequestId::Number(74)
+        );
+        assert_eq!(executor.state.borrow().transport.sent.iter().filter(|message| {
+            matches!(message, JsonRpcMessage::Request(request) if request.method == "notifications/cancelled")
+        }).count(), 1);
+        assert!(executor.try_take_response(&mut subscription).is_err());
+
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(73),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(executor.take_uncorrelated_responses().is_empty());
+        executor
+            .route_response_with_raw_result(
+                &cx,
+                JsonRpcResponse::success(
+                    RequestId::Number(74),
+                    serde_json::json!({"resultType":"complete"}),
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(executor.try_take_response(&mut sibling).unwrap().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn stdio_task_subscription_foreign_activity_and_progress_do_not_extend_idle() {
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").unwrap();
+        let executor = RequestExecutor::with_protocol_era(
+            ScriptedTransport::new([
+                Ok(tasks_subscription_acknowledgement(73, &task_id)),
+                Ok(tasks_status_notification(74, &task_id)),
+                Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/progress",
+                    Some(serde_json::json!({"progressToken":73,"progress":1})),
+                ))),
+            ]),
+            ProtocolEra::Modern2026,
+        );
+        let mut request = tasks_subscription_request(73, &task_id);
+        request.params.as_mut().unwrap()["_meta"]["progressToken"] = serde_json::json!(73);
+        let mut subscription = executor.execute_tasks_subscription(&cx, request).unwrap();
+        executor.drive(&cx).unwrap();
+        let admitted = executor.pending_records();
+        executor.drive(&cx).unwrap();
+        assert_eq!(executor.pending_records(), admitted);
+        executor.drive(&cx).unwrap();
+        assert_eq!(executor.pending_records(), admitted);
+        executor
+            .poll_timeouts_at(&cx, admitted[0].idle_deadline)
+            .unwrap();
+        assert_eq!(
+            executor.take_cancellation_events()[0].reason,
+            ExecutionTerminalReason::IdleTimeout
+        );
+        assert!(executor.try_take_response(&mut subscription).is_err());
+    }
+
+    #[test]
+    fn subscription_policy_rejects_an_ordinary_request_before_sending() {
+        let cx = Cx::for_testing();
+        let executor =
+            RequestExecutor::with_protocol_era(ScriptedTransport::new([]), ProtocolEra::Modern2026);
+        assert!(
+            executor
+                .execute_subscription_with_timeout_policy(
+                    &cx,
+                    request(73),
+                    SubscriptionTimeoutPolicy::default(),
+                )
+                .is_err()
+        );
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.state.borrow().transport.sent.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_wrong_task_negative_unchanged_state() {
+        let cx = Cx::for_testing();
+        let requested_task = TaskId::parse("task-73").expect("bounded requested task id");
+        let foreign_task = TaskId::parse("task-74").expect("bounded foreign task id");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([
+                Ok(tasks_subscription_acknowledgement(73, &requested_task)),
+                Ok(tasks_status_notification(73, &foreign_task)),
+            ]),
+            ResultPeerEra::Modern,
+        );
+        let subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &requested_task))
+            .expect("baseline exact Tasks subscription commits");
+        executor
+            .drive(&cx)
+            .expect("baseline acknowledgement is admitted");
+        let before_pending = executor.pending_records();
+        let before_accepted = executor
+            .state
+            .borrow()
+            .task_subscriptions
+            .get(&(RequestId::Number(73), subscription.generation()))
+            .and_then(|subscription| subscription.accepted_filter.clone());
+        let before_accepted_snapshot =
+            serde_json::to_value(&before_accepted).expect("accepted filter snapshot serializes");
+
+        let error = executor
+            .drive(&cx)
+            .expect_err("changing only taskId to an unacknowledged task must reject the event");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.pending_records(), before_pending);
+        let after_accepted = executor
+            .state
+            .borrow()
+            .task_subscriptions
+            .get(&(RequestId::Number(73), subscription.generation()))
+            .and_then(|subscription| subscription.accepted_filter.clone());
+        assert_eq!(
+            serde_json::to_value(after_accepted).expect("accepted filter snapshot serializes"),
+            before_accepted_snapshot,
+        );
+        assert!(
+            executor
+                .take_tasks_subscription_notifications(&subscription)
+                .expect("rejected event leaves the listener queue unchanged")
+                .is_empty()
+        );
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
+        assert!(executor.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn cache_03_tolerates_missing_and_negative_cache_ttl_as_immediately_stale() {
+        let request = CoreRequest::Final(fastmcp_protocol::FinalCoreRequest::ToolsList(
+            fastmcp_protocol::FinalListParams {
+                meta: fastmcp_protocol::common_types::OpenMetadata::default(),
+                cursor: None,
+                include_tags: None,
+                exclude_tags: None,
+            },
+        ));
+
+        let (missing, missing_diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "cacheScope": "private",
+            }),
+            None,
+        )
+        .expect("a missing peer TTL is normalized to zero freshness");
+        assert_eq!(missing_diagnostic, Some(FinalCacheTtlDiagnostic::Missing));
+        assert!(matches!(
+            missing,
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. })
+                if result.payload.ttl_ms.try_as_millis() == Ok(0)
+                    && result.payload.ttl_ms.as_str() == "0"
+        ));
+
+        let (negative, negative_diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "ttlMs": -1.5,
+                "cacheScope": "private",
+            }),
+            None,
+        )
+        .expect("a negative peer TTL is normalized to zero freshness");
+        assert_eq!(negative_diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
+        assert!(matches!(
+            negative,
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. })
+                if result.payload.ttl_ms.try_as_millis() == Ok(0)
+                    && result.payload.ttl_ms.as_str() == "0"
+        ));
+
+        let exact_source = r#"{"resultType":"complete","tools":[],"zeta":{"second":2,"first":1},"ttlMs":-1,"cacheScope":"private","alpha":1.20e+4}"#;
+        let exact_value = serde_json::from_str(exact_source).expect("exact TTL source is JSON");
+        let (exact, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &exact_value,
+            Some(exact_source),
+        )
+        .expect("negative TTL compatibility retains every other source lexeme");
+        assert_eq!(diagnostic, Some(FinalCacheTtlDiagnostic::Negative));
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = exact else {
+            panic!("exact TTL source selects tools/list");
+        };
+        assert_eq!(result.payload.ttl_ms.as_str(), "0");
+        assert_eq!(
+            result
+                .payload
+                .ttl_ms
+                .try_as_millis()
+                .expect("normalized TTL fits the local duration domain"),
+            0
+        );
+        assert_eq!(
+            result
+                .extras
+                .members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zeta", "alpha"],
+        );
+        assert_eq!(
+            result.extras.members()[1].value,
+            fastmcp_protocol::ExactJsonValue::Number("1.20e+4".to_owned()),
+        );
+
+        assert!(
+            decode_core_result_with_cache_ttl_from_source(
+                &request,
+                &serde_json::json!({
+                    "resultType": "complete",
+                    "tools": [],
+                    "ttlMs": 1.5,
+                    "cacheScope": "private",
+                }),
+                None,
+            )
+            .is_err()
+        );
+    }
+}

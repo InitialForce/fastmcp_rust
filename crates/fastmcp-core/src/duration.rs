@@ -36,6 +36,9 @@ impl std::error::Error for ParseDurationError {}
 /// - Hours: "1h", "2h"
 /// - Combined: "1h30m", "2m30s", "1h30m45s"
 ///
+/// Whitespace may separate components or a number from its unit, but cannot
+/// split the digits of a number: "1h 30 m" is valid, while "1 0s" is not.
+///
 /// # Examples
 ///
 /// ```
@@ -43,10 +46,10 @@ impl std::error::Error for ParseDurationError {}
 /// use std::time::Duration;
 ///
 /// assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-/// assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_mins(5));
+/// assert_eq!(parse_duration("1h").unwrap(), Duration::from_hours(1));
 /// assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
-/// assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+/// assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_mins(90));
 /// ```
 pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
     let s = s.trim();
@@ -59,10 +62,17 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
 
     let mut total_millis: u64 = 0;
     let mut current_num = String::new();
+    let mut number_has_separator = false;
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c.is_ascii_digit() {
+            if number_has_separator {
+                return Err(ParseDurationError {
+                    input: s.to_string(),
+                    message: "whitespace cannot split the digits of a duration number".to_string(),
+                });
+            }
             current_num.push(c);
         } else if c.is_ascii_alphabetic() {
             if current_num.is_empty() {
@@ -96,19 +106,32 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
                 }
             };
 
-            let millis = match unit {
-                "ms" => num,
-                "s" => num * 1000,
-                "m" => num * 60 * 1000,
-                "h" => num * 60 * 60 * 1000,
+            let millis_per_unit = match unit {
+                "ms" => 1,
+                "s" => 1_000,
+                "m" => 60_000,
+                "h" => 3_600_000,
                 _ => unreachable!(),
             };
+            let millis = num
+                .checked_mul(millis_per_unit)
+                .ok_or_else(|| ParseDurationError {
+                    input: s.to_string(),
+                    message: format!("duration component overflows: {num}{unit}"),
+                })?;
 
-            total_millis = total_millis.saturating_add(millis);
+            total_millis = total_millis
+                .checked_add(millis)
+                .ok_or_else(|| ParseDurationError {
+                    input: s.to_string(),
+                    message: "combined duration overflows".to_string(),
+                })?;
             current_num.clear();
+            number_has_separator = false;
         } else if c.is_whitespace() {
-            // Allow whitespace between components
-            continue;
+            // Preserve legal component/number-unit spacing without joining
+            // two distinct numeric tokens into a different duration.
+            number_has_separator |= !current_num.is_empty();
         } else {
             return Err(ParseDurationError {
                 input: s.to_string(),
@@ -117,7 +140,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
         }
     }
 
-    // Handle trailing number without unit (treat as seconds for compatibility)
+    // Every component requires an explicit unit, including the last one.
     if !current_num.is_empty() {
         return Err(ParseDurationError {
             input: s.to_string(),
@@ -150,14 +173,14 @@ mod tests {
     fn test_parse_minutes() {
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
-        assert_eq!(parse_duration("90m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("90m").unwrap(), Duration::from_mins(90));
     }
 
     #[test]
     fn test_parse_hours() {
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
-        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_hours(24));
     }
 
     #[test]
@@ -173,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_parse_combined() {
-        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_mins(90));
         assert_eq!(parse_duration("2m30s").unwrap(), Duration::from_secs(150));
         assert_eq!(
             parse_duration("1h30m45s").unwrap(),
@@ -188,7 +211,65 @@ mod tests {
     #[test]
     fn test_parse_with_whitespace() {
         assert_eq!(parse_duration("  30s  ").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_mins(90));
+    }
+
+    #[test]
+    fn rejects_whitespace_inside_numeric_tokens() {
+        for separator in [" ", "\t", "\n", "\r\n", "\u{00a0}", "\u{2003}"] {
+            for (compact, split) in [
+                ("10s", format!("1{separator}0s")),
+                ("500ms", format!("5{separator}00ms")),
+                ("1h30m", format!("1h 3{separator}0m")),
+            ] {
+                assert!(parse_duration(compact).is_ok(), "{compact:?}");
+                let error = parse_duration(&split)
+                    .expect_err("a separator must not concatenate numeric tokens");
+                assert_eq!(error.input, split);
+                assert_eq!(
+                    error.message,
+                    "whitespace cannot split the digits of a duration number"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn number_unit_spacing_does_not_poison_later_components() {
+        for separator in [" ", "\t", "\n", "\u{00a0}", "\u{2003}"] {
+            let input = format!("1{separator}h{separator}30{separator}m500{separator}ms");
+            assert_eq!(
+                parse_duration(&input).expect("spacing around complete numeric tokens is legal"),
+                Duration::from_millis(5_400_500)
+            );
+        }
+    }
+
+    #[test]
+    fn spaced_components_still_require_units_and_checked_arithmetic() {
+        assert!(parse_duration("1h 30 ").is_err());
+        assert!(parse_duration("1h 0 s").is_ok());
+        assert!(parse_duration("0 s").is_err());
+        assert_eq!(
+            parse_duration("18446744073709551615 ms").unwrap(),
+            Duration::from_millis(u64::MAX)
+        );
+        assert!(parse_duration("18446744073709551615 ms 1 ms").is_err());
+        assert!(parse_duration("18446744073709551615 s").is_err());
+    }
+
+    #[test]
+    fn rejects_component_and_combined_overflow() {
+        let component = parse_duration("18446744073709551615s")
+            .expect_err("seconds-to-milliseconds conversion must be checked");
+        assert_eq!(
+            component.message,
+            "duration component overflows: 18446744073709551615s"
+        );
+
+        let combined = parse_duration("18446744073709551615ms1ms")
+            .expect_err("adding duration components must be checked");
+        assert_eq!(combined.message, "combined duration overflows");
     }
 
     #[test]
@@ -272,11 +353,15 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn saturating_add_overflow() {
-        // u64::MAX millis would overflow without saturating_add
-        let result = parse_duration(&format!("{}ms {}ms", u64::MAX, 1));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), Duration::from_millis(u64::MAX));
+    fn maximum_milliseconds_is_exact_and_one_more_is_rejected() {
+        assert_eq!(
+            parse_duration(&format!("{}ms", u64::MAX)).unwrap(),
+            Duration::from_millis(u64::MAX)
+        );
+
+        let err = parse_duration(&format!("{}ms 1ms", u64::MAX))
+            .expect_err("duration parsing must not silently saturate overflow");
+        assert_eq!(err.message, "combined duration overflows");
     }
 
     #[test]

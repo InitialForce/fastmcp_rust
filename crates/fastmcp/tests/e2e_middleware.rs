@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fastmcp_protocol::JsonRpcRequest;
+use fastmcp_protocol::{JsonRpcRequest, LegacyContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{McpContext, McpError, McpErrorCode, McpResult};
 
@@ -297,10 +297,64 @@ fn spawn_middleware_server(
     let server = build(builder);
 
     let handle = std::thread::spawn(move || {
-        set_echo_tool_calls(echo_calls);
-        let cx = Cx::for_testing();
-        server.run_transport_returning_with_cx(&cx, server_transport);
-        set_echo_tool_calls(None);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("middleware test reactor must initialize"),
+            )
+            .blocking_threads(2, 16)
+            .build()
+            .expect("middleware test runtime must initialize");
+        runtime
+            .block_on(async move {
+                let cx = Cx::current().expect("middleware runtime installs its caller Cx");
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                let mut pump = cx
+                    .spawn_blocking(move |pump_cx| {
+                        // The unsplit returning pump executes these handlers
+                        // on this thread, where their real call counter lives.
+                        set_echo_tool_calls(echo_calls);
+                        let result =
+                            server.run_transport_returning_with_cx(&pump_cx, server_transport);
+                        set_echo_tool_calls(None);
+                        let _ = sender.send(result);
+                    })
+                    .map_err(|error| McpError::internal_error(error.to_string()))?;
+                let deadline = cx.now().saturating_add_nanos(30_000_000_000);
+                loop {
+                    match receiver.try_recv() {
+                        Ok(result) => {
+                            // The channel preserves the server's result; join
+                            // also waits for the admitted task to become terminal.
+                            // Server shutdown can cancel its wrapper after the
+                            // result has already been sent.
+                            match pump.join(&cx).await {
+                                Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                                Err(error) => {
+                                    return Err(McpError::internal_error(error.to_string()));
+                                }
+                            }
+                            break result;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            break Err(McpError::internal_error(
+                                "middleware pump exited without a result",
+                            ));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            asupersync::time::timeout_at(
+                                deadline,
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)),
+                            )
+                            .await
+                            .map_err(|_| {
+                                McpError::internal_error("middleware test server timed out")
+                            })?;
+                        }
+                    }
+                }
+            })
+            .expect("middleware server loop");
     });
 
     (client_transport, handle)
@@ -315,9 +369,9 @@ fn take_events(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     out
 }
 
-fn first_text(contents: &[Content]) -> Option<String> {
+fn first_text(contents: &[LegacyContent]) -> Option<String> {
     contents.first().and_then(|c| match c {
-        Content::Text { text } => Some(text.clone()),
+        LegacyContent::Text { text, .. } => Some(text.clone()),
         _ => None,
     })
 }
@@ -346,7 +400,7 @@ fn middleware_ordering_success_request_in_order_response_in_reverse() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     trace.log_with_data(
         TraceLevel::Info,
@@ -408,7 +462,7 @@ fn middleware_short_circuit_still_runs_entered_response_stack() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     assert!(init_res.is_ok());
 
@@ -474,7 +528,7 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
             .build()
     });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     let init_res = client.initialize();
     assert!(init_res.is_ok());
 
@@ -484,8 +538,14 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
     // Clear so we only capture the failing request.
     let _ = take_events(&events);
 
-    // Send invalid params to force an actual dispatch error (not an "isError" tool result).
-    let err = client.send_request_json("tools/call", json!({}));
+    // Use a structurally valid call that fails during routing. A malformed
+    // payload is rejected by typed admission before extension middleware,
+    // while an unknown tool reaches the entered middleware stack and produces
+    // an actual dispatch error (not an `isError` tool result).
+    let err = client.send_request_json(
+        "tools/call",
+        json!({"name": "missing-tool", "arguments": {}}),
+    );
     assert!(err.is_err());
     let (err_code, err_message) = match err {
         Ok(_) => (None, None),
@@ -520,7 +580,7 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
 
     assert!(
         err_code.is_some() && err_message.is_some(),
-        "expected error from invalid tools/call params"
+        "expected routing error from unknown tools/call target"
     );
     let Some(message) = err_message else {
         return;
@@ -545,7 +605,7 @@ fn middleware_response_transformation_is_observable_in_client() {
                 .build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let res = client.call_tool("echo", json!({"message": "hello"}));
@@ -580,14 +640,16 @@ fn caching_middleware_caches_tools_call_until_ttl_expires() {
 
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let caching = ResponseCachingMiddleware::new().call_ttl_secs(1);
+    let caching = ResponseCachingMiddleware::new()
+        .call_ttl_secs(1)
+        .include_tools(vec!["echo".to_string()]);
 
     let (transport, server_handle) =
         spawn_middleware_server("mw-caching", Some(Arc::clone(&calls)), |builder| {
             builder.middleware(caching).tool(EchoTool).build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let res1 = client.call_tool("echo", json!({"message": "a"}));
@@ -666,7 +728,7 @@ fn rate_limiting_middleware_blocks_second_tool_call_deterministically() {
             builder.middleware(limiter).tool(EchoTool).build()
         });
 
-    let mut client = TestClient::new(transport);
+    let mut client = TestClient::new(transport, Cx::for_testing());
     assert!(client.initialize().is_ok());
 
     let ok = client.call_tool("echo", json!({"message": "x"}));

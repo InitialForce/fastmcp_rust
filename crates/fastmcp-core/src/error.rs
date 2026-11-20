@@ -126,11 +126,8 @@ impl McpError {
 
     /// Creates a method not found error.
     #[must_use]
-    pub fn method_not_found(method: &str) -> Self {
-        Self::new(
-            McpErrorCode::MethodNotFound,
-            format!("Method not found: {method}"),
-        )
+    pub fn method_not_found(_method: &str) -> Self {
+        Self::new(McpErrorCode::MethodNotFound, "Method not found")
     }
 
     /// Creates an invalid params error.
@@ -139,13 +136,32 @@ impl McpError {
         Self::new(McpErrorCode::InvalidParams, message)
     }
 
-    /// Creates an internal error.
+    /// Creates an internal error, which is **opaque and terminal**.
+    ///
+    /// Returned from a tool handler, this is reported to the peer as a
+    /// JSON-RPC *protocol* error carrying a fixed message and an incident
+    /// id, never as a tool result: the handler's own message is redacted
+    /// before it leaves the process. The framework raises the same code for
+    /// its own terminal conditions (the nested-call depth limit, for
+    /// example), and an intermediate handler cannot convert one into a
+    /// successful or in-band result.
+    ///
+    /// A tool whose *execution* failed in a way the model should see wants
+    /// [`Self::tool_error`] instead. Choosing this constructor for an
+    /// ordinary execution failure hides the reason from the model and fails
+    /// the official `tools-call-error` conformance check.
     #[must_use]
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(McpErrorCode::InternalError, message)
     }
 
-    /// Creates a tool execution error.
+    /// Creates a tool execution error, which is reported **in band**.
+    ///
+    /// This is the constructor for a tool that ran and failed. Both MCP eras
+    /// report tool execution failures inside the tool result (`isError:
+    /// true`) so the model can read the reason and retry, rather than as a
+    /// JSON-RPC protocol error. Prefer it over [`Self::internal_error`] for
+    /// anything the caller is meant to understand.
     #[must_use]
     pub fn tool_error(message: impl Into<String>) -> Self {
         Self::new(McpErrorCode::ToolExecutionError, message)
@@ -163,7 +179,7 @@ impl McpError {
     /// Creates a request cancelled error.
     #[must_use]
     pub fn request_cancelled() -> Self {
-        Self::new(McpErrorCode::RequestCancelled, "Request was cancelled")
+        Self::new(McpErrorCode::RequestCancelled, "Request cancelled")
     }
 
     /// Returns a masked version of this error for client responses.
@@ -302,10 +318,7 @@ impl<T> OutcomeExt<T> for Outcome<T, McpError> {
             Outcome::Ok(v) => Ok(v),
             Outcome::Err(e) => Err(e),
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-            Outcome::Panicked(payload) => Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                payload.message()
-            ))),
+            Outcome::Panicked(_payload) => Err(McpError::internal_error("Internal server error")),
         }
     }
 
@@ -431,7 +444,7 @@ mod tests {
     fn test_error_display() {
         let err = McpError::method_not_found("tools/call");
         assert!(err.to_string().contains("-32601"));
-        assert!(err.to_string().contains("tools/call"));
+        assert!(!err.to_string().contains("tools/call"));
     }
 
     #[test]
@@ -489,7 +502,8 @@ mod tests {
         let err = McpError::method_not_found("test");
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("-32601"));
-        assert!(json.contains("Method not found: test"));
+        assert!(json.contains("Method not found"));
+        assert!(!json.contains("test"));
     }
 
     // ========================================
@@ -520,10 +534,15 @@ mod tests {
 
     #[test]
     fn test_outcome_into_mcp_result_panicked() {
-        let outcome: Outcome<i32, McpError> = Outcome::Panicked(PanicPayload::new("test panic"));
+        let outcome: Outcome<i32, McpError> = Outcome::Panicked(PanicPayload::new(
+            "PANIC_SECRET_CANARY Bearer should-not-cross-boundary",
+        ));
         let result = outcome.into_mcp_result();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, McpErrorCode::InternalError);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "Internal server error");
+        assert!(!error.message.contains("PANIC_SECRET_CANARY"));
     }
 
     #[test]
@@ -583,7 +602,7 @@ mod tests {
 
         let method = McpError::method_not_found("unknown");
         let masked = method.masked(true);
-        assert!(masked.message.contains("unknown"));
+        assert_eq!(masked.message, "Method not found");
 
         let params = McpError::invalid_params("missing field");
         let masked = params.masked(true);
@@ -668,7 +687,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>("{{bad json").unwrap_err();
         let mcp_err: McpError = serde_err.into();
         assert_eq!(mcp_err.code, McpErrorCode::ParseError);
-        assert!(!mcp_err.message.is_empty());
+        assert_ne!(mcp_err.message, "");
     }
 
     #[test]

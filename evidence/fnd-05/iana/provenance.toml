@@ -1,0 +1,148 @@
+# FND-05 B — pinned IANA special-purpose address registry snapshot.
+#
+# WHY THIS EXISTS. The guarded-fetch destination classifier
+# (is_public_guarded_ipv4 / is_public_guarded_ipv6 in
+# crates/fastmcp-transport/src/http.rs) decides which resolved addresses the
+# fetcher may connect to. That decision is a frozen judgement about content a
+# THIRD PARTY mutates: IANA designates new special-purpose ranges over time.
+#
+# The failure direction is what makes this a security control rather than a
+# completeness one. It FAILS OPEN. A newly designated special-purpose range that
+# the classifier does not know about is classified public, admitted by the
+# fence, and connected to — with no error, no diagnostic and no failing test.
+# A frozen deny-list cannot announce when it has stopped being correct.
+#
+# This pin plus its gate make that silence impossible: any change to either the
+# registry or the classifier fails a test.
+#
+# NO NETWORK AT BUILD, TEST OR RUNTIME. These files are checked in. Nothing in
+# the shipped artifact ever contacts IANA to decide whether an address is
+# special-purpose. An address fence that silently re-sources itself from the
+# internet would be worse than one that is stale and says so.
+
+[snapshot]
+retrieved_at = "2026-09-17T16:42:22Z"
+retrieved_by = "ProudValley (authoring-time fetch, orchestrator-authorized 2026-09-17)"
+user_agent = "OpenAI File Downloader, XaiImageApiFetch/1.0"  # AGENTS.md:1016
+transport = "https, HTTP 200, curl"
+
+[[registry]]
+family = "ipv4"
+path = "evidence/fnd-05/iana/iana-ipv4-special-registry.xml"
+source_url = "https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xml"
+# IANA's OWN revision marker, taken from the <updated> element of the document.
+# This is what distinguishes a STALE snapshot from a TAMPERED one: staleness
+# moves this date, tampering moves the digest while leaving it unchanged.
+registry_updated = "2025-10-09"
+registry_id = "iana-ipv4-special-registry"
+byte_length = 13459
+sha256 = "cf24e11f41b7d42c68debe2d18b97cac815084ec413ebb3b244f704028a16f20"
+record_count = 25
+
+[[registry]]
+family = "ipv6"
+path = "evidence/fnd-05/iana/iana-ipv6-special-registry.xml"
+source_url = "https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xml"
+registry_updated = "2025-10-09"
+registry_id = "iana-ipv6-special-registry"
+byte_length = 13431
+sha256 = "c17f4380ba84fb2160dae82ebfd8bd155a5853cfab624ed3a9fd251638a8be02"
+record_count = 25
+
+[classifier_comparison]
+# Recorded at pin time. The discriminator is IANA's own `global` (globally
+# reachable) flag, NOT mere presence in the registry: a special-purpose prefix
+# that IS globally reachable (anycast services such as PCP, TURN, AS112, AMT)
+# is legitimately admitted by a fetch fence, while one that is NOT globally
+# reachable is precisely what the fence exists to refuse.
+method = "drive the FIRST and LAST address of every global=False prefix (by the <global> leading token, 33 prefixes / 66 probes) through the SHIPPED fence via GuardedHttpFetcher::with_resolver, offline, per crates/fastmcp-transport/tests/fnd_05_iana_fence_sweep.rs (bd-fnd-05-implementation-b-ysez bar Y4); the global=True prefixes the fence denies must equal the declared_over_denial set below"
+ipv4_unreachable_prefixes_admitted = 0
+ipv6_unreachable_prefixes_admitted = 0
+# Fail-closed over-denials: globally REACHABLE prefixes the classifier refuses
+# anyway. Harmless for a guarded fetcher. Each is declared below, and the sweep
+# fails if the denied set and the declared set ever differ.
+ipv4_reachable_prefixes_denied = 2  # 192.0.0.9/32 PCP Anycast, 192.0.0.10/32 TURN Anycast
+ipv6_reachable_prefixes_denied = 8  # 64:ff9b::/96 NAT64, and seven 2001::/23 sub-allocations
+
+[[declared_over_denial]]
+# FAIL-CLOSED OVER-DENIALS, DECLARED RATHER THAN HIDDEN.
+#
+# Each entry is a prefix IANA marks globally REACHABLE (global=True) that the
+# shipped classifier nevertheless denies. They are harmless to a guarded
+# fetcher, but a fence that refuses more than its policy states must say so.
+# fnd_05_iana_fence_sweep.rs requires the denied global=True set to equal this
+# set EXACTLY: an undeclared denial and a declared prefix that is admitted are
+# both red.
+#
+# Do NOT add an entry here to silence a failing sweep without a ruling. A new
+# over-denial is a behaviour change to a security classifier, and it is
+# reviewed like one.
+family = "ipv4"
+prefix = "192.0.0.9/32"
+name = "Port Control Protocol Anycast"
+reason = "the coarse (192, 0, _) arm of is_public_guarded_ipv4 denies all of 192.0.0.0/24, which contains this global=True anycast address"
+
+[[declared_over_denial]]
+family = "ipv4"
+prefix = "192.0.0.10/32"
+name = "Traversal Using Relays around NAT Anycast"
+reason = "the coarse (192, 0, _) arm of is_public_guarded_ipv4 denies all of 192.0.0.0/24, which contains this global=True anycast address"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "64:ff9b::/96"
+name = "IPv4-IPv6 Translat."
+reason = "the FND-05 package body requires the NAT64 well-known prefix to be DENIED rather than reinterpreted; this pre-existing over-denial was recorded nowhere until bd-fnd-05-implementation-b-ysez"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:1::1/128"
+name = "Port Control Protocol Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:1::2/128"
+name = "Traversal Using Relays around NAT Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:1::3/128"
+name = "DNS-SD Service Registration Protocol Anycast"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:3::/32"
+name = "AMT"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:4:112::/48"
+name = "AS112-v6"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:20::/28"
+name = "ORCHIDv2"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[[declared_over_denial]]
+family = "ipv6"
+prefix = "2001:30::/28"
+name = "Drone Remote ID Protocol Entity Tags (DETs) Prefix"
+reason = "WAVE16 rulings #23 option (b): 2001::/23 (global=False) is denied whole, fail-closed, which also denies this global=True sub-allocation; reversible by a reviewed narrowing"
+
+[refresh_procedure]
+# MANUAL AND HUMAN-DECIDED, never automated. RCH cannot fetch during a build and
+# this repository forbids network dependencies, so an auto-refresh is both
+# impossible and undesirable.
+step_1 = "fetch both source_url values with the AGENTS.md user agent"
+step_2 = "READ the retrieved documents; confirm registry_id, title and <updated> are present and the record counts are plausible"
+step_3 = "diff against the vendored copies and REVIEW every added, removed or changed record on its merits"
+step_4 = "update byte_length, sha256, registry_updated, record_count and retrieved_at here in the same change"
+step_5 = "re-run the comparison; any newly admitted globally-unreachable prefix is a FINDING to be reported, never an entry to add to known_uncloseable_gap"
+prohibition = "never refresh this snapshot to clear a failing gate (RH-3). A gate that goes red because the registry changed is the gate working; the correct response is to review the change and, where needed, close the classifier gap."

@@ -25,6 +25,13 @@
 //! - `endpoint`: Contains the URL for client POST requests
 //! - `message`: Contains a JSON-RPC message (request or response)
 //!
+//! # Size limits
+//!
+//! SSE wire lines are limited to 64 KiB. Because a message data line also
+//! contains the `data: ` prefix and newline delimiter, JSON-RPC message data
+//! is limited to 65,529 bytes. Both [`SseWriter`] and [`SseReader`] enforce
+//! that same effective message ceiling before codec admission.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -42,12 +49,14 @@
 //! writer.write_response(&response)?;
 //! ```
 //!
-//! # Cancel-Safety
+//! # Cancellation checks
 //!
-//! This module integrates with asupersync's capability context:
-//! - Writers check `cx.is_cancel_requested()` before I/O operations
-//! - Readers properly handle partial event data
-//! - All operations respect budget constraints
+//! Readers and writers checkpoint the caller's cancellation, deadline and
+//! execution budget before I/O and between partial operations. A budget refusal
+//! before progress is retryable; abandoning a partially consumed or written
+//! frame makes that stream terminal to prevent frame splicing. Caller-provided
+//! synchronous `Read`, `Write`, flush, iterator and POST implementations are
+//! not made interruptible once a call has entered them.
 //!
 //! # Integration Note
 //!
@@ -55,12 +64,450 @@
 //! You'll need to integrate with an HTTP server framework that works with
 //! asupersync (or use the provided adapters if available).
 
+#[cfg(feature = "legacy-2024-11-05")]
 use std::io::{BufReader, Read, Write};
 
+#[cfg(feature = "legacy-2024-11-05")]
 use asupersync::Cx;
+#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
-use crate::{Codec, CodecError, Transport, TransportError};
+#[cfg(feature = "legacy-2024-11-05")]
+use crate::{Codec, Transport, TransportRecvHalf, TransportSendHalf};
+use crate::{CodecError, TransportError};
+
+/// Observes the caller's budget, mapping an exhausted one to a typed refusal.
+///
+/// Mirrors `stdio_checkpoint` and `http_checkpoint` exactly, and is deliberately
+/// STRONGER than this module's older `cx.is_cancel_requested()` guard: that bit
+/// detects explicit cancellation only, so a caller whose DEADLINE has already
+/// expired passes it and proceeds into blocking I/O. `Cx::checkpoint` observes
+/// deadline exhaustion, cancellation, and poll/cost quota exhaustion, and
+/// distinguishes `Timeout` from `Cancelled` for the caller.
+///
+/// All legacy SSE I/O entry points share this classification. It does not make
+/// a synchronous adapter interruptible while that adapter is executing.
+// Keep the helper and its Cx import behind the same legacy feature boundary.
+#[cfg(feature = "legacy-2024-11-05")]
+fn sse_checkpoint(cx: &Cx) -> Result<(), TransportError> {
+    cx.checkpoint().map_err(|error| {
+        use asupersync::{CancelKind, error::ErrorKind};
+
+        match cx.cancel_reason().map(|reason| reason.kind) {
+            Some(CancelKind::Deadline | CancelKind::Timeout) => TransportError::Timeout,
+            Some(_) => TransportError::Cancelled,
+            None => match error.kind() {
+                ErrorKind::DeadlineExceeded | ErrorKind::CancelTimeout => TransportError::Timeout,
+                ErrorKind::Cancelled
+                | ErrorKind::PollQuotaExhausted
+                | ErrorKind::CostQuotaExhausted => TransportError::Cancelled,
+                _ => TransportError::Cancelled,
+            },
+        }
+    })
+}
+
+/// Commits a bounded frame without allowing an expired caller to enter another
+/// partial write or flush. This cannot interrupt a synchronous I/O call that
+/// has already entered the kernel or caller-supplied adapter.
+///
+/// Cancellation before the first accepted byte is retryable. After any byte
+/// escapes, a refusal is terminal: appending a new frame could otherwise splice
+/// it into the unfinished one. A successful flush is the commit point; no
+/// checkpoint may retroactively turn that success into a retryable failure.
+#[cfg(feature = "legacy-2024-11-05")]
+fn sse_commit_frame<W: Write>(
+    cx: &Cx,
+    writer: &mut W,
+    closed: &mut bool,
+    mut bytes: &[u8],
+) -> Result<(), TransportError> {
+    let mut wrote_any = false;
+    while !bytes.is_empty() {
+        if let Err(error) = sse_checkpoint(cx) {
+            *closed |= wrote_any;
+            return Err(error);
+        }
+        match writer.write(bytes) {
+            Ok(0) => {
+                *closed = true;
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "SSE frame write made no progress",
+                )));
+            }
+            Ok(written) => {
+                // Defend this slicing boundary even against an invalid custom
+                // Write implementation; do not panic with a half-written frame.
+                let Some(remaining) = bytes.get(written..) else {
+                    *closed = true;
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "SSE writer reported an invalid byte count",
+                    )));
+                };
+                wrote_any = true;
+                bytes = remaining;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                *closed = true;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+    loop {
+        if let Err(error) = sse_checkpoint(cx) {
+            *closed |= wrote_any;
+            return Err(error);
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                *closed = true;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+}
+
+/// Maximum decoded JSON-RPC message carried by one SSE event.
+///
+/// LIMIT-01's guarded default for a decoded SSE JSON message: 8 MiB.
+const MAX_SSE_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+
+/// Bytes a peer may add around one data line: `data: ` plus a CRLF
+/// terminator, the longest line ending an event stream admits.
+const SSE_DATA_LINE_CRLF_OVERHEAD: usize = b"data: \r\n".len();
+
+/// Maximum wire-line size for SSE events.
+///
+/// LIMIT-01's guarded default for one SSE line: 8 MiB + 8 B, which is one
+/// maximal message on a single `data:` line ending in CRLF.
+const MAX_SSE_LINE_SIZE: usize = MAX_SSE_MESSAGE_SIZE + SSE_DATA_LINE_CRLF_OVERHEAD;
+
+/// Bytes this writer adds around one serialized data line: `data: ` plus LF.
+const SSE_DATA_LINE_WIRE_OVERHEAD: usize = b"data: \n".len();
+
+/// Explicit bounds for a modern request-scoped SSE response body.
+///
+/// Modern Streamable HTTP uses the WHATWG event-stream framing rules.  The
+/// collector receives chunks from the HTTP body, so both the current line and
+/// the assembled event need their own bounded accounting rather than relying
+/// on a caller to retain an arbitrary body prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModernSseLimits {
+    line_bytes: usize,
+    event_bytes: usize,
+    keepalive_lines: usize,
+}
+
+impl ModernSseLimits {
+    /// Creates nonzero bounds for one modern HTTP SSE body.
+    #[must_use]
+    pub const fn new(
+        max_line_bytes: usize,
+        max_event_bytes: usize,
+        max_keepalive_lines: usize,
+    ) -> Option<Self> {
+        if max_line_bytes == 0 || max_event_bytes == 0 || max_keepalive_lines == 0 {
+            return None;
+        }
+        Some(Self {
+            line_bytes: max_line_bytes,
+            event_bytes: max_event_bytes,
+            keepalive_lines: max_keepalive_lines,
+        })
+    }
+
+    /// Returns the maximum raw or decoded bytes retained for one line.
+    #[must_use]
+    pub const fn max_line_bytes(self) -> usize {
+        self.line_bytes
+    }
+
+    /// Returns the maximum raw or decoded bytes retained for one event.
+    #[must_use]
+    pub const fn max_event_bytes(self) -> usize {
+        self.event_bytes
+    }
+
+    /// Returns the maximum non-dispatching lines accepted between events.
+    #[must_use]
+    pub const fn max_keepalive_lines(self) -> usize {
+        self.keepalive_lines
+    }
+}
+
+/// The bounded parser's report when the HTTP response body reaches EOF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModernSseEndOfStream {
+    /// Whether an unterminated event with at least one `data` field was discarded.
+    pub discarded_pending_event: bool,
+    /// Whether an unterminated final line was discarded.
+    pub discarded_partial_line: bool,
+}
+
+/// Refusals from the bounded modern HTTP SSE framing parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModernSseParseError {
+    /// A raw or replacement-decoded line exceeds its configured bound.
+    LineTooLong {
+        /// The configured line bound.
+        limit_bytes: usize,
+    },
+    /// An assembled event exceeds its configured bound.
+    EventTooLarge {
+        /// The configured event bound.
+        limit_bytes: usize,
+    },
+    /// Too many inert/comment-only lines arrived before a dispatch.
+    KeepaliveFlood {
+        /// The configured line-count bound.
+        limit_lines: usize,
+    },
+    /// Input was supplied after an earlier refusal released parser state.
+    Poisoned,
+}
+
+/// The outcome of incrementally dispatching a decoded modern SSE event.
+///
+/// This remains crate-private because public callers use [`ModernSseDecoder::push`].
+/// The HTTP collector uses it to process each completed event immediately
+/// instead of retaining every event from an arbitrarily large body chunk.
+#[derive(Debug)]
+pub(crate) enum ModernSsePushError<E> {
+    /// Bounded SSE framing refused the input.
+    Parse(ModernSseParseError),
+    /// The immediate event consumer refused a completed payload.
+    Consumer(E),
+}
+
+impl std::fmt::Display for ModernSseParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LineTooLong { limit_bytes } => {
+                write!(formatter, "modern SSE line exceeds {limit_bytes} bytes")
+            }
+            Self::EventTooLarge { limit_bytes } => {
+                write!(formatter, "modern SSE event exceeds {limit_bytes} bytes")
+            }
+            Self::KeepaliveFlood { limit_lines } => {
+                write!(
+                    formatter,
+                    "modern SSE stream exceeds {limit_lines} inert lines"
+                )
+            }
+            Self::Poisoned => formatter.write_str("modern SSE parser already refused input"),
+        }
+    }
+}
+
+impl std::error::Error for ModernSseParseError {}
+
+/// Incremental, chunk-invariant WHATWG event-stream decoder for modern HTTP.
+///
+/// Each successful [`Self::push`] returns only completed `data` payloads in
+/// wire order.  `event`, `id`, `retry`, and unknown fields remain framing
+/// inputs only: modern request-scoped bodies must not acquire reconnect or
+/// cross-request routing state from them.
+#[derive(Debug)]
+pub struct ModernSseDecoder {
+    limits: ModernSseLimits,
+    raw_line: Vec<u8>,
+    pending_cr: bool,
+    bom_window_open: bool,
+    data: String,
+    event_raw_bytes: usize,
+    keepalive_lines: usize,
+    poisoned: bool,
+}
+
+impl ModernSseDecoder {
+    /// Creates an empty bounded decoder.
+    #[must_use]
+    pub fn new(limits: ModernSseLimits) -> Self {
+        Self {
+            limits,
+            raw_line: Vec::new(),
+            pending_cr: false,
+            bom_window_open: true,
+            data: String::new(),
+            event_raw_bytes: 0,
+            keepalive_lines: 0,
+            poisoned: false,
+        }
+    }
+
+    /// Feeds one HTTP body chunk and returns every completed SSE data payload.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, ModernSseParseError> {
+        let mut dispatched = Vec::new();
+        match self.push_with(chunk, |payload| {
+            dispatched.push(payload);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(()) => Ok(dispatched),
+            Err(ModernSsePushError::Parse(error)) => Err(error),
+            Err(ModernSsePushError::Consumer(never)) => match never {},
+        }
+    }
+
+    /// Feeds one HTTP body chunk and immediately dispatches each completed
+    /// event in wire order.
+    ///
+    /// Unlike [`Self::push`], this does not retain all completed events from
+    /// the supplied chunk.  A consumer refusal leaves final lifecycle policy
+    /// to the owner of the stream.
+    pub(crate) fn push_with<E>(
+        &mut self,
+        chunk: &[u8],
+        mut consume: impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        if self.poisoned {
+            return Err(ModernSsePushError::Parse(ModernSseParseError::Poisoned));
+        }
+        for &byte in chunk {
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    if let Err(error) = self.complete_line(&mut consume) {
+                        return Err(self.poison_push_error(error));
+                    }
+                    self.pending_cr = true;
+                }
+                b'\n' => {
+                    if let Err(error) = self.complete_line(&mut consume) {
+                        return Err(self.poison_push_error(error));
+                    }
+                }
+                byte => {
+                    if self.raw_line.len() >= self.limits.line_bytes {
+                        return Err(ModernSsePushError::Parse(self.poison(
+                            ModernSseParseError::LineTooLong {
+                                limit_bytes: self.limits.line_bytes,
+                            },
+                        )));
+                    }
+                    self.raw_line.push(byte);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes the body without synthesizing a final blank line.
+    pub fn finish(self) -> Result<ModernSseEndOfStream, ModernSseParseError> {
+        if self.poisoned {
+            return Err(ModernSseParseError::Poisoned);
+        }
+        Ok(ModernSseEndOfStream {
+            discarded_pending_event: !self.data.is_empty(),
+            discarded_partial_line: !self.raw_line.is_empty(),
+        })
+    }
+
+    fn poison(&mut self, error: ModernSseParseError) -> ModernSseParseError {
+        self.raw_line = Vec::new();
+        self.data = String::new();
+        self.event_raw_bytes = 0;
+        self.keepalive_lines = 0;
+        self.poisoned = true;
+        error
+    }
+
+    fn poison_push_error<E>(&mut self, error: ModernSsePushError<E>) -> ModernSsePushError<E> {
+        match error {
+            ModernSsePushError::Parse(error) => ModernSsePushError::Parse(self.poison(error)),
+            ModernSsePushError::Consumer(error) => ModernSsePushError::Consumer(error),
+        }
+    }
+
+    fn complete_line<E>(
+        &mut self,
+        consume: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        let mut raw = std::mem::take(&mut self.raw_line);
+        if self.bom_window_open {
+            self.bom_window_open = false;
+            if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                raw.drain(..3);
+            }
+        }
+        let raw_len = raw.len();
+        let line = String::from_utf8_lossy(&raw);
+        if line.len() > self.limits.line_bytes {
+            return Err(ModernSsePushError::Parse(self.poison(
+                ModernSseParseError::LineTooLong {
+                    limit_bytes: self.limits.line_bytes,
+                },
+            )));
+        }
+        self.process_line(&line, raw_len, consume)
+    }
+
+    fn process_line<E>(
+        &mut self,
+        line: &str,
+        raw_len: usize,
+        consume: &mut impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), ModernSsePushError<E>> {
+        if line.is_empty() {
+            if self.data.is_empty() {
+                return self.count_inert_line().map_err(ModernSsePushError::Parse);
+            }
+            let mut payload = std::mem::take(&mut self.data);
+            debug_assert!(payload.ends_with('\n'));
+            payload.pop();
+            self.event_raw_bytes = 0;
+            self.keepalive_lines = 0;
+            return consume(payload).map_err(ModernSsePushError::Consumer);
+        }
+        if line.starts_with(':') {
+            return self.count_inert_line().map_err(ModernSsePushError::Parse);
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field != "data" {
+            return self.count_inert_line().map_err(ModernSsePushError::Parse);
+        }
+        let decoded_after = self
+            .data
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(1);
+        let raw_after = self.event_raw_bytes.saturating_add(raw_len);
+        if decoded_after > self.limits.event_bytes || raw_after > self.limits.event_bytes {
+            return Err(ModernSsePushError::Parse(self.poison(
+                ModernSseParseError::EventTooLarge {
+                    limit_bytes: self.limits.event_bytes,
+                },
+            )));
+        }
+        self.data.push_str(value);
+        self.data.push('\n');
+        self.event_raw_bytes = raw_after;
+        self.keepalive_lines = 0;
+        Ok(())
+    }
+
+    fn count_inert_line(&mut self) -> Result<(), ModernSseParseError> {
+        self.keepalive_lines = self.keepalive_lines.saturating_add(1);
+        if self.keepalive_lines > self.limits.keepalive_lines {
+            return Err(ModernSseParseError::KeepaliveFlood {
+                limit_lines: self.limits.keepalive_lines,
+            });
+        }
+        Ok(())
+    }
+}
 
 // =============================================================================
 // SSE Event Types
@@ -146,13 +593,19 @@ impl SseEvent {
         self
     }
 
-    /// Serialize the event to SSE format.
+    /// Serializes the event to bounded SSE wire format.
     ///
     /// # Returns
     ///
     /// The SSE-formatted event as bytes, including the trailing blank line.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when event data or fields exceed the transport bounds,
+    /// or when an ID/endpoint value contains characters that could inject SSE
+    /// fields or event boundaries.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, TransportError> {
+        self.validate()?;
         let mut output = Vec::with_capacity(self.data.len() + 64);
 
         // Event type
@@ -174,23 +627,84 @@ impl SseEvent {
             output.push(b'\n');
         }
 
-        // Data (handle multi-line data by prefixing each line with "data: ")
-        for line in self.data.lines() {
+        // Data (handle multi-line data by prefixing each line with "data: ").
+        // `str::lines()` discards the trailing empty segment, but each such
+        // segment is semantically significant in SSE: `"line\n"` must become
+        // `data: line` followed by `data: ` so a reader reconstructs the
+        // terminal newline. Normalize accepted CRLF input while retaining
+        // every logical data field, including a final empty one.
+        for line in self
+            .data
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        {
             output.extend_from_slice(b"data: ");
             output.extend_from_slice(line.as_bytes());
             output.push(b'\n');
         }
 
-        // If data doesn't have lines (empty), still send one data line
-        if self.data.is_empty() {
-            output.extend_from_slice(b"data: \n");
-        }
-
         // Blank line to terminate the event
         output.push(b'\n');
 
-        output
+        Ok(output)
     }
+
+    fn validate(&self) -> Result<(), TransportError> {
+        if self.data.len() > MAX_SSE_MESSAGE_SIZE {
+            return Err(TransportError::Codec(CodecError::MessageTooLarge(
+                self.data.len(),
+            )));
+        }
+        if has_invalid_sse_data_characters(&self.data) {
+            return Err(invalid_sse_field("event data"));
+        }
+        for line in self
+            .data
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        {
+            let wire_size = line.len().saturating_add(SSE_DATA_LINE_WIRE_OVERHEAD);
+            if wire_size > MAX_SSE_LINE_SIZE {
+                return Err(TransportError::Codec(CodecError::MessageTooLarge(
+                    line.len(),
+                )));
+            }
+        }
+        if self.event_type == SseEventType::Endpoint
+            && self
+                .data
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+        {
+            return Err(invalid_sse_field("endpoint data"));
+        }
+        if let Some(id) = &self.id {
+            if id.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | b'\0')) {
+                return Err(invalid_sse_field("event ID"));
+            }
+            let wire_size = id.len().saturating_add(b"id: \n".len());
+            if wire_size > MAX_SSE_LINE_SIZE {
+                return Err(TransportError::Codec(CodecError::MessageTooLarge(id.len())));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn has_invalid_sse_data_characters(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| match byte {
+        b'\0' => true,
+        b'\r' => bytes.get(index + 1) != Some(&b'\n'),
+        _ => false,
+    })
+}
+
+fn invalid_sse_field(field: &str) -> TransportError {
+    TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid {field} for SSE wire format"),
+    ))
 }
 
 // =============================================================================
@@ -213,37 +727,47 @@ impl SseEvent {
 /// // Send a response
 /// writer.write_message(&JsonRpcMessage::Response(response))?;
 /// ```
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct SseWriter<W> {
     writer: W,
     codec: Codec,
     event_counter: u64,
+    closed: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<W: Write> SseWriter<W> {
     /// Creates a new SSE writer.
     #[must_use]
     pub fn new(writer: W) -> Self {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(MAX_SSE_MESSAGE_SIZE);
         Self {
             writer,
-            codec: Codec::new(),
+            codec,
             event_counter: 0,
+            closed: false,
         }
+    }
+
+    fn commit(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), TransportError> {
+        sse_commit_frame(cx, &mut self.writer, &mut self.closed, bytes)
     }
 
     /// Writes an SSE event.
     ///
     /// # Cancel-Safety
     ///
-    /// Checks for cancellation before writing.
+    /// Checks the caller's budget before encoding and between partial writes.
+    /// A refusal after any bytes are written makes the writer terminal.
     pub fn write_event(&mut self, cx: &Cx, event: &SseEvent) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.closed {
+            return Err(TransportError::Closed);
         }
+        sse_checkpoint(cx)?;
 
-        let bytes = event.to_bytes();
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
-        Ok(())
+        let bytes = event.to_bytes()?;
+        self.commit(cx, &bytes)
     }
 
     /// Writes the endpoint event with the POST URL.
@@ -260,23 +784,33 @@ impl<W: Write> SseWriter<W> {
         cx: &Cx,
         message: &JsonRpcMessage,
     ) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.closed {
+            return Err(TransportError::Closed);
         }
+        sse_checkpoint(cx)?;
 
-        let json = match message {
-            JsonRpcMessage::Request(req) => {
-                // Encode without newline (SSE adds its own framing)
-                serde_json::to_string(req).map_err(CodecError::Json)?
-            }
-            JsonRpcMessage::Response(resp) => {
-                serde_json::to_string(resp).map_err(CodecError::Json)?
-            }
+        let mut encoded = match message {
+            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
         };
+        if encoded.pop() != Some(b'\n') {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "JSON-RPC codec omitted its NDJSON delimiter",
+            )));
+        }
+        let json = String::from_utf8(encoded).map_err(|error| {
+            TransportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })?;
 
-        self.event_counter += 1;
-        let event = SseEvent::message(json).with_id(self.event_counter.to_string());
-        self.write_event(cx, &event)
+        let next_event_id = self
+            .event_counter
+            .checked_add(1)
+            .ok_or_else(|| invalid_sse_field("event ID counter"))?;
+        let event = SseEvent::message(json).with_id(next_event_id.to_string());
+        self.write_event(cx, &event)?;
+        self.event_counter = next_event_id;
+        Ok(())
     }
 
     /// Writes a JSON-RPC response as an SSE message event.
@@ -305,21 +839,55 @@ impl<W: Write> SseWriter<W> {
     /// SSE comments start with `:` and are ignored by the client.
     /// They're useful for keeping connections alive.
     pub fn write_comment(&mut self, cx: &Cx, comment: &str) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        sse_checkpoint(cx)?;
+
+        if comment
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+        {
+            return Err(invalid_sse_field("comment"));
+        }
+        let wire_size = comment.len().saturating_add(b": \n".len());
+        if wire_size > MAX_SSE_LINE_SIZE {
+            return Err(TransportError::Codec(CodecError::MessageTooLarge(
+                comment.len(),
+            )));
         }
 
-        // Comments are lines starting with ':'
-        self.writer.write_all(b": ")?;
-        self.writer.write_all(comment.as_bytes())?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()?;
-        Ok(())
+        // Comments are lines starting with ':'. Build the bounded line before
+        // committing so any I/O error has one terminal-latch path.
+        let mut bytes = Vec::with_capacity(wire_size);
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(comment.as_bytes());
+        bytes.push(b'\n');
+        self.commit(cx, &bytes)
     }
 
     /// Sends a keep-alive comment.
     pub fn keep_alive(&mut self, cx: &Cx) -> Result<(), TransportError> {
         self.write_comment(cx, "keep-alive")
+    }
+
+    /// Closes the writer terminally, flushing any buffered output once.
+    pub fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        // Observe the caller's budget BEFORE the terminal commit, so a cancelled
+        // or expired caller is not made to wait on the flush below. Refusing here
+        // leaves the writer non-terminal and retryable; placing the check after
+        // the already-closed branch keeps an idempotent close Ok, because
+        // terminal state performs no I/O and has no budget to spend.
+        //
+        // `sse_checkpoint` rather than this module's older
+        // `cx.is_cancel_requested()` guard: that bit would let an expired
+        // DEADLINE through into the blocking flush.
+        sse_checkpoint(cx)?;
+        self.closed = true;
+        self.writer.flush().map_err(TransportError::Io)
     }
 
     /// Returns a reference to the underlying writer.
@@ -342,9 +910,6 @@ impl<W: Write> SseWriter<W> {
 // SSE Reader
 // =============================================================================
 
-/// Maximum line size for SSE events (64KB should be generous for JSON-RPC).
-const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
-
 /// Reader for SSE event streams.
 ///
 /// Parses SSE events from any `Read` implementation.
@@ -361,21 +926,40 @@ const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
 ///     }
 /// }
 /// ```
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct SseReader<R> {
     reader: BufReader<R>,
-    line_buffer: String,
+    line_buffer: Vec<u8>,
+    codec: Codec,
     /// Maximum line size to prevent memory exhaustion.
     max_line_size: usize,
+    /// Whether EOF or a terminal framing/I/O error has ended this stream.
+    terminal: bool,
+    /// A CR terminates a line immediately; one following LF belongs to the
+    /// same delimiter and is discarded at the start of the next read.
+    discard_lf_after_cr: bool,
+    /// Last valid SSE event ID, persisted across event blocks.
+    last_event_id: Option<String>,
+    /// Last valid reconnection delay, persisted across event blocks.
+    reconnection_time: Option<u64>,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<R: Read> SseReader<R> {
     /// Creates a new SSE reader.
     #[must_use]
     pub fn new(reader: R) -> Self {
+        let mut codec = Codec::new();
+        codec.set_max_message_size(MAX_SSE_MESSAGE_SIZE);
         Self {
             reader: BufReader::new(reader),
-            line_buffer: String::with_capacity(4096),
+            line_buffer: Vec::with_capacity(4096),
+            codec,
             max_line_size: MAX_SSE_LINE_SIZE,
+            terminal: false,
+            discard_lf_after_cr: false,
+            last_event_id: None,
+            reconnection_time: None,
         }
     }
 
@@ -386,52 +970,74 @@ impl<R: Read> SseReader<R> {
     ///
     /// # Note
     ///
-    /// On error, the reader state may be inconsistent (partial data consumed).
-    /// Callers should treat errors as terminal and not attempt further reads.
-    fn read_line_bounded(&mut self) -> Result<usize, std::io::Error> {
+    /// `consumed_input` belongs to the whole event, not just this line. It lets
+    /// the caller distinguish a retryable no-progress budget refusal from a
+    /// partially consumed event whose local parser state cannot be resumed.
+    fn read_line_bounded(
+        &mut self,
+        cx: &Cx,
+        consumed_input: &mut bool,
+    ) -> Result<usize, TransportError> {
         use std::io::BufRead;
 
         let mut total_read = 0;
         loop {
-            let available = self.reader.fill_buf()?;
+            // A long line must not bypass the budget merely because no line
+            // delimiter has arrived yet. Interrupted reads also return here.
+            sse_checkpoint(cx)?;
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(TransportError::Io(error)),
+            };
             if available.is_empty() {
                 // EOF
                 return Ok(total_read);
             }
 
-            // Find newline in available buffer
-            let newline_pos = available.iter().position(|&b| b == b'\n');
-            let bytes_to_consume = match newline_pos {
-                Some(pos) => pos + 1, // Include the newline
-                None => available.len(),
-            };
+            if self.discard_lf_after_cr {
+                self.discard_lf_after_cr = false;
+                if available[0] == b'\n' {
+                    self.reader.consume(1);
+                    *consumed_input = true;
+                    continue;
+                }
+            }
+
+            // Event streams recognize CR, LF, and CRLF. A CR ends this line;
+            // a following LF is skipped by the next invocation, including
+            // when the two delimiter bytes arrive in separate reads.
+            let delimiter = available
+                .iter()
+                .position(|byte| matches!(*byte, b'\r' | b'\n'));
+            let content_bytes = delimiter.unwrap_or(available.len());
+            let bytes_to_consume = content_bytes + usize::from(delimiter.is_some());
 
             // Check if this would exceed our limit
-            if self.line_buffer.len() + bytes_to_consume > self.max_line_size {
-                return Err(std::io::Error::new(
+            if self.line_buffer.len().saturating_add(bytes_to_consume) > self.max_line_size {
+                self.line_buffer.clear();
+                return Err(TransportError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "SSE line exceeds maximum size of {} bytes",
                         self.max_line_size
                     ),
-                ));
+                )));
             }
 
-            // Convert bytes to string and append
-            let chunk = &available[..bytes_to_consume];
-            let chunk_str = std::str::from_utf8(chunk).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Invalid UTF-8: {e}"),
-                )
-            })?;
-            self.line_buffer.push_str(chunk_str);
+            // Preserve raw bytes until the complete line is available. A
+            // valid UTF-8 scalar may be split across two underlying reads.
+            self.line_buffer
+                .extend_from_slice(&available[..content_bytes]);
             total_read += bytes_to_consume;
 
-            self.reader.consume(bytes_to_consume);
+            let ended_with_cr = delimiter.is_some_and(|position| available[position] == b'\r');
 
-            if newline_pos.is_some() {
-                // Found newline, done with this line
+            self.reader.consume(bytes_to_consume);
+            *consumed_input = true;
+
+            if delimiter.is_some() {
+                self.discard_lf_after_cr = ended_with_cr;
                 return Ok(total_read);
             }
         }
@@ -447,62 +1053,79 @@ impl<R: Read> SseReader<R> {
     ///
     /// # Cancel-Safety
     ///
-    /// Checks for cancellation between reads.
+    /// Checks the caller's full budget between reads, even within one line.
+    /// A no-progress budget refusal leaves the reader reusable. Refusal after
+    /// input is consumed makes the reader terminal rather than losing part of
+    /// an event and interpreting its suffix as a new event.
     pub fn read_event(&mut self, cx: &Cx) -> Result<Option<SseEvent>, TransportError> {
-        // Maximum total event data size (1MB should be generous)
-        const MAX_EVENT_DATA_SIZE: usize = 1024 * 1024;
-
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.terminal {
+            return Err(TransportError::Closed);
         }
+        sse_checkpoint(cx)?;
 
         let mut event_type: Option<SseEventType> = None;
         let mut unknown_event = false;
         let mut data_lines: Vec<String> = Vec::new();
         let mut total_data_size: usize = 0;
-        let mut event_id: Option<String> = None;
-        let mut retry: Option<u64> = None;
-
+        let mut consumed_input = false;
         loop {
             self.line_buffer.clear();
-            let bytes_read = self.read_line_bounded()?;
+            let bytes_read = match self.read_line_bounded(cx, &mut consumed_input) {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    if consumed_input
+                        || !matches!(&error, TransportError::Cancelled | TransportError::Timeout)
+                    {
+                        self.terminal = true;
+                    }
+                    return Err(error);
+                }
+            };
 
             if bytes_read == 0 {
                 // EOF
+                self.terminal = true;
                 return Ok(None);
             }
 
-            // Check cancellation between lines
-            if cx.is_cancel_requested() {
-                return Err(TransportError::Cancelled);
+            // Check the budget again before exposing or processing a line.
+            if let Err(error) = sse_checkpoint(cx) {
+                // At least one line of the current event was consumed. The
+                // parser state is local to this call, so resuming would splice
+                // the remainder into a different event.
+                self.terminal = true;
+                return Err(error);
             }
 
-            let line = self
-                .line_buffer
-                .trim_end_matches(|c| c == '\n' || c == '\r');
+            let line = std::str::from_utf8(&self.line_buffer).map_err(|error| {
+                self.terminal = true;
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid UTF-8 in SSE line: {error}"),
+                ))
+            })?;
 
             // Empty line = end of event
             if line.is_empty() {
-                if unknown_event {
-                    event_type = None;
-                    data_lines.clear();
-                    total_data_size = 0;
-                    event_id = None;
-                    retry = None;
-                    unknown_event = false;
-                    continue;
-                }
-                if event_type.is_some() || !data_lines.is_empty() {
-                    // We have an event to return
+                // SSE dispatches only when at least one data field was seen.
+                // An empty `data` field still counts and dispatches an event
+                // with an empty payload; event/id/retry-only blocks do not.
+                if !data_lines.is_empty() && !unknown_event {
                     let data = data_lines.join("\n");
                     return Ok(Some(SseEvent {
                         event_type: event_type.unwrap_or(SseEventType::Message),
                         data,
-                        id: event_id,
-                        retry,
+                        id: self.last_event_id.clone(),
+                        retry: self.reconnection_time,
                     }));
                 }
-                // Empty event, continue reading
+
+                // Per-event buffers never leak through an empty or ignored
+                // block. ID and retry state deliberately persist separately.
+                event_type = None;
+                unknown_event = false;
+                data_lines.clear();
+                total_data_size = 0;
                 continue;
             }
 
@@ -511,47 +1134,74 @@ impl<R: Read> SseReader<R> {
                 continue;
             }
 
-            // Parse field: value
-            if let Some((field, value)) = line.split_once(':') {
-                // SSE spec: if value starts with space, trim one space
-                let value = value.strip_prefix(' ').unwrap_or(value);
+            // A field without a colon has the empty string as its value.
+            let (field, raw_value) = line.split_once(':').unwrap_or((line, ""));
+            // If present, exactly one leading ASCII space is removed.
+            let value = raw_value.strip_prefix(' ').unwrap_or(raw_value);
 
-                match field {
-                    "event" => {
-                        if let Some(parsed) = SseEventType::from_str(value) {
-                            event_type = Some(parsed);
-                            unknown_event = false;
-                        } else {
-                            event_type = None;
-                            unknown_event = true;
-                        }
+            match field {
+                "event" => {
+                    if value.is_empty() {
+                        event_type = None;
+                        unknown_event = false;
+                    } else if let Some(parsed) = SseEventType::from_str(value) {
+                        event_type = Some(parsed);
+                        unknown_event = false;
+                    } else {
+                        event_type = None;
+                        unknown_event = true;
                     }
-                    "data" => {
-                        // Check accumulated data size to prevent memory exhaustion
-                        total_data_size = total_data_size.saturating_add(value.len() + 1); // +1 for newline
-                        if total_data_size > MAX_EVENT_DATA_SIZE {
-                            return Err(TransportError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "SSE event data exceeds maximum size of {} bytes",
-                                    MAX_EVENT_DATA_SIZE
-                                ),
-                            )));
-                        }
-                        data_lines.push(value.to_string());
+                }
+                "data" => {
+                    // Check accumulated data size to prevent memory exhaustion.
+                    let separator_size = usize::from(!data_lines.is_empty());
+                    total_data_size = total_data_size
+                        .saturating_add(separator_size)
+                        .saturating_add(value.len());
+                    if total_data_size > MAX_SSE_MESSAGE_SIZE {
+                        self.terminal = true;
+                        return Err(TransportError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "SSE event data exceeds maximum size of {} bytes",
+                                MAX_SSE_MESSAGE_SIZE
+                            ),
+                        )));
                     }
-                    "id" => {
-                        event_id = Some(value.to_string());
+                    data_lines.push(value.to_string());
+                }
+                "id" => {
+                    // U+0000 makes this field a no-op; it does not clear the
+                    // last valid ID and is not a terminal stream error.
+                    if !value.contains('\0') {
+                        self.last_event_id = Some(value.to_string());
                     }
-                    "retry" => {
-                        retry = value.parse().ok();
+                }
+                "retry" => {
+                    if !value.is_empty()
+                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                        && let Ok(retry) = value.parse()
+                    {
+                        self.reconnection_time = Some(retry);
                     }
-                    _ => {
-                        // Unknown field, ignore per SSE spec
-                    }
+                }
+                _ => {
+                    // Unknown field, ignore per SSE spec.
                 }
             }
         }
+    }
+
+    /// Returns the persistent last event ID established by valid `id` fields.
+    #[must_use]
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    /// Returns the persistent reconnection delay established by valid `retry` fields.
+    #[must_use]
+    pub fn retry_interval(&self) -> Option<u64> {
+        self.reconnection_time
     }
 
     /// Reads the next message event and parses it as a JSON-RPC message.
@@ -568,8 +1218,7 @@ impl<R: Read> SseReader<R> {
             match self.read_event(cx)? {
                 Some(event) => {
                     if event.event_type == SseEventType::Message {
-                        let message: JsonRpcMessage = serde_json::from_str(&event.data)
-                            .map_err(|e| TransportError::Codec(CodecError::Json(e)))?;
+                        let message = self.codec.decode_complete_message(event.data.as_bytes())?;
                         return Ok(Some(message));
                     }
                     // Skip non-message events
@@ -607,6 +1256,254 @@ impl<R: Read> SseReader<R> {
     /// Returns a reference to the underlying reader.
     pub fn inner(&self) -> &BufReader<R> {
         &self.reader
+    }
+}
+
+// =============================================================================
+// Exact MCP 2024-11-05 SSE transport
+// =============================================================================
+
+/// One client-to-server HTTP POST selected by an exact-2024 SSE endpoint event.
+///
+/// The endpoint is opaque to this transport: the caller's HTTP adapter owns
+/// connection establishment and any origin, credential, redirect, or TLS
+/// policy. The adapter receives the exact advertised URI and already-framed
+/// JSON-RPC bytes, so it cannot silently substitute a derived modern route.
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacySseMessagePost {
+    endpoint: String,
+    body: Vec<u8>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySseMessagePost {
+    fn new(endpoint: String, body: Vec<u8>) -> Self {
+        Self { endpoint, body }
+    }
+
+    /// Returns the exact URI advertised by the first SSE endpoint event.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns the newline-delimited JSON-RPC body for the advertised POST.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// Caller-owned HTTP POST adapter for exact MCP 2024-11-05 SSE clients.
+///
+/// A legacy SSE connection has two directions: server messages remain on the
+/// SSE reader, while every client JSON-RPC message is delivered to this sink
+/// using the one URI advertised by the first endpoint event.
+#[cfg(feature = "legacy-2024-11-05")]
+pub trait LegacySsePostSink {
+    /// Delivers one JSON-RPC message to the advertised endpoint.
+    fn post(&mut self, cx: &Cx, post: LegacySseMessagePost) -> Result<(), TransportError>;
+}
+
+/// Exact MCP 2024-11-05 client-side SSE adapter.
+///
+/// This adapter is deliberately separate from [`SseClientTransport`]. It
+/// requires the first valid event to be `endpoint`, latches the advertised
+/// POST URI once, and rejects any send before that handshake. Modern
+/// streamable-HTTP routing never constructs this type.
+#[cfg(feature = "legacy-2024-11-05")]
+pub struct LegacySseClientTransport<R, P> {
+    reader: SseReader<R>,
+    post_sink: P,
+    codec: Codec,
+    advertised_endpoint: Option<String>,
+    closed: bool,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<R: Read, P: LegacySsePostSink> LegacySseClientTransport<R, P> {
+    /// Creates a legacy SSE adapter over an already-opened SSE GET body.
+    #[must_use]
+    pub fn new(reader: R, post_sink: P) -> Self {
+        Self {
+            reader: SseReader::new(reader),
+            post_sink,
+            codec: Codec::new(),
+            advertised_endpoint: None,
+            closed: false,
+        }
+    }
+
+    /// Consumes and latches the required first `endpoint` event.
+    ///
+    /// A `message` event, end of stream, or an empty endpoint is a terminal
+    /// legacy-adapter denial. The reader intentionally does not search ahead
+    /// for a later endpoint because that would allow endpoint replacement.
+    pub fn establish(&mut self, cx: &Cx) -> Result<&str, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        if self.advertised_endpoint.is_some() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "legacy SSE endpoint has already been established",
+            )));
+        }
+
+        let event = match self.reader.read_event(cx) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                self.closed = true;
+                return Err(TransportError::Closed);
+            }
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
+                self.closed = self.reader.terminal;
+                return Err(error);
+            }
+            Err(error) => {
+                self.closed = true;
+                return Err(error);
+            }
+        };
+        if event.event_type != SseEventType::Endpoint || event.data.is_empty() {
+            self.closed = true;
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy SSE stream must begin with one nonempty endpoint event",
+            )));
+        }
+        self.advertised_endpoint = Some(event.data);
+        if let Some(endpoint) = self.advertised_endpoint.as_deref() {
+            Ok(endpoint)
+        } else {
+            self.closed = true;
+            Err(TransportError::Closed)
+        }
+    }
+
+    /// Returns the endpoint fixed by [`Self::establish`].
+    #[must_use]
+    pub fn advertised_endpoint(&self) -> Option<&str> {
+        self.advertised_endpoint.as_deref()
+    }
+
+    fn encode_client_message(&self, message: &JsonRpcMessage) -> Result<Vec<u8>, TransportError> {
+        match message {
+            JsonRpcMessage::Request(request) => self
+                .codec
+                .encode_request(request)
+                .map_err(TransportError::Codec),
+            JsonRpcMessage::Response(response) => self
+                .codec
+                .encode_response(response)
+                .map_err(TransportError::Codec),
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<R: Read, P: LegacySsePostSink> Transport for LegacySseClientTransport<R, P> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        sse_checkpoint(cx)?;
+        let endpoint = self.advertised_endpoint.clone().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "legacy SSE endpoint event must be established before POSTing messages",
+            ))
+        })?;
+        let post = LegacySseMessagePost::new(endpoint, self.encode_client_message(message)?);
+        // Encoding may itself spend the remaining budget. Do not invoke the
+        // caller-owned HTTP adapter after that budget is exhausted.
+        sse_checkpoint(cx)?;
+        match self.post_sink.post(cx, post) {
+            Ok(()) => Ok(()),
+            Err(TransportError::Cancelled) => Err(TransportError::Cancelled),
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        match self.reader.read_message(cx) {
+            Ok(Some(message)) => Ok(message),
+            Ok(None) => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
+            Err(error @ TransportError::Codec(_)) => Err(error),
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
+                if self.reader.terminal {
+                    self.closed = true;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        self.closed = true;
+        Ok(())
+    }
+}
+
+/// Exact MCP 2024-11-05 server-side SSE adapter.
+///
+/// The HTTP GET handler calls [`Self::open`] immediately after establishing
+/// its SSE response body, guaranteeing that the endpoint event precedes every
+/// server-to-client JSON-RPC message. Existing [`SseServerTransport`] callers
+/// retain their current lazy endpoint behavior.
+#[cfg(feature = "legacy-2024-11-05")]
+pub struct LegacySseServerTransport<W, R> {
+    inner: SseServerTransport<W, R>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator<Item = JsonRpcRequest>> LegacySseServerTransport<W, R> {
+    /// Creates the exact-2024 server adapter with one advertised POST URI.
+    #[must_use]
+    pub fn new(writer: W, request_source: R, endpoint_url: impl Into<String>) -> Self {
+        Self {
+            inner: SseServerTransport::new(writer, request_source, endpoint_url),
+        }
+    }
+
+    /// Opens the SSE body by sending its mandatory first endpoint event.
+    pub fn open(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.inner.closed || self.inner.writer.closed {
+            self.inner.closed = true;
+            return Err(TransportError::Closed);
+        }
+        self.inner.ensure_endpoint_sent(cx)
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for LegacySseServerTransport<W, R> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.open(cx)?;
+        self.inner.send(cx, message)
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.open(cx)?;
+        self.inner.recv(cx)
+    }
+
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.inner.close(cx)
     }
 }
 
@@ -649,14 +1546,18 @@ impl<R: Read> SseReader<R> {
 ///
 /// This is a basic implementation. For production use, you'll need to integrate
 /// with an HTTP server and handle the POST endpoint separately.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct SseServerTransport<W, R> {
     writer: SseWriter<W>,
+    request_codec: Codec,
     /// Channel or queue for receiving requests from POST handler.
     request_source: R,
     endpoint_sent: bool,
     endpoint_url: String,
+    closed: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
     /// Creates a new SSE server transport.
     ///
@@ -669,9 +1570,11 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
     pub fn new(writer: W, request_source: R, endpoint_url: impl Into<String>) -> Self {
         Self {
             writer: SseWriter::new(writer),
+            request_codec: Codec::new(),
             request_source,
             endpoint_sent: false,
             endpoint_url: endpoint_url.into(),
+            closed: false,
         }
     }
 
@@ -683,31 +1586,141 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> SseServerTransport<W, R> {
         }
         Ok(())
     }
+
+    /// Separates typed POST ingress from SSE response egress.
+    ///
+    /// The two returned halves own disjoint I/O resources, so a server can
+    /// continue receiving requests while a request-owned child commits its
+    /// response to the event stream.
+    #[must_use]
+    pub fn into_split(self) -> (SseServerRecvHalf<R>, SseServerSendHalf<W>) {
+        (
+            SseServerRecvHalf {
+                request_codec: self.request_codec,
+                request_source: self.request_source,
+                closed: self.closed,
+            },
+            SseServerSendHalf {
+                writer: self.writer,
+                endpoint_sent: self.endpoint_sent,
+                endpoint_url: self.endpoint_url,
+                closed: self.closed,
+            },
+        )
+    }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransport<W, R> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed || self.writer.closed {
+            self.closed = true;
+            return Err(TransportError::Closed);
+        }
         self.ensure_endpoint_sent(cx)?;
         self.writer.write_message(cx, message)
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.closed || self.writer.closed {
+            self.closed = true;
+            return Err(TransportError::Closed);
         }
+        sse_checkpoint(cx)?;
 
         // Get next request from the request source (POST handler)
         match self.request_source.next() {
-            Some(request) => Ok(JsonRpcMessage::Request(request)),
-            None => Err(TransportError::Closed),
+            Some(request) => {
+                // Iterator-backed typed ingress otherwise bypasses all wire
+                // validation and per-message size admission.
+                self.request_codec.encode_request(&request)?;
+                Ok(JsonRpcMessage::Request(request))
+            }
+            None => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
-        // SSE connections don't have a graceful close mechanism
-        // Just flush and let the connection drop
-        self.writer.inner_mut().flush()?;
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        // SSE connections don't have a close frame; flush once and let the
+        // connection drop. SseWriter makes this idempotent and terminal.
+        let result = self.writer.close(cx);
+        self.closed |= self.writer.closed;
+        result
+    }
+}
+
+/// Independently owned typed POST ingress for an SSE server transport.
+#[cfg(feature = "legacy-2024-11-05")]
+pub struct SseServerRecvHalf<R> {
+    request_codec: Codec,
+    request_source: R,
+    closed: bool,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<R: Iterator<Item = JsonRpcRequest>> TransportRecvHalf for SseServerRecvHalf<R> {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        sse_checkpoint(cx)?;
+
+        match self.request_source.next() {
+            Some(request) => {
+                self.request_codec.encode_request(&request)?;
+                Ok(JsonRpcMessage::Request(request))
+            }
+            None => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
+        }
+    }
+
+    fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+        self.closed = true;
         Ok(())
+    }
+}
+
+/// Independently owned event-stream egress for an SSE server transport.
+#[cfg(feature = "legacy-2024-11-05")]
+pub struct SseServerSendHalf<W> {
+    writer: SseWriter<W>,
+    endpoint_sent: bool,
+    endpoint_url: String,
+    closed: bool,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write> SseServerSendHalf<W> {
+    fn ensure_endpoint_sent(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if !self.endpoint_sent {
+            self.writer.write_endpoint(cx, &self.endpoint_url)?;
+            self.endpoint_sent = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<W: Write + Send> TransportSendHalf for SseServerSendHalf<W> {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed || self.writer.closed {
+            self.closed = true;
+            return Err(TransportError::Closed);
+        }
+        self.ensure_endpoint_sent(cx)?;
+        self.writer.write_message(cx, message)
+    }
+
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        let result = self.writer.close(cx);
+        self.closed |= self.writer.closed;
+        result
     }
 }
 
@@ -737,13 +1750,16 @@ impl<W: Write, R: Iterator<Item = JsonRpcRequest>> Transport for SseServerTransp
 /// // Use transport for MCP client
 /// client.run(transport);
 /// ```
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct SseClientTransport<R, W> {
     reader: SseReader<R>,
     /// Sender for POST requests (injected into HTTP client)
     request_sink: W,
     codec: Codec,
+    closed: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<R: Read, W: Write> SseClientTransport<R, W> {
     /// Creates a new SSE client transport.
     ///
@@ -757,22 +1773,49 @@ impl<R: Read, W: Write> SseClientTransport<R, W> {
             reader: SseReader::new(reader),
             request_sink,
             codec: Codec::new(),
+            closed: false,
         }
+    }
+
+    fn commit_request(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), TransportError> {
+        sse_commit_frame(cx, &mut self.request_sink, &mut self.closed, bytes)
     }
 
     /// Reads the endpoint URL from the SSE stream.
     ///
     /// This should be called once when the connection is established.
     pub fn read_endpoint(&mut self, cx: &Cx) -> Result<Option<String>, TransportError> {
-        self.reader.read_endpoint(cx)
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        match self.reader.read_endpoint(cx) {
+            Ok(endpoint) => {
+                if endpoint.is_none() {
+                    self.closed = true;
+                }
+                Ok(endpoint)
+            }
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
+                if self.reader.terminal {
+                    self.closed = true;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
+        }
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
+        if self.closed {
+            return Err(TransportError::Closed);
         }
+        sse_checkpoint(cx)?;
 
         // Send via POST (write to request sink)
         let bytes = match message {
@@ -780,21 +1823,46 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
             JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
         };
 
-        self.request_sink.write_all(&bytes)?;
-        self.request_sink.flush()?;
-        Ok(())
+        self.commit_request(cx, &bytes)
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        match self.reader.read_message(cx)? {
-            Some(message) => Ok(message),
-            None => Err(TransportError::Closed),
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        match self.reader.read_message(cx) {
+            Ok(Some(message)) => Ok(message),
+            Ok(None) => {
+                self.closed = true;
+                Err(TransportError::Closed)
+            }
+            // A complete message event with invalid JSON-RPC has already
+            // consumed a safe event boundary and does not corrupt the stream.
+            Err(error @ TransportError::Codec(_)) => Err(error),
+            Err(error @ (TransportError::Cancelled | TransportError::Timeout)) => {
+                if self.reader.terminal {
+                    self.closed = true;
+                }
+                Err(error)
+            }
+            Err(error) => {
+                self.closed = true;
+                Err(error)
+            }
         }
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
-        self.request_sink.flush()?;
-        Ok(())
+    fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        // Budget observed after the terminal branch and before the write-side
+        // commit, per the conversion template: an already-closed transport does
+        // no I/O and must stay Ok under cancellation, while a live one refuses
+        // before the blocking flush and stays retryable.
+        sse_checkpoint(cx)?;
+        self.closed = true;
+        self.request_sink.flush().map_err(TransportError::Io)
     }
 }
 
@@ -802,15 +1870,72 @@ impl<R: Read, W: Write> Transport for SseClientTransport<R, W> {
 // Tests
 // =============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedWriteBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriteBuffer {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("shared SSE output lock").clone()
+        }
+    }
+
+    impl Write for SharedWriteBuffer {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("shared SSE output lock poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ByteAtATime {
+        inner: Cursor<Vec<u8>>,
+    }
+
+    impl Read for ByteAtATime {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let limit = buffer.len().min(1);
+            self.inner.read(&mut buffer[..limit])
+        }
+    }
+
+    #[derive(Default)]
+    struct PartialWriteThenFail {
+        bytes: Vec<u8>,
+        wrote_partial_prefix: bool,
+    }
+
+    impl Write for PartialWriteThenFail {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.wrote_partial_prefix {
+                return Err(std::io::Error::other("write failed after partial SSE data"));
+            }
+            let written = buffer.len().min(8);
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.wrote_partial_prefix = true;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_sse_event_endpoint() {
         let event = SseEvent::endpoint("http://localhost:8080/messages");
-        let bytes = event.to_bytes();
+        let bytes = event.to_bytes().unwrap();
         let output = String::from_utf8(bytes).unwrap();
 
         assert!(output.contains("event: endpoint\n"));
@@ -819,9 +1944,56 @@ mod tests {
     }
 
     #[test]
+    fn sse_server_split_halves_preserve_endpoint_and_response() {
+        let output = SharedWriteBuffer::default();
+        let request = JsonRpcRequest::new("tools/list", None, 41_i64);
+        let (mut recv_half, mut send_half) =
+            SseServerTransport::new(output.clone(), [request.clone()].into_iter(), "/mcp")
+                .into_split();
+        let cx = Cx::for_testing();
+
+        let received = recv_half.recv(&cx).expect("split ingress request");
+        let JsonRpcMessage::Request(received) = received else {
+            panic!("split ingress must preserve the request variant");
+        };
+        assert_eq!(received.method, request.method);
+        assert_eq!(received.id, request.id);
+        send_half
+            .send(
+                &cx,
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    41.into(),
+                    serde_json::json!({"tools": []}),
+                )),
+            )
+            .expect("split egress response");
+
+        let bytes = String::from_utf8(output.bytes()).expect("SSE output is UTF-8");
+        assert!(bytes.starts_with("event: endpoint\ndata: /mcp\n\n"));
+        assert!(bytes.contains("event: message\n"));
+        assert!(bytes.contains("\"id\":41"));
+    }
+
+    #[test]
+    fn sse_server_split_cancelled_ingress_leaves_egress_unchanged() {
+        let output = SharedWriteBuffer::default();
+        let request = JsonRpcRequest::new("tools/list", None, 42_i64);
+        let (mut recv_half, _send_half) =
+            SseServerTransport::new(output.clone(), [request].into_iter(), "/mcp").into_split();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+
+        assert!(matches!(
+            recv_half.recv(&cx),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(output.bytes().len(), 0);
+    }
+
+    #[test]
     fn test_sse_event_message() {
         let event = SseEvent::message(r#"{"jsonrpc":"2.0","id":1}"#).with_id("42");
-        let bytes = event.to_bytes();
+        let bytes = event.to_bytes().unwrap();
         let output = String::from_utf8(bytes).unwrap();
 
         assert!(output.contains("event: message\n"));
@@ -832,7 +2004,7 @@ mod tests {
     #[test]
     fn test_sse_event_with_retry() {
         let event = SseEvent::message("test").with_retry(5000);
-        let bytes = event.to_bytes();
+        let bytes = event.to_bytes().unwrap();
         let output = String::from_utf8(bytes).unwrap();
 
         assert!(output.contains("retry: 5000\n"));
@@ -841,12 +2013,47 @@ mod tests {
     #[test]
     fn test_sse_event_multiline_data() {
         let event = SseEvent::message("line1\nline2\nline3");
-        let bytes = event.to_bytes();
+        let bytes = event.to_bytes().unwrap();
         let output = String::from_utf8(bytes).unwrap();
 
         assert!(output.contains("data: line1\n"));
         assert!(output.contains("data: line2\n"));
         assert!(output.contains("data: line3\n"));
+    }
+
+    #[test]
+    fn public_sse_event_round_trip_preserves_a_terminal_data_newline() {
+        let event = SseEvent::message("line\n");
+        let bytes = event.to_bytes().expect("terminal data field serializes");
+
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("SSE bytes remain UTF-8"),
+            "event: message\ndata: line\ndata: \n\n"
+        );
+        let mut reader = SseReader::new(Cursor::new(bytes));
+        let decoded = reader
+            .read_event(&Cx::for_testing())
+            .expect("public SSE reader accepts its public writer output")
+            .expect("one data event is dispatched");
+        assert_eq!(decoded.data, "line\n");
+    }
+
+    #[test]
+    fn public_sse_event_without_terminal_data_newline_does_not_invent_one() {
+        // Planted negative: only the final empty logical data field is absent.
+        let event = SseEvent::message("line");
+        let bytes = event.to_bytes().expect("single data field serializes");
+
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("SSE bytes remain UTF-8"),
+            "event: message\ndata: line\n\n"
+        );
+        let mut reader = SseReader::new(Cursor::new(bytes));
+        let decoded = reader
+            .read_event(&Cx::for_testing())
+            .expect("public SSE reader accepts its public writer output")
+            .expect("one data event is dispatched");
+        assert_eq!(decoded.data, "line");
     }
 
     #[test]
@@ -860,6 +2067,86 @@ mod tests {
 
         assert_eq!(event.event_type, SseEventType::Message);
         assert_eq!(event.data, "hello");
+    }
+
+    #[test]
+    fn event_without_data_is_not_dispatched_and_does_not_leak_its_type() {
+        let input = b"event: endpoint\n\ndata: payload\n\n";
+        let mut reader = SseReader::new(Cursor::new(input.to_vec()));
+
+        let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+
+        assert_eq!(event.event_type, SseEventType::Message);
+        assert_eq!(event.data, "payload");
+    }
+
+    #[test]
+    fn colonless_data_field_dispatches_an_empty_message_event() {
+        let input = b"data\n\n";
+        let mut reader = SseReader::new(Cursor::new(input.to_vec()));
+
+        let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+
+        assert_eq!(event.event_type, SseEventType::Message);
+        assert_eq!(event.data.len(), 0);
+    }
+
+    #[test]
+    fn reader_accepts_cr_crlf_and_lf_line_endings_even_when_split_across_reads() {
+        let input = b"id: 7\rretry: 1500\r\ndata: first\rdata: second\n\n";
+        let source = ByteAtATime {
+            inner: Cursor::new(input.to_vec()),
+        };
+        let mut reader = SseReader::new(source);
+
+        let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+
+        assert_eq!(event.event_type, SseEventType::Message);
+        assert_eq!(event.data, "first\nsecond");
+        assert_eq!(event.id.as_deref(), Some("7"));
+        assert_eq!(event.retry, Some(1500));
+        assert_eq!(reader.last_event_id(), Some("7"));
+        assert_eq!(reader.retry_interval(), Some(1500));
+    }
+
+    #[test]
+    fn id_and_retry_state_persist_while_nul_and_invalid_retry_fields_are_ignored() {
+        let input = b"id: stable\nretry: 2500\n\ndata: first\n\n\
+id: ignored\0value\nretry: -1\ndata: second\n\n\
+id\ndata: third\n\n";
+        let mut reader = SseReader::new(Cursor::new(input.to_vec()));
+        let cx = Cx::for_testing();
+
+        let first = reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(first.data, "first");
+        assert_eq!(first.id.as_deref(), Some("stable"));
+        assert_eq!(first.retry, Some(2500));
+
+        let second = reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(second.data, "second");
+        assert_eq!(second.id.as_deref(), Some("stable"));
+        assert_eq!(second.retry, Some(2500));
+
+        let third = reader.read_event(&cx).unwrap().unwrap();
+        assert_eq!(third.data, "third");
+        assert_eq!(third.id.as_deref(), Some(""));
+        assert_eq!(third.retry, Some(2500));
+        assert_eq!(reader.last_event_id(), Some(""));
+        assert_eq!(reader.retry_interval(), Some(2500));
+    }
+
+    #[test]
+    fn test_sse_reader_accepts_utf8_split_across_underlying_reads() {
+        let input = "event: message\ndata: méthod\n\n";
+        let reader = ByteAtATime {
+            inner: Cursor::new(input.as_bytes().to_vec()),
+        };
+        let mut sse_reader = SseReader::new(reader);
+
+        let event = sse_reader.read_event(&Cx::for_testing()).unwrap().unwrap();
+
+        assert_eq!(event.event_type, SseEventType::Message);
+        assert_eq!(event.data, "méthod");
     }
 
     #[test]
@@ -918,6 +2205,24 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n\n";
     }
 
     #[test]
+    fn test_sse_reader_rejects_escaped_duplicate_object_member() {
+        let input = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"first\",\"m\\u0065thod\":\"second\",\"id\":1}\n\n";
+        let reader = Cursor::new(input.to_vec());
+        let mut sse_reader = SseReader::new(reader);
+
+        let error = sse_reader.read_message(&Cx::for_testing()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Codec(CodecError::InvalidMessage {
+                kind: crate::InvalidMessageKind::Request,
+                ..
+            })
+        ));
+        assert!(error.to_string().contains("duplicate JSON object member"));
+    }
+
+    #[test]
     fn test_sse_reader_eof() {
         let input = b"";
         let reader = Cursor::new(input.to_vec());
@@ -927,6 +2232,44 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n\n";
         let result = sse_reader.read_event(&cx).unwrap();
 
         assert!(result.is_none());
+        assert!(matches!(
+            sse_reader.read_event(&cx),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn sse_reader_latches_documented_terminal_line_errors() {
+        let input = b"event: message\ndata: too-long\n\n";
+        let mut reader = SseReader::new(Cursor::new(input.to_vec()));
+        reader.max_line_size = 8;
+        let cx = Cx::for_testing();
+
+        assert!(matches!(reader.read_event(&cx), Err(TransportError::Io(_))));
+        assert!(reader.terminal);
+        assert!(matches!(
+            reader.read_event(&cx),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[test]
+    fn complete_invalid_message_event_does_not_poison_sse_reader() {
+        let input = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":1,\"id\":1}\n\n\
+event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
+        let mut reader = SseReader::new(Cursor::new(input.to_vec()));
+        let cx = Cx::for_testing();
+
+        assert!(matches!(
+            reader.read_message(&cx),
+            Err(TransportError::Codec(_))
+        ));
+        assert!(!reader.terminal);
+
+        let JsonRpcMessage::Request(request) = reader.read_message(&cx).unwrap().unwrap() else {
+            panic!("expected request");
+        };
+        assert_eq!(request.method, "valid");
     }
 
     #[test]
@@ -966,6 +2309,286 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n\n";
 
         let output = String::from_utf8(writer.into_inner()).unwrap();
         assert!(output.contains(": keep-alive\n"));
+    }
+
+    #[test]
+    fn sse_reader_and_writer_share_effective_message_ceiling() {
+        let reader = SseReader::new(Cursor::new(Vec::<u8>::new()));
+        let writer = SseWriter::new(Vec::<u8>::new());
+
+        assert_eq!(reader.codec.max_message_size(), MAX_SSE_MESSAGE_SIZE);
+        assert_eq!(writer.codec.max_message_size(), MAX_SSE_MESSAGE_SIZE);
+        // LIMIT-01: an 8 MiB decoded message, on a line of 8 MiB + 8 B, which
+        // is that message after `data: ` and before a CRLF terminator.
+        assert_eq!(MAX_SSE_MESSAGE_SIZE, 8 * 1024 * 1024);
+        assert_eq!(MAX_SSE_LINE_SIZE, 8 * 1024 * 1024 + 8);
+        assert_eq!(
+            MAX_SSE_MESSAGE_SIZE + b"data: \r\n".len(),
+            MAX_SSE_LINE_SIZE
+        );
+    }
+
+    #[test]
+    fn sse_writer_rejects_oversized_event_before_writing() {
+        let event = SseEvent::message("x".repeat(MAX_SSE_MESSAGE_SIZE + 1));
+        let mut writer = SseWriter::new(Vec::new());
+
+        let error = writer.write_event(&Cx::for_testing(), &event).unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Codec(CodecError::MessageTooLarge(size))
+                if size == MAX_SSE_MESSAGE_SIZE + 1
+        ));
+        assert_eq!(writer.inner().len(), 0);
+    }
+
+    #[test]
+    fn sse_writer_bounds_and_validates_typed_messages_before_writing() {
+        let cx = Cx::for_testing();
+        let mut writer = SseWriter::new(Vec::new());
+        let oversized = JsonRpcMessage::Response(JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::json!({"payload": "x".repeat(MAX_SSE_MESSAGE_SIZE)}),
+        ));
+        assert!(matches!(
+            writer.write_message(&cx, &oversized),
+            Err(TransportError::Codec(CodecError::MessageTooLarge(_)))
+        ));
+        assert_eq!(writer.inner().len(), 0);
+        assert_eq!(writer.event_counter, 0);
+
+        let invalid = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        });
+        assert!(matches!(
+            writer.write_message(&cx, &invalid),
+            Err(TransportError::Codec(CodecError::Json(_)))
+        ));
+        assert_eq!(writer.inner().len(), 0);
+        assert_eq!(writer.event_counter, 0);
+    }
+
+    /// One event whose single `data:` line carries `size` payload bytes and
+    /// ends, like the blank line after it, with `terminator`.
+    fn one_data_line_event(size: usize, terminator: &str) -> Vec<u8> {
+        let mut wire = b"data: ".to_vec();
+        wire.resize(wire.len() + size, b'x');
+        wire.extend_from_slice(terminator.as_bytes());
+        wire.extend_from_slice(terminator.as_bytes());
+        wire
+    }
+
+    /// LIMIT-01's decoded SSE JSON message, written out rather than read from
+    /// the constant under test.
+    const LIMIT_01_SSE_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+    #[test]
+    fn sse_reader_admits_a_limit_01_message_and_refuses_one_more_byte_on_lf_and_crlf_lines() {
+        let cx = Cx::for_testing();
+        let refusal =
+            format!("SSE event data exceeds maximum size of {LIMIT_01_SSE_MESSAGE_BYTES} bytes");
+        for terminator in ["\n", "\r\n"] {
+            let at_bound = one_data_line_event(LIMIT_01_SSE_MESSAGE_BYTES, terminator);
+            if terminator == "\r\n" {
+                // The maximal message on a CRLF line fills the line bound.
+                assert_eq!(at_bound.len() - terminator.len(), MAX_SSE_LINE_SIZE);
+            }
+            let event = SseReader::new(Cursor::new(at_bound))
+                .read_event(&cx)
+                .expect("an 8 MiB message is admitted")
+                .expect("its event dispatches");
+            assert_eq!(
+                event.data.len(),
+                LIMIT_01_SSE_MESSAGE_BYTES,
+                "{terminator:?}"
+            );
+
+            let error = SseReader::new(Cursor::new(one_data_line_event(
+                LIMIT_01_SSE_MESSAGE_BYTES + 1,
+                terminator,
+            )))
+            .read_event(&cx)
+            .expect_err("one byte more is refused");
+            assert!(
+                matches!(&error, TransportError::Io(io)
+                    if io.kind() == std::io::ErrorKind::InvalidData
+                        && io.to_string() == refusal),
+                "{terminator:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_reader_admits_a_limit_01_lf_line_and_refuses_one_more_byte() {
+        let cx = Cx::for_testing();
+        // A comment line of `line_bytes` including its LF, then one event.
+        let comment_then_event = |line_bytes: usize| {
+            let mut wire = b": ".to_vec();
+            wire.resize(line_bytes - 1, b'x');
+            wire.extend_from_slice(b"\ndata: ok\n\n");
+            wire
+        };
+
+        let event = SseReader::new(Cursor::new(comment_then_event(MAX_SSE_LINE_SIZE)))
+            .read_event(&cx)
+            .expect("a line of exactly the bound is admitted")
+            .expect("the following event dispatches");
+        assert_eq!(event.data, "ok");
+
+        let error = SseReader::new(Cursor::new(comment_then_event(MAX_SSE_LINE_SIZE + 1)))
+            .read_event(&cx)
+            .expect_err("one byte more is refused");
+        assert!(
+            matches!(&error, TransportError::Io(io)
+                if io.to_string() == format!("SSE line exceeds maximum size of {MAX_SSE_LINE_SIZE} bytes")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn sse_writer_admits_a_limit_01_message_and_refuses_one_more_byte_for_lf_and_crlf_data() {
+        let cx = Cx::for_testing();
+        for crlf in [false, true] {
+            // One data line, or the same size split by a CRLF that the writer
+            // normalizes into two LF-terminated data lines.
+            let data = |size: usize| {
+                if crlf {
+                    format!("a\r\n{}", "x".repeat(size - 3))
+                } else {
+                    "x".repeat(size)
+                }
+            };
+
+            let mut writer = SseWriter::new(Vec::new());
+            writer
+                .write_event(&cx, &SseEvent::message(data(LIMIT_01_SSE_MESSAGE_BYTES)))
+                .expect("an 8 MiB message is written");
+            let echoed = SseReader::new(Cursor::new(writer.into_inner()))
+                .read_event(&cx)
+                .expect("the written event is admitted by the reader")
+                .expect("its event dispatches");
+            assert_eq!(
+                echoed.data,
+                data(LIMIT_01_SSE_MESSAGE_BYTES).replace("\r\n", "\n"),
+                "crlf={crlf}"
+            );
+
+            let mut refused = SseWriter::new(Vec::new());
+            let error = refused
+                .write_event(
+                    &cx,
+                    &SseEvent::message(data(LIMIT_01_SSE_MESSAGE_BYTES + 1)),
+                )
+                .expect_err("one byte more is refused");
+            assert!(
+                matches!(error, TransportError::Codec(CodecError::MessageTooLarge(size))
+                    if size == LIMIT_01_SSE_MESSAGE_BYTES + 1),
+                "crlf={crlf}: {error:?}"
+            );
+            assert!(refused.inner().is_empty(), "crlf={crlf}");
+        }
+    }
+
+    #[test]
+    fn partial_sse_write_latches_writer_closed_but_validation_errors_do_not() {
+        let cx = Cx::for_testing();
+        let mut reusable = SseWriter::new(Vec::new());
+        assert!(SseEvent::message("bad\rfield").to_bytes().is_err());
+        assert!(
+            reusable
+                .write_event(&cx, &SseEvent::message("bad\rfield"))
+                .is_err()
+        );
+        assert!(!reusable.closed);
+        reusable
+            .write_event(&cx, &SseEvent::message("valid"))
+            .unwrap();
+
+        let mut writer = SseWriter::new(PartialWriteThenFail::default());
+        let error = writer
+            .write_event(&cx, &SseEvent::message("will be partial"))
+            .unwrap_err();
+
+        assert!(matches!(error, TransportError::Io(_)));
+        assert!(writer.closed);
+        assert_ne!(writer.inner().bytes.len(), 0);
+        assert!(matches!(
+            writer.write_event(&cx, &SseEvent::message("retry")),
+            Err(TransportError::Closed)
+        ));
+        assert!(writer.close(&cx).is_ok());
+        assert!(writer.close(&cx).is_ok());
+    }
+
+    #[test]
+    fn sse_event_rejects_nul_and_bare_carriage_return_but_accepts_multiline_data() {
+        for data in ["safe\0data", "safe\revent: endpoint"] {
+            let error = SseEvent::message(data).to_bytes().unwrap_err();
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::InvalidInput
+            ));
+        }
+
+        for data in ["first\nsecond", "first\r\nsecond"] {
+            let output = String::from_utf8(SseEvent::message(data).to_bytes().unwrap()).unwrap();
+            assert!(output.contains("data: first\ndata: second\n"));
+            assert!(!output.contains('\r'));
+        }
+    }
+
+    #[test]
+    fn sse_writer_rejects_event_id_injection_before_writing() {
+        for id in ["safe\nid: injected", "safe\revent: endpoint", "safe\0id"] {
+            let event = SseEvent::message("data").with_id(id);
+            assert!(event.to_bytes().is_err());
+            let mut writer = SseWriter::new(Vec::new());
+
+            let error = writer.write_event(&Cx::for_testing(), &event).unwrap_err();
+
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::InvalidInput
+            ));
+            assert_eq!(writer.inner().len(), 0);
+        }
+    }
+
+    #[test]
+    fn sse_writer_rejects_comment_and_endpoint_injection_before_writing() {
+        for comment in [
+            "safe\ndata: injected",
+            "safe\revent: message",
+            "safe\0comment",
+        ] {
+            let mut writer = SseWriter::new(Vec::new());
+            let error = writer
+                .write_comment(&Cx::for_testing(), comment)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source)
+                    if source.kind() == std::io::ErrorKind::InvalidInput
+            ));
+            assert_eq!(writer.inner().len(), 0);
+        }
+
+        let mut writer = SseWriter::new(Vec::new());
+        let error = writer
+            .write_endpoint(&Cx::for_testing(), "https://example.invalid\nretry: 0")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(writer.inner().len(), 0);
     }
 
     #[test]
@@ -1179,6 +2802,7 @@ data: {\"jsonrpc\":\"2.0\",\"method\":\"test\"}\n\
         // EOF after requests are exhausted
         let result = transport.recv(&cx);
         assert!(matches!(result, Err(TransportError::Closed)));
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
     }
 
     #[test]
@@ -1303,7 +2927,7 @@ data: }\n\
     fn sse_event_empty_data_serialization() {
         // Empty data should still produce a "data: " line
         let event = SseEvent::message("");
-        let bytes = event.to_bytes();
+        let bytes = event.to_bytes().unwrap();
         let output = String::from_utf8(bytes).unwrap();
 
         assert!(output.contains("data: \n"));
@@ -1338,12 +2962,34 @@ data: }\n\
     }
 
     #[test]
+    fn sse_writer_event_counter_exhaustion_fails_before_writing() {
+        let mut writer = SseWriter::new(Vec::new());
+        writer.event_counter = u64::MAX;
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        ));
+
+        let error = writer
+            .write_message(&Cx::for_testing(), &message)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransportError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(writer.inner().len(), 0);
+        assert_eq!(writer.event_counter, u64::MAX);
+    }
+
+    #[test]
     fn sse_writer_inner_and_inner_mut_accessors() {
         let buffer: Vec<u8> = Vec::new();
         let mut writer = SseWriter::new(buffer);
 
         // inner() returns a reference
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
 
         // inner_mut() allows mutation
         writer.inner_mut().extend_from_slice(b"raw");
@@ -1383,7 +3029,69 @@ event: endpoint\ndata: http://localhost/post\n\n";
             SseServerTransport::new(buffer, requests.into_iter(), "http://localhost/post");
 
         // close() should succeed (flushes the underlying writer)
-        transport.close().unwrap();
+        let cx = Cx::for_testing();
+        transport.close(&cx).unwrap();
+        transport.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn partial_sse_client_request_write_latches_transport_closed() {
+        let incoming = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":null,\"id\":1}\n\n";
+        let mut transport = SseClientTransport::new(
+            Cursor::new(incoming.to_vec()),
+            PartialWriteThenFail::default(),
+        );
+        let cx = Cx::for_testing();
+        let request = JsonRpcRequest::new("tools/list", None, 1_i64);
+
+        assert!(matches!(
+            transport.send(&cx, &JsonRpcMessage::Request(request)),
+            Err(TransportError::Io(_))
+        ));
+        assert!(transport.closed);
+        assert_ne!(transport.request_sink.bytes.len(), 0);
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+        assert!(transport.close(&cx).is_ok());
+        assert!(transport.close(&cx).is_ok());
+    }
+
+    #[test]
+    fn terminal_sse_reader_error_latches_client_transport_closed() {
+        let input = b"event: message\ndata: too-long\n\n";
+        let mut transport = SseClientTransport::new(Cursor::new(input.to_vec()), Vec::<u8>::new());
+        transport.reader.max_line_size = 8;
+        let cx = Cx::for_testing();
+
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Io(_))));
+        assert!(transport.closed);
+        assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn sse_client_prewrite_codec_failure_is_recoverable() {
+        let mut transport =
+            SseClientTransport::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new());
+        let cx = Cx::for_testing();
+        let invalid = JsonRpcResponse {
+            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
+            result: None,
+            error: None,
+            id: Some(fastmcp_protocol::RequestId::Number(1)),
+        };
+
+        assert!(matches!(
+            transport.send(&cx, &JsonRpcMessage::Response(invalid)),
+            Err(TransportError::Codec(CodecError::Json(_)))
+        ));
+        assert!(!transport.closed);
+
+        transport
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::new("still-open", None, 2_i64)),
+            )
+            .unwrap();
+        assert_ne!(transport.request_sink.len(), 0);
     }
 
     #[test]

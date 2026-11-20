@@ -2,7 +2,7 @@
 name = "fastmcp-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "Core types and context for FastMCP"
 repository.workspace = true
@@ -17,6 +17,18 @@ asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+# FND-01 CORE-*: inherit exact root pins (no local version/feature rewrites)
+chacha20poly1305 = { workspace = true }
+getrandom = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# Unit tests exercise asupersync's deliberately test-only context constructors.
+# This edge is absent from the published production dependency graph.
+asupersync = { workspace = true, features = ["test-internals"] }
 
 [lints]
 workspace = true

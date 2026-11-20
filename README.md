@@ -1,29 +1,262 @@
 <p align="center">
-  <img src="fastmcp_rust_illustration.webp" alt="FastMCP Rust - High-performance MCP framework" width="800">
+  <img src="fastmcp_rust_illustration.webp" alt="FastMCP Rust - cancel-aware MCP framework" width="800">
 </p>
 
 <h1 align="center">FastMCP Rust</h1>
 
 <p align="center">
-  <strong>High-performance Model Context Protocol (MCP) framework for Rust</strong>
+  <strong>Cancel-aware Model Context Protocol (MCP) framework for Rust</strong>
 </p>
 
 <p align="center">
-  <em>A Rust port of <a href="https://github.com/jlowin/fastmcp">jlowin/fastmcp</a> (Python), extended with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for structured concurrency and cancel-correct async.</em>
+  <em>A Rust port of <a href="https://github.com/jlowin/fastmcp">jlowin/fastmcp</a> (Python), extended with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> capability contexts and cooperative-cancellation primitives.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dicklesworthstone/fastmcp_rust/actions/workflows/ci.yml"><img src="https://github.com/Dicklesworthstone/fastmcp_rust/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.85%2B_(nightly)-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/License-MIT%20with%20rider-blue.svg" alt="MIT License with rider">
+  <img src="https://img.shields.io/badge/rust-nightly--2026--08--25-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
+  <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
+
+> **Protocol status (2026-08-27):** MCP 2026-07-28 support is under
+> implementation and remains unverified. The root compatibility
+> `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
+> `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
+> historical parity rows are not conformance or release evidence. Versions
+> through 0.13.0 have been published, but publication and source edits alone do
+> not prove historical workflow identities, queued runs, or credentials inert;
+> provider-side release-safety evidence is still required.
+
+### Measured official-conformance standing
+
+Run it yourself with `scripts/run_official_conformance.sh`; it owns the suite
+pin and the result tally. Measurements use
+`@modelcontextprotocol/conformance@0.2.0-alpha.10`,
+`--spec-version 2026-07-28 --suite all`, server mode against the in-tree
+`conformance_server` adapter:
+
+| revision | date | scenarios | checks | SUCCESS | FAILURE | WARNING | INFO |
+|---|---|---|---|---|---|---|---|
+| `1c2dc896` | 2026-10-12 | 40 | 115 | **112** | **0** | 2 | 1 |
+| `e2a0ac5c` | 2026-10-12 | 40 | 115 | 110 | **0** | 4 | 1 |
+| `99a3b4e8` | 2026-10-05 | 40 | 115 | 110 | **0** | 4 | 1 |
+| working tree (unanchored) | 2026-10-04 | 40 | 115 | 110 | **0** | 4 | 1 |
+| `6b54e023` | 2026-10-03 | 40 | 114 | 108 | 1 | 4 | 1 |
+| `bba5a09f` | 2026-10-01 | 40 | 92 | 54 | 38 | 0 | 0 |
+
+The `99a3b4e8` row is bound to identity rather than to a date, which the row
+above it is not: 98 commits and 388 lines across four server-mode source files
+(`fastmcp-core/src/context.rs`, `fastmcp-protocol/src/server_discovery.rs`,
+`fastmcp-server/src/lib.rs`, `fastmcp/src/lib.rs`) landed after the 2026-10-04
+measurement, which under this project's own receipt rules invalidated it. The
+re-measurement reproduces it exactly, so the standing held across that drift —
+but that is now a measured fact rather than an assumption. Its bindings:
+
+    HEAD              99a3b4e8f0ebd56357f34953754ac6912df0597b
+    adapter blob      0b887aedeb0b7f6ad3ddceb5ea3cc3523bbab29b
+    adapter sha256    a66f0bee...e149b4   crates/fastmcp/examples/conformance_server.rs
+    binary sha256     74c18713...e54a1a   target/debug/conformance_server
+    toolchain         rustc 1.100.0-nightly (e7769602a 2026-08-24)
+    host              hz3 (x86_64 linux), direct ssh, RCH scheduler bypassed
+    build             cargo build --locked -p fastmcp-rust --features tasks
+                      --bin conformance_server, rc 0, 32m24s
+
+**`--baseline` cannot currently pass, and that is a property of the gate, not
+of the server.** The suite's own `--expected-failures` treats a scenario
+carrying a SHOULD-level WARNING as a scenario failure, so this run reported
+`suite exit status: 1` and named `server-stateless`,
+`input-required-result-missing-input-response` and
+`input-required-result-ignore-extra-params` as "unexpected failures" while its
+own tally printed `110 passed, 0 failed`. Anyone wiring `--baseline` into a
+gate today gets a permanent red. Resolving that means either listing those
+scenarios (an expected-failures edit, which `scripts/conformance-expected-failures.yaml`
+deliberately reserves to its owner) or gating on the tally instead; it is not
+resolved here.
+
+**These rows are not a ratio, and the denominator is not fixed.** It rose 92 →
+114 → 115 because a scenario that fails an early check never runs its later
+ones, so fixing one check can *add* checks to the run. The corollary is a trap:
+a regression that makes a scenario abort earlier shrinks the denominator and can
+push a percentage *up*. Compare the *sets* of failing check ids, which is what
+`scripts/conformance-expected-failures.yaml` records and what the suite's own
+`--expected-failures` gates on.
+
+**Client mode.** The gate is the harness passing in *both* modes. Most recent
+run, 32 scenarios / 155 checks: SUCCESS=55, FAILURE=46, SKIPPED=2, WARNING=1,
+INFO=51. Split it before quoting it, because the halves measure different
+things:
+
+| | checks | SUCCESS | FAILURE |
+|---|---|---|---|
+| non-authorization | 55 | 52 | **0** |
+| authorization | 100 | 3 | 46 |
+
+- **Non-authorization: no FAILURE-level check remains.** `http-custom-headers`
+  18/18, `http-invalid-tool-headers` 11/11, `http-standard-headers` 9/9 (2
+  skipped), `sep-2322-client-request-state` 5/5, `json-schema-ref-no-deref`,
+  `request-metadata` (1 SHOULD warning) and `tools_call` clean. SEP-2243
+  parameter-header mirroring is exercised end to end: designated parameters are
+  sent as `Mcp-Param-*`, encoded where the value is header-unsafe, omitted when
+  null, and never added for an undesignated parameter — and a tool whose
+  `x-mcp-header` annotations are invalid is excluded rather than called.
+- **Authorization: the adapter, not the library.** `conformance_client`
+  supplies no interactive OAuth driver, so these measure adapter completeness.
+  It does ship a *non-interactive* authorization-code driver —
+  `examples/conformance_oauth.rs` plus its `managed` submodule, compiled into
+  the adapter as a module and wired at `conformance_client.rs:376` — but that
+  driver is inert unless `FASTMCP_CONFORMANCE_OAUTH` carries its configuration,
+  and nothing in this repository sets it, including
+  `scripts/run_official_conformance.sh`. So these checks measure the adapter
+  with authorization switched off. **No value of that variable can switch it
+  on, though.** Measured 2026-10-12 against the pinned suite: `configure`
+  requires the `resource` member to equal the MCP endpoint *and* to use
+  `https` (`conformance_oauth.rs:306`), and `issuer` and
+  `authorization_endpoint` are required static pins rather than discovered
+  values. The suite serves plain HTTP on an ephemeral loopback port and has no
+  TLS capability at all — a census of its 472,891-byte bundle finds
+  `http://localhost:${this.port}` and `http://127.0.0.1:${e}` against **zero**
+  occurrences of `createSecureServer`, `node:tls`, or any cert/key material —
+  and it stands up a fresh authorization server per scenario, across 25
+  `auth/*` client scenarios that deliberately vary the issuer
+  (`iss-wrong-issuer`, `metadata-issuer-mismatch`,
+  `authorization-server-migration`). So the driver refuses any configuration
+  naming the suite's endpoint, on two independent grounds. Closing these needs
+  a separate loopback-HTTP adapter profile, not a configuration value; relaxing
+  the shipped driver's HTTPS requirement to move a conformance number would
+  weaken a deliberate security property, so that is not on the table.
+  **They are also not one problem.** The
+  pinned suite drives PKCE (`code_challenge`), `authorization_code`, dynamic
+  `register`, and 401 `WWW-Authenticate` + `resource_metadata` discovery, all of
+  which this client implements. It also carries a DPoP family — `sep-1932-client-dpop-auth-scheme`,
+  `-token-request-proof`, `-fresh-proof`, `-as-nonce`, `-rs-nonce` — and DPoP
+  (RFC 9449) is **not implemented**: `http_auth/discovery/challenge.rs` states
+  "No automatic login/retry, DPoP, DCR, DNS pinning, or OIDC identity
+  authentication is installed", and a sender-constrained token (`token_type:
+  "DPoP"`, or a `cnf` holding `jkt`) is deliberately *rejected*. So some of
+  these checks await an adapter profile that does not exist yet, and at least
+  the DPoP ones additionally need a library capability that does not exist. How
+  the 46 split between those two is not measured here.
+  The nine
+  in-tree `oauth_*` test targets are gated on `native-tls-roots`; each one now
+  carries a matching `required-features` stanza, so a default run *excludes*
+  them and naming one explicitly makes cargo refuse. They are therefore not a
+  vacuous pass — but they are also not evidence those flows work, because a
+  default run does not execute them at all.
+
+Client-mode conformance is measured; aggregate conformance is still **not**
+claimed, in either mode.
+
+No server-mode FAILURE-level check remains, and **two of the four SHOULD-level
+warnings are now gone**. The two that cleared were
+`sep-2575-server-sends-tools-list-changed-on-subscription` and its prompts
+counterpart, which the adapter had declined on the stated grounds that "the
+server has no runtime catalog-mutation API". That was false: `McpContext`
+exposes `disable_tool`/`enable_tool` and the resource and prompt pairs, each
+publishing a catalog change, and the server already attached both the session
+state and the `subscriptions/listen` publisher. Serving the suite's two trigger
+fixtures through that API took no library change at all — only
+`examples/conformance_server.rs`, +93/-4. The `e2a0ac5c` and `1c2dc896` rows
+above are a measured before/after over an identical 99-check id set, with
+exactly those two statuses changing and nothing else moving, so the +2 is not a
+denominator shift.
+
+The two remaining warnings are enumerated in that same file: both are the
+deliberate fail-closed choice about empty MRTR response maps that the suite
+would prefer we relax.
+
+**What this is not.** It is a count of named checks at one revision, under one
+adapter, over HTTP. It is not aggregate MCP 2026-07-28 conformance, and it says
+nothing about the qualification boundaries below — several of which (OAuth/OIDC
+production profile, end-to-end quiescence, `awaitCleanup`) the suite does not
+exercise at all. The suite's default `--suite active` omits roughly half the
+scenarios, including every input-required one, so a measurement taken without
+`--suite all` is not comparable to these rows.
+
+### Current qualification boundaries
+
+- **Wire cancellation is only partially qualified:** on Unix, the primary
+  stdio path keeps receiving while bounded modern requests run in independent
+  request-owned children, so it can route cancellation during handler
+  execution. Response and notification commits remain serialized at the
+  output writer, while exact MCP 2024-11-05 traffic remains serialized through
+  its lifecycle worker. Non-Unix stdio and custom/SSE/WebSocket entry points
+  retain sequential or blocking boundaries, except that an unsplit custom
+  transport runs `subscriptions/listen` off its receive loop and queues output
+  produced while `recv` blocks until `recv` returns. A non-cooperative handler can
+  still exceed the bounded process-exit drain, so end-to-end quiescence and
+  reliable `awaitCleanup` semantics remain unverified.
+- **Bidirectional calls are only partly qualified:** the Unix stdio receive
+  pump can route sampling, elicitation, and roots responses while exact-2024
+  lifecycle work or modern request children are active. The WebSocket server
+  and custom split transports share that pump: live `bind_websocket` tests
+  show an exact-2024 handler awaiting `ctx.sample` or `ctx.list_roots`
+  (including a synchronous handler that bridges with `block_on`) receives the
+  client's reply, and a client without the capability gets a typed refusal
+  instead of a hang. Non-Unix stdio, unsplit custom transports, and SSE still
+  reject or lack that split routing. Public HTTP has its own dual-era request
+  and response routing, but end-to-end bidirectional lifecycle/cancellation
+  evidence is incomplete.
+- **Response caching is conservatively partitioned:** eligible production
+  requests are keyed by committed authentication facts plus opaque session
+  identity and revision. Uncommitted authentication, local-only state views,
+  allocation failure, or state mutation during a request cause cache admission
+  to fail closed rather than sharing an entry.
+- **Authentication admission is incomplete:** native HTTP accepts credentials
+  only from `Authorization`; recognized body/meta and query credential fields
+  are rejected before the provider or application runs. Other adapters retain
+  a stripped legacy JSON-RPC credential fallback. Complete authorization,
+  lease/revocation, and OAuth challenge qualification remain open.
+- **Legacy Tasks RPC stays dead:** `tasks/list` and `tasks/submit` return
+  JSON-RPC `MethodNotFound`. Official MCP 2026-07-28 methods `tasks/get`,
+  `tasks/update`, and `tasks/cancel` are served by default (process-local
+  in-memory store). Call `ServerBuilder::final_tasks` to supply an
+  application-owned store.
+- **Task creation needs an application supervisor.** Configure
+  `ServerBuilder::task_supervisor(Arc::new(supervisor))` to host an
+  `ApplicationTaskSupervisor` on the default runtime or the runtime supplied
+  by `final_tasks`. The server starts the service within the caller-owned
+  serve lifetime, waits for readiness, and settles it on exit. The shipped
+  `echo_server` uses this hook. A server without a ready service still refuses
+  creation with `Final task creation requires an installed ready task service`.
+  Applications may instead install and drive `AuthorizedTaskServiceRunner`
+  explicitly; combining that installation with the builder hook is rejected.
+- **Authenticated local Tasks retain their caller:** task creation atomically
+  stores a private principal binding. Request get/update/cancel and Tasks
+  subscriptions enforce that binding; a refreshed credential for the same
+  verified owner can continue the task. Custom stores must implement atomic
+  authenticated creation and preserve the binding in every snapshot.
+  Context-free runtime and subscription APIs are trusted embedding controls.
+  Anonymous client isolation, proxy Tasks ownership, durable authorization,
+  grant revalidation, and revocation remain unqualified.
+- **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
+  remain available for development, but production security/profile
+  conformance is unverified and no production-support claim is made for them.
+- **CLI inspection is bounded diagnostics, not conformance evidence:** with
+  default features in a current source checkout, `fastmcp inspect
+  --protocol-policy` reports the selected `auto`, `modern-only`, or
+  `legacy-only` era. A selected modern session requires valid
+  `_meta.io.modelcontextprotocol/serverInfo` metadata and retains the open
+  discovery capability shape (including `completions` and `extensions`)
+  subject to output bounds and credential/control-text sanitization; a
+  selected legacy session renders only the exact legacy capability shape. A
+  `--no-default-features` build supports `modern-only` only. This does not
+  qualify either protocol era as aggregate conformance or production
+  readiness.
+- **Subprocess cleanup is explicit and platform-bounded:**
+  `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
+  `fastmcp test` is Unix-only and fails before spawn elsewhere. Its
+  `--protocol-policy` option binds both client negotiation and the launched
+  FastMCP server profile. It uses a live
+  anchor plus an owner-death channel, but cannot contain descendants that
+  change group/session, withstand a competing global child reaper, or close a
+  control descriptor copied by a host-side fork. Drop is best effort.
 
 ---
 
 ```bash
-# Add to your project (crates.io)
-cargo add fastmcp-rust
+# Current published package; publication is not aggregate conformance evidence
+cargo add fastmcp-rust@0.13.0
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -35,42 +268,68 @@ cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
 
 ### The Problem
 
-Building MCP servers in Rust is painful:
-- No first-class async support with proper cancellation
-- Manual JSON-RPC boilerplate for every tool
-- No structured concurrency—orphan tasks and resource leaks
-- Request timeouts are afterthoughts, not guarantees
+MCP server implementations need to solve several recurring problems:
+
+- Handler schemas and JSON-RPC dispatch
+- Cooperative cancellation and request budgets
+- Ownership of concurrent child work
+- Transport framing and session lifecycle
 
 ### The Solution
 
-**FastMCP Rust** is a batteries-included MCP framework with cancel-correct async, attribute macros, and structured concurrency baked in:
+**FastMCP Rust** is an MCP framework with asupersync capability contexts, attribute macros, and explicit cancellation/budget surfaces:
 
 ```rust
-use fastmcp_rust::prelude::*;
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool]
-async fn greet(ctx: &McpContext, name: String) -> String {
-    ctx.checkpoint()?;  // Cancellation point
-    format!("Hello, {name}!")
+async fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
+    ctx.checkpoint()?; // Cancellation point
+    Ok(format!("Hello, {name}!"))
 }
 
 fn main() {
-    Server::new("my-server", "1.0.0")
-        .tool(greet)
-        .run_stdio();
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
+        .build()
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("my-server", "1.0.0")
+            // Attribute macros generate PascalCase handler values.
+            .tool(Greet)
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
+
+The application creates the runtime once and supplies its context. FastMCP does
+not create a runtime at this entry point. `run_stdio_with_cx` needs a blocking
+pool because its receive pump blocks on `recv`; that is a property of this entry
+point, not of the framework. On Unix you can instead serve reactor-driven
+process stdio with no blocking pool at all — see
+[Non-blocking stdio](#non-blocking-stdio-unix-opt-in). See Quick Start below for
+the dependency declarations.
+
+`auto::ServerBuilder` serves MCP 2026-07-28 clients and also the exact
+2024-11-05 `initialize` handshake that today's desktop clients and the MCP
+Inspector open with. `modern::ServerBuilder` pins a server to 2026-07-28 alone,
+so it refuses those clients.
 
 ### Why FastMCP Rust?
 
 | Feature | FastMCP Rust | Manual Implementation |
 |---------|--------------|----------------------|
-| **Async handlers** | `#[tool] async fn` | Manual Future boxing |
-| **Cancellation** | `ctx.checkpoint()` | Hope for the best |
-| **Timeouts** | Budget-based, automatic | Roll your own |
-| **Structured concurrency** | Region-scoped tasks | Orphan task leaks |
+| **Async handler API** | `#[tool] async fn` plus handler trait hooks | Manual Future boxing |
+| **Cancellation** | Local request checkpoints; live wire interruption remains unverified | Application-specific checks |
+| **Timeouts** | Request and handler budget surfaces | Application-specific timers |
+| **Concurrent-future ownership** | Context combinators poll caller-owned futures | Manual ownership |
 | **Error handling** | 4-valued Outcome | 2-valued Result |
-| **Boilerplate** | Zero (macros) | 100+ lines per tool |
+| **Boilerplate** | Generated handler/schema implementations | Handwritten handler/schema implementations |
 
 ---
 
@@ -79,111 +338,136 @@ fn main() {
 This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI coding agents. Key points:
 
 - **Porting methodology:** Extract spec from legacy → implement from spec → never translate line-by-line
-- **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for cancel-correct async (not tokio directly)
+- **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) exclusively; Tokio and Tokio-based adapters are unsupported
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-- **Toolchain:** Rust 2024 edition, nightly required
+- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-08-25` / rustc 1.100.0-nightly (`rust-version = "1.100"`)
+- **MCP 2026-07-28 support is under implementation and remains unverified.**
+- **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
+- **The root compatibility `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. Neither is proof of negotiated 2026-07-28 support.**
 
 ---
 
 ## Quick Example
 
 ```rust
-use fastmcp_rust::prelude::*;
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 // Define a tool with automatic JSON schema generation
 #[tool(description = "Calculate the sum of two numbers")]
-async fn add(ctx: &McpContext, a: i64, b: i64) -> i64 {
-    ctx.checkpoint()?;  // Check for client disconnect
-    a + b
+async fn add(ctx: &McpContext, a: i64, b: i64) -> McpResult<String> {
+    ctx.checkpoint()?; // Check the local cancellation token and budget
+    Ok((a + b).to_string())
 }
 
-// Define a resource
-#[resource(uri = "file://config.json", description = "Application config")]
-async fn read_config(ctx: &McpContext) -> String {
+// Define an in-memory resource. Potentially blocking filesystem work is not
+// performed inline on the dispatch worker.
+#[resource(uri = "config://settings", description = "Application config")]
+fn config(ctx: &McpContext) -> McpResult<String> {
     ctx.checkpoint()?;
-    std::fs::read_to_string("config.json").unwrap_or_default()
+    Ok(r#"{"theme":"dark"}"#.to_owned())
 }
 
 // Define a prompt template
 #[prompt(description = "Generate a greeting message")]
-async fn greeting_prompt(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
+async fn greeting(ctx: &McpContext, name: String) -> McpResult<Vec<PromptMessage>> {
     ctx.checkpoint()?;
-    vec![PromptMessage::user(format!("Please greet {name} warmly."))]
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text(format!("Please greet {name} warmly.")),
+    }])
 }
 
 fn main() {
-    Server::new("example-server", "1.0.0")
-        .tool(add)
-        .resource(read_config)
-        .prompt(greeting_prompt)
-        .request_timeout(30)  // 30-second budget per request
-        .run_stdio();
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
+        .build()
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("example-server", "1.0.0")
+            .tool(Add)
+            .resource(ConfigResource)
+            .prompt(GreetingPrompt)
+            .request_timeout(30) // 30-second budget per request
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
 
 Run it:
 
 ```bash
-cargo run --example server
+# echo_server is a shipped binary target of the facade crate, not an example
+cargo run -p fastmcp-rust --bin echo_server
 ```
 
 ---
 
 ## Design Philosophy
 
-### 1. Cancel-Correctness Over Convenience
+### 1. Explicit Cooperative Cancellation
 
-Every async operation must be cancellable. Silent drops cause data loss. FastMCP uses checkpoints:
+Handlers should check cancellation at natural suspension or iteration boundaries. FastMCP exposes cooperative checkpoints. These local context semantics do not, by themselves, make cancellation interruptible over a live connection; see the qualification boundaries above.
 
 ```rust
 #[tool]
-async fn process_items(ctx: &McpContext, items: Vec<Item>) -> Vec<Result> {
+async fn process_items(
+    ctx: &McpContext,
+    items: Vec<String>,
+) -> McpResult<Vec<Content>> {
     let mut results = vec![];
     for item in items {
         ctx.checkpoint()?;  // Allow graceful cancellation between items
-        results.push(process(item).await);
+        results.push(Content::text(process(item).await?));
     }
-    results
+    Ok(results)
 }
 ```
 
 ### 2. Budgets, Not Timeouts
 
-Timeouts are "we gave up." Budgets are "you have X resources." The Budget type tracks deadline, poll quota, and cost quota as a product semiring:
+Timeouts are "we gave up." Budgets are "you have X resources." The `Budget` type represents deadline, poll-quota, and cost-quota dimensions:
 
 ```rust
-// Server enforces 30-second budget per request
-Server::new("server", "1.0.0")
-    .request_timeout(30)
-    .tool(my_tool)
-    .run_stdio();
+// Called from the application's runtime with its context.
+async fn serve(cx: &Cx) -> ! {
+    ServerBuilder::new("server", "1.0.0")
+        .request_timeout(30) // 30-second server-owned request ceiling
+        .tool(MyTool)
+        .build()
+        .run_stdio_with_cx(cx)
+        .await
+}
 
 // Handler can check remaining budget
 #[tool]
-async fn my_tool(ctx: &McpContext) -> String {
-    if ctx.budget().is_exhausted() {
-        return "Budget exhausted".to_string();
-    }
+async fn my_tool(ctx: &McpContext) -> McpResult<String> {
+    ctx.checkpoint()?;
     // ... work ...
+    Ok("work completed".to_string())
 }
 ```
 
 ### 3. Four-Valued Outcomes
 
-`Result<T, E>` conflates "operation failed" with "operation was cancelled" and "operation panicked." FastMCP uses `Outcome<T, E>`:
+`Result<T, E>` has no distinct cancellation or panic variants. FastMCP's asynchronous handler boundary uses `Outcome<T, E>`:
 
 ```rust
 enum Outcome<T, E> {
-    Ok(T),           // Success
-    Err(E),          // Expected failure
-    Cancelled(Why),  // External interruption
-    Panicked(Msg),   // Internal failure
+    Ok(T),                    // Success
+    Err(E),                   // Expected failure
+    Cancelled(CancelReason),  // External interruption
+    Panicked(PanicPayload),   // Internal failure
 }
 ```
 
-### 4. Capability Security
+### 4. Capability-oriented handlers
 
-No ambient authority. All effects flow through explicit `McpContext`:
+Request authority flows through `McpContext`; application dependencies should likewise be passed explicitly instead of hidden in globals:
 
 ```rust
 // BAD: Global state access
@@ -197,48 +481,62 @@ async fn good_tool(ctx: &McpContext, db: &DbHandle) {
 }
 ```
 
-### 5. Structured Concurrency
+### 5. Owned Concurrent Futures
 
-All spawned tasks belong to regions. When a region closes, all children complete or drain. No orphan tasks:
+Concurrent child futures remain owned by the request handler and are polled together by context combinators:
 
 ```rust
+use std::future::Future;
+use std::pin::Pin;
+
 #[tool]
-async fn parallel_fetch(ctx: &McpContext, urls: Vec<String>) -> Vec<String> {
-    // All spawned tasks are scoped to this request's region
-    let handles: Vec<_> = urls.iter()
-        .map(|url| ctx.spawn(fetch(url.clone())))
+async fn parallel_fetch(
+    ctx: &McpContext,
+    urls: Vec<String>,
+) -> McpResult<Vec<Content>> {
+    type FetchFuture = Pin<Box<dyn Future<Output = McpResult<String>> + Send>>;
+
+    let futures: Vec<FetchFuture> = urls
+        .into_iter()
+        .map(|url| Box::pin(fetch(url)) as FetchFuture)
         .collect();
 
-    // Region waits for all children before returning
-    join_all(handles).await
+    let results = ctx.join_all(futures).await?;
+    results
+        .into_iter()
+        .map(|result| result.map(Content::text))
+        .collect()
 }
 ```
 
 ---
 
-## Comparison vs Alternatives
+## Design Positioning
 
-| Feature | FastMCP Rust | rmcp | jsonrpc-core |
-|---------|-------------|------|--------------|
-| **MCP-native** | Yes | Yes | No (generic) |
-| **Async handlers** | Native | Native | Native |
-| **Cancellation** | Checkpoints + masks | Manual | None |
-| **Timeouts** | Budget-based | Timer-based | Manual |
-| **Macros** | `#[tool]`, `#[resource]`, `#[prompt]` | Manual impl | Manual impl |
-| **Runtime** | asupersync (cancel-correct) | tokio | tokio |
-| **Outcome type** | 4-valued | 2-valued | 2-valued |
-| **Structured concurrency** | Region-scoped | Manual | Manual |
-| **Unsafe code** | Forbidden | Allowed | Allowed |
+These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-28 conformance certificate. Competing projects change independently and should be evaluated from their current documentation rather than a static comparison table.
+
+| Area | FastMCP Rust design |
+|------|---------------------|
+| **Handler API** | `#[tool]`, `#[resource]`, and `#[prompt]` macros plus explicit handler traits |
+| **Cancellation** | `McpContext` checkpoints and masks backed by asupersync |
+| **Timeouts** | Request and handler budget surfaces |
+| **Runtime** | asupersync only; Tokio adapters are unsupported |
+| **Outcomes** | Four-valued `Outcome`: success, expected error, cancellation, or panic |
+| **Unsafe code** | Forbidden in workspace crates with `#![forbid(unsafe_code)]` |
 
 ---
 
 ## Installation
 
-### From crates.io
+### From crates.io (current 0.13.0 package)
+
+The `0.13.0` package was published on 2026-10-12. Publication does
+not establish aggregate MCP 2026-07-28 conformance, production readiness, or
+qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.1"
+fastmcp-rust = "0.13.0"
 ```
 
 ### As a Git Dependency
@@ -246,6 +544,7 @@ fastmcp-rust = "0.1"
 ```toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+asupersync = "=0.5.0"
 ```
 
 ### From Source
@@ -256,15 +555,258 @@ cd fastmcp_rust
 cargo build --release
 ```
 
-### CLI (optional)
+### CLI binaries (GitHub Releases)
+
+The latest published release, v0.13.0, provides prebuilt `fastmcp` binaries on
+GitHub Releases. The `fastmcp-cli` source package is also available from
+crates.io for Cargo-based installation. Archives follow a `fastmcp-<os>-<arch>`
+pattern (`.tar.xz` on Unix, `.zip` on Windows).
+
+**This repository does not establish what the published archives are named.**
+The checked-in release workflow is a quarantined verification surface and does
+not publish new GitHub Releases: it has held `contents: read` since 2026-08-02,
+and that permission cannot create a Release. v0.13.0 was built and published
+with the maintainer's local release tooling, not this workflow, so this
+repository does not establish whether those archives are downloadable either,
+and nothing in it can. That workflow's build matrix — the
+`SURF-RELEASE-ASSET-CLOSURE` rows in
+`evidence/fnd-01/dependency-verification.toml` — describes what the quarantined
+workflow *would* produce, which is not evidence of what the release contains;
+do not read it as the published filenames.
+
+Take the exact filename from the v0.13.0 release page. The command below pins
+the tag rather than `releases/latest` — under a workflow that does not publish,
+`latest` is a moving pointer whose meaning is not stated anywhere.
+**If the download does not resolve, build from source as shown above; that path
+is verified by this repository and the download is not.**
 
 ```bash
-cargo install fastmcp-cli
+# Replace <asset> with the exact filename listed on the v0.13.0 release page.
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/download/v0.13.0/<asset>
+tar -xJf <asset>
+./fastmcp --version
 ```
 
+### CLI via Cargo (optional)
+
+```bash
+rustup toolchain install nightly-2026-08-25
+cargo +nightly-2026-08-25 install fastmcp-cli --version 0.13.0 --locked
+```
+
+### Client request deadlines (current source tree)
+
+Ordinary client requests use separate idle and absolute response-wait
+deadlines. Both begin after the request send commits. The idle deadline
+defaults to 30 seconds; the non-resettable absolute deadline defaults to 120
+seconds. Serialization, sending, and teardown are outside these timers.
+Unix subprocess sends have a separate two-second bound covering writer-lock
+acquisition and the native pipe commit. These commits remain synchronous;
+non-Unix sends retain blocking-I/O limits. Only a valid matching progress
+notification on a request that actually supplied a progress token can reset idle.
+
+On Unix, eager `ClientBuilder::connect_stdio_with_cx` initialization also
+yields between bounded receive turns, including partial responses and Auto
+negotiation. A fallback child starts only after the disposable modern child
+has been cleaned up. With `auto_initialize(true)`, async requests and
+`Client::ensure_initialized_with_cx` also yield during the first handshake.
+Dropping that future preserves the handshake, partial response and original
+deadline; the next async or synchronous call resumes it without another send.
+Explicit cancellation after the handshake starts fails the connection.
+Synchronous constructors and synchronous first use retain their blocking
+boundaries; subprocess creation and write commits remain synchronous.
+
+```rust
+use std::time::Duration;
+
+use fastmcp_rust::prelude::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
+
+async fn connect(cx: &Cx) -> McpResult<Client> {
+    let policy = RequestTimeoutPolicy::new(
+        Duration::from_secs(20),
+        Duration::from_secs(90),
+    )?;
+    ClientBuilder::new()
+        .request_timeout_policy(policy)
+        .connect_stdio_with_cx(cx, "my-mcp-server", &[])
+        .await
+}
+```
+
+A live modern `subscriptions/listen` can stay open on the same stdio
+`Client` while other requests complete. Call
+`Client::open_subscriptions_listener` and then
+`Client::next_subscription_event` to drain acknowledgement, catalog, and
+resource-update events without collecting the stream to terminal.
+On Unix, `open_subscriptions_listener_with_cx` and
+`next_subscription_event_with_cx` yield during initialization and between
+bounded receive turns. Tasks offer the corresponding
+`open_final_task_subscription_listener_with_cx` and
+`next_final_task_subscription_event_with_cx` APIs. Dropping an event future
+preserves the stream and partial frame for resumption; explicit cancellation
+retires only that listener, leaving sibling requests usable. Cancellation
+write failures retain the listener and its error. Writes remain synchronous.
+`listen_subscriptions_typed` remains the collect-to-terminal adapter.
+The same incremental pattern exists on HTTP (`HttpClient::start_subscriptions_listener`),
+modern WebSocket (`WebSocketClient::open_subscriptions_listener`), and
+`ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams.
+Proxy catalog and Tasks listener startup and event methods are async and
+take the caller's `&Cx`. HTTP opening yields while awaiting headers;
+cancelling or dropping that opening closes its socket and releases the
+route for another attempt. Dropping an event future preserves the installed
+listener for resumption. Stdio startup and bounded receive turns retain
+their synchronous I/O limits.
+`ProxyUpstreamBindingRegistry::connect_http_with_protocol_plan` and
+`connect_stdio_with_protocol_plan` are async and take the caller's `&Cx`
+first. HTTP negotiation and exact-2024 initialization await that runtime;
+Unix stdio initialization uses the client's yielding receive path. Interrupted
+openings leave the registry cache unchanged, allowing a fresh attempt. Keep
+the caller runtime alive while using a cached legacy HTTP/SSE connection.
+Use `ProxyClient::catalog_typed_with_cx` or `catalog_with_cx` to fetch HTTP or stdio
+catalogs on that runtime, including every page and its modern cache hints.
+These methods release the route lock while awaiting HTTP I/O or between bounded
+stdio receive turns and reject cursor cycles without returning a partial
+catalog. Stdio writes and individual receive turns retain their synchronous
+I/O limits. Backends without an upstream binding retain their synchronous
+catalog implementation.
+
+Exact-2024 resource subscribe/unsubscribe hooks also have awaited variants:
+`ResourceHandler::on_subscribe_async` and `on_unsubscribe_async`. The live
+dispatcher and mounted resources forward these hooks on the caller runtime.
+Native proxies release the route lock during HTTP/SSE waits and between bounded
+stdio receive turns.
+Failed or interrupted proxy requests preserve local URI rewrites, and failed
+synchronous hooks roll back the session's subscription membership. Remote
+effects already acknowledged upstream cannot be rolled back by these guarantees.
+
+HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
+`read_resource`/`get_prompt` verbs so callers do not have to decode a raw
+core result for ordinary catalog and invocation traffic. HTTP and WebSocket
+`list_tools_with_cancellation`/`call_tool_with_cancellation`/
+`read_resource_with_cancellation`/`get_prompt_with_cancellation` honor a
+caller-owned cancellation domain for those ordinary verbs.
+Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
+event stream and POST message endpoints are already known.
+
+On Unix, `Client::call_tool_with_cx`, `read_resource_with_cx`, and
+`get_prompt_with_cx` follow installed async reverse handlers when a modern
+peer requests input. After initialization, all rounds and handler waits share
+one absolute deadline; cancellation drops pending handler work and preserves
+the connection. Deferred discovery keeps its separate initialization deadline
+and connection-ending cancellation rules. Each
+retry carries the original arguments and only the latest continuation state.
+Without installed handlers, the input-required result is returned to the caller.
+
+Installed modern MRTR callbacks also remain cancellable while pending in HTTP
+and WebSocket clients, including callbacks that never wake themselves. Dropping
+or interrupting a callback cancels its local token and prevents a continuation;
+callback panics become redacted errors. These checks run between callback polls
+and cannot preempt synchronous work or undo external effects inside user code.
+
+With the `tasks` feature on Unix, `Client::call_tool_final_outcome_with_cx`
+creates tasks without blocking the runtime while waiting for the peer. It
+returns the typed complete, task, or input-required outcome. A returned task ID
+can be used with `get_task_final_with_cx` and `cancel_task_final_with_cx` on the
+same client. An already-admitted valid task result survives caller cancellation;
+other results remain cancellation-first. Input-required results are returned
+without automatic continuation. Pipe writes remain synchronous.
+
+The published 0.13.0 CLI includes these flags. From a current source checkout,
+run the CLI through the workspace to configure the two limits independently:
+
+```bash
+cargo run -p fastmcp-cli -- test --protocol-policy auto --idle-timeout 30 --absolute-timeout 120 my-mcp-server
+```
+
+The current `fastmcp test` subprocess runner is Unix-only because success
+includes verified owned-process-group cleanup. Library callers should likewise
+call `client.close()` and handle its `McpResult`; dropping a client is only a
+best-effort safety net. The group anchor protects its numeric PGID while it is
+live and closes an owner-death channel when the host exits, but this is not
+portable process-tree containment or a substitute for Windows Job Objects.
+
 **Requirements:**
-- Rust 1.85+ (nightly) for Edition 2024 features
-- [asupersync](https://github.com/Dicklesworthstone/asupersync) as a sibling directory (or adjust path in `Cargo.toml`)
+- Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
+
+### Tasks commands (current source tree, optional)
+
+Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,
+and `cancel`. These commands require modern MCP and bilateral
+`io.modelcontextprotocol/tasks` support. The pinned extension is experimental;
+this source implementation remains provisional. The published default
+binaries do not include these commands.
+
+```bash
+cargo run -p fastmcp-cli --features tasks -- tasks get TASK_ID --http-url http://127.0.0.1:8000/mcp --json
+cargo run -p fastmcp-cli --features tasks -- tasks watch TASK_ID --http-url http://127.0.0.1:8000/mcp --timeout 60 --max-events 100 --json
+cargo run -p fastmcp-cli --features tasks -- tasks update TASK_ID --http-url http://127.0.0.1:8000/mcp --input-file responses.json --json
+cargo run -p fastmcp-cli --features tasks -- tasks cancel TASK_ID --http-url http://127.0.0.1:8000/mcp --json
+```
+
+The input file contains the `inputResponses` map itself, for example
+`{"roots":{"roots":[]}}` when the task's outstanding input key is `roots`
+and its method is `roots/list`. Files are limited to 1 MiB. Updates use the
+current task's input request types. Update and cancellation success mean
+acknowledgement; use `get` or `watch` to observe subsequent task state.
+
+Watch emits an initial snapshot and exits successfully if the task is already
+completed, failed, or cancelled. Otherwise it subscribes to live updates and
+reads the task again after subscription acknowledgement, so a terminal change
+during subscription setup is also reported. It ends successfully on a terminal
+update or after `--max-events` updates. Each
+successful exit includes a `watch-ended` event; ending a watch does not cancel
+the task. It does not reconnect or promise replay across disconnects.
+`--timeout` defaults to 30 seconds, and timeout is a failed command. JSON mode
+emits one document per event; human output bounds and sanitizes fields and
+redacts recognizable credentials.
+
+Use `--server EXECUTABLE` and repeat `--server-arg ARGUMENT` for stdio. Each
+command starts a fresh process, so previously issued task IDs require a store
+retained outside the prior process. For authenticated HTTPS, Tasks commands and
+`inspect` accept `--bearer-token-file PATH`:
+
+```bash
+cargo run -p fastmcp-cli --features tasks,native-tls-roots -- tasks get TASK_ID --http-url https://mcp.example.com/mcp --bearer-token-file token.txt --json
+```
+
+The file must contain a UTF-8 token of at most 16 KiB, including an optional
+trailing LF or CRLF. Do not include a `Bearer ` prefix or other whitespace or
+control characters. The CLI reads a regular file once per invocation; callers
+own token acquisition and refresh. Credentials require HTTPS and a modern or
+auto protocol policy. Core-only builds omit Tasks from help and explain
+the required feature when a Tasks command is attempted.
+
+### Authenticated HTTP clients (current source tree)
+
+The SDK accepts a caller-acquired bearer credential bound to one exact HTTPS
+endpoint. For example, with a caller-owned `cx` and an existing `token`:
+
+```rust
+use fastmcp_rust::{BoundBearerCredential, CanonicalHttpUrl, modern};
+
+let endpoint = CanonicalHttpUrl::parse("https://mcp.example.com/mcp")?;
+let credential = BoundBearerCredential::bind(endpoint.clone(), token)?;
+let client = modern::ClientBuilder::new()
+    .http_bearer_credential(credential)
+    .connect_http_with_cx(cx, endpoint)
+    .await?;
+```
+
+The same credential binding covers discovery, later request/subscription
+POSTs, and reverse-response POSTs. It never attaches to cleartext HTTP, a different path or query, or a
+redirect target. An authenticated Auto client refuses legacy fallback.
+Applications own token acquisition and refresh; create a new client when the
+credential changes. The CLI's `--bearer-token-file` uses this same binding.
+
+The bounded JSON/SSE readers withhold JSON-RPC errors that reflect the exact
+credential into their message or data, returning a typed diagnostic instead.
+Successful application results and the raw native-stream API remain unmodified.
+
+HTTPS uses the transport's bundled WebPKI roots by default. Enable
+`native-tls-roots` on `fastmcp-rust`, `fastmcp-client`, or `fastmcp-cli` for the platform trust
+store. That profile also honors the native certificate provider's
+`SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
+and do not disable certificate or hostname verification.
 
 ---
 
@@ -283,25 +825,37 @@ cd my-mcp-server
 # Cargo.toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
+asupersync = "=0.5.0"
 ```
 
 ### 3. Write Your Server
 
 ```rust
 // src/main.rs
-use fastmcp_rust::prelude::*;
+use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool(description = "Echo the input message")]
-async fn echo(ctx: &McpContext, message: String) -> String {
+async fn echo(ctx: &McpContext, message: String) -> McpResult<String> {
     ctx.checkpoint()?;
-    message
+    Ok(message)
 }
 
 fn main() {
-    Server::new("echo-server", "1.0.0")
-        .tool(echo)
-        .instructions("A simple echo server for testing")
-        .run_stdio();
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create I/O reactor"))
+        .blocking_threads(0, 16)
+        .build()
+        .expect("create application runtime");
+    runtime.block_on(async {
+        let cx = Cx::current().expect("application context");
+        ServerBuilder::new("echo-server", "1.0.0")
+            .tool(Echo)
+            .instructions("A simple echo server for testing")
+            .build()
+            .run_stdio_with_cx(&cx)
+            .await
+    });
 }
 ```
 
@@ -314,8 +868,72 @@ cargo run
 ### 5. Test with MCP Inspector
 
 ```bash
-npx @anthropic-ai/mcp-inspector cargo run
+npx @modelcontextprotocol/inspector cargo run
 ```
+
+---
+
+## Non-blocking stdio (Unix, opt-in)
+
+`run_stdio_with_cx` above is the portable default, and it is blocking: it hands
+`run_stdio_pump` to `spawn_blocking` and reads through `StdioTransport::stdio()`
+and `AsyncStdout`, whose own documentation records that they "perform blocking
+I/O internally. An async trait alone does not make those standard-stream
+operations nonblocking." Several stdio caveats in
+[Limitations](#limitations) are consequences of that choice rather than of the
+framework, and the rows that describe only this entry point now say so. Others,
+such as the client-subprocess rows, are unrelated to it and still apply.
+
+On Unix there is a second path. `NativePipeReader::from_stdin` and
+`NativePipeWriter::from_stdout` claim the real process descriptors, register
+them with the caller's reactor, and observe that caller's cancellation and
+deadline — no helper thread, no blocking pool, and no change to descriptor
+flags that is not restored on release. `serve_stdio_io` then serves the
+transport over them. `modern::ServerBuilder` is already modern-only, so no
+protocol-policy call is needed:
+
+```rust
+use fastmcp_rust::modern::ServerBuilder;
+use fastmcp_rust::{NativePipeReader, NativePipeWriter};
+
+// Note blocking_threads(0, 0): this path needs no blocking pool at all.
+let runtime = RuntimeBuilder::current_thread()
+    .with_reactor(create_reactor().expect("create I/O reactor"))
+    .blocking_threads(0, 0)
+    .build()
+    .expect("create application runtime");
+runtime.block_on(async {
+    let cx = Cx::current().expect("application context");
+    let server = ServerBuilder::new("native-process-stdio", "1.0")
+        .tool(Echo)
+        .build();
+    let input = NativePipeReader::from_stdin(&cx)?;
+    let output = NativePipeWriter::from_stdout(&cx)?;
+    server.serve_stdio_io(&cx, input, output).await
+})
+```
+
+That is the wiring, not a complete program: acquiring the second descriptor can
+fail after the first succeeded, and the two halves report `io::Error` while
+`serve_stdio_io` reports `McpResult`, so a real `main` has to reconcile both.
+`crates/fastmcp-server/examples/native_stdio.rs` does, including closing the
+already-claimed reader rather than implying a partial process binding was
+released. It is a checked-in target with no `required-features`; run it with
+`cargo run -p fastmcp-server --example native_stdio`.
+
+**Bind both endpoints to the same `Cx` that serves the transport.** A pipe whose
+own context is cancelled or past its deadline reports a cooperative stop on
+every poll while the serving context stays live. The transport retries a
+bounded number of those and then fails the endpoint with a diagnostic naming
+this cause, instead of retrying without end.
+
+**What this does not claim.** This is an opt-in transport pairing, not the
+default, and not an aggregate cancellation, quiescence, or conformance
+qualification — every boundary in [Limitations](#limitations) still applies
+except where it is explicitly about the blocking default. `from_stdin` and
+`from_stdout` are `#[cfg(unix)]`; there is no non-Unix equivalent, because
+asupersync's readiness `Source` is socket-bound on Windows while Windows
+standard streams are handles.
 
 ---
 
@@ -380,10 +998,12 @@ fastmcp_rust/
 │   ├── fastmcp/           # Facade crate (published as fastmcp-rust)
 │   ├── fastmcp-core/      # McpContext, errors, runtime helpers
 │   ├── fastmcp-protocol/  # MCP types, JSON-RPC messages
-│   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket)
+│   ├── fastmcp-transport/ # Transport implementations (stdio, SSE, WebSocket, HTTP, memory)
 │   ├── fastmcp-server/    # Server builder, router, handlers
 │   ├── fastmcp-client/    # Client implementation
-│   └── fastmcp-derive/    # #[tool], #[resource], #[prompt] macros
+│   ├── fastmcp-macros/    # Proc-macro crate, published as fastmcp-derive
+│   ├── fastmcp-console/   # Console rendering and statistics
+│   └── fastmcp-cli/       # fastmcp command-line interface
 ```
 
 | Crate | Purpose |
@@ -391,25 +1011,31 @@ fastmcp_rust/
 | `fastmcp-rust` | Convenience re-exports for simple `use fastmcp_rust::prelude::*` |
 | `fastmcp-core` | `McpContext` wrapper, error types, `block_on` helper |
 | `fastmcp-protocol` | MCP message types, capabilities, JSON-RPC framing |
-| `fastmcp-transport` | Transport trait, stdio/SSE/WebSocket implementations |
+| `fastmcp-transport` | Transport trait and stdio/SSE/WebSocket/HTTP/memory implementations |
 | `fastmcp-server` | `Server`, `ServerBuilder`, routing, handler traits |
-| `fastmcp-client` | `Client` for calling MCP servers |
+| `fastmcp-client` | Three clients: `Client` drives a subprocess over stdio; `HttpClient` covers modern HTTP and exact legacy SSE and is returned by `Client::http_with_cx` and (with `legacy-2024-11-05`) `Client::sse_with_cx`, with `ClientHttpConnection` beneath it; `WebSocketClient` exists only with the `websocket-experimental` feature, where it accepts owned native async transports and Auto negotiation uses a caller-owned factory that supplies a fresh upgraded transport for its permitted retry |
 | `fastmcp-derive` | Procedural macros for handler generation |
 
 ---
 
 ## Handler Traits
 
+The signatures below are abridged; asynchronous trait methods return four-valued `McpOutcome` values, not ordinary `McpResult` values.
+
 ### ToolHandler
 
 ```rust
 pub trait ToolHandler: Send + Sync {
     fn definition(&self) -> Tool;
-    fn call(&self, ctx: &McpContext, arguments: Value) -> McpResult<Vec<Content>>;
+    fn call(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>>;
 
     // Override for true async (default delegates to call())
-    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: Value)
-        -> BoxFuture<'a, McpResult<Vec<Content>>>;
+    fn call_async<'a>(&'a self, ctx: &'a McpContext, arguments: serde_json::Value)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<Content>>> + Send + 'a>>;
 }
 ```
 
@@ -422,7 +1048,7 @@ pub trait ResourceHandler: Send + Sync {
 
     // Override for true async
     fn read_async<'a>(&'a self, ctx: &'a McpContext)
-        -> BoxFuture<'a, McpResult<Vec<ResourceContent>>>;
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<ResourceContent>>> + Send + 'a>>;
 }
 ```
 
@@ -431,12 +1057,16 @@ pub trait ResourceHandler: Send + Sync {
 ```rust
 pub trait PromptHandler: Send + Sync {
     fn definition(&self) -> Prompt;
-    fn get(&self, ctx: &McpContext, arguments: HashMap<String, String>)
+    fn get(&self, ctx: &McpContext, arguments: std::collections::HashMap<String, String>)
         -> McpResult<Vec<PromptMessage>>;
 
     // Override for true async
-    fn get_async<'a>(&'a self, ctx: &'a McpContext, arguments: HashMap<String, String>)
-        -> BoxFuture<'a, McpResult<Vec<PromptMessage>>>;
+    fn get_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: std::collections::HashMap<String, String>,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = McpOutcome<Vec<PromptMessage>>> + Send + 'a>>;
 }
 ```
 
@@ -446,22 +1076,28 @@ pub trait PromptHandler: Send + Sync {
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `McpError::MethodNotFound("tool: my_tool")` | Tool not registered | Add `.tool(my_tool)` to server builder |
-| Request cancelled mid-operation | Client disconnect or timeout | Use `ctx.masked()` for critical sections |
-| Budget exhausted errors | Timeout too short | Increase `.request_timeout(120)` |
-| `#[tool]` macro compilation error | Missing trait bounds | Ensure handler returns `McpResult<T>` or `Into<Vec<Content>>` |
+| JSON-RPC `InvalidParams` (`-32602`) `Unknown tool: <name>` for `tools/call` | Tool not registered | Register the generated handler, for example `.tool(MyTool)` |
+| Request cancelled mid-operation | Local request cancellation or budget exhaustion | Add checkpoints and mask only the smallest atomic section that must finish; Unix stdio keeps receiving while bounded modern request children run, but output commits are serialized, non-Unix/custom/SSE/WebSocket loops retain blocking boundaries, and a non-cooperative handler can exceed the process-exit quiescence drain |
+| JSON-RPC `RequestCancelled` (`-32004`) error `Request timeout exceeded` | The request outlived the server-owned deadline (`.request_timeout(...)`, 30 seconds by default), whether the server or the handler's own checkpoint observed it first | Add checkpoints so work stops promptly; increase `.request_timeout(...)` only for a deadline that is intentionally too short |
+| `#[tool]` macro compilation error | Unsupported return conversion or argument schema | Prefer `String`, `Vec<Content>`, `McpResult<String>`, or `McpResult<Vec<Content>>` and ensure custom argument types implement `JsonSchema` |
 | `TransportError::Io` on startup | stdin unavailable | Ensure nothing else reads stdin |
 
 ### Critical Section Example
 
 ```rust
-#[tool]
-async fn critical_write(ctx: &McpContext, data: String) -> String {
-    // This section won't be interrupted
-    ctx.masked(|| {
-        fs::write("important.txt", &data).unwrap();
-    });
-    "Written".to_string()
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// A handler that owns `committed` can call this helper after validation.
+fn commit_revision(
+    ctx: &McpContext,
+    revision: u64,
+    committed: &AtomicU64,
+) -> McpResult<()> {
+    // Mask only a small, non-blocking atomic commit. Masking does not make
+    // synchronous filesystem or device I/O bounded or cancel-safe.
+    ctx.masked(|| committed.store(revision, Ordering::Release))
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    Ok(())
 }
 ```
 
@@ -471,46 +1107,89 @@ async fn critical_write(ctx: &McpContext, data: String) -> String {
 
 | Limitation | Details |
 |------------|---------|
-| **Nightly Required** | Uses Rust 2024 edition features |
-| **Network Transports** | SSE and WebSocket transports are implemented at the transport layer, but HTTP/WS server integration is external |
-| **No Built-in TLS** | Transport encryption must be handled externally |
-| **Single-threaded Loop** | Main server loop is sequential |
-| **Sibling Dependency** | Requires asupersync at `../asupersync` |
+| **Pinned Nightly Required** | The project contract pins `nightly-2026-08-25`; do not substitute a different toolchain merely because it supports Edition 2024 |
+| **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
+| **Poll-quota accounting is scoped to framework operations** | `McpContext::checkpoint` keeps a clone-shared request debit counter. The synchronous client `RequestExecutor` also consumes a finite poll budget during `execute`, `drive`, and `wait`, sharing it across nested control maintenance and every frame of a `wait`. Exhausting this local ledger stops that call without cancelling the caller's shared `Cx` or unrelated request owners. This operation-admission limit also applies inside `Cx::masked`; runtime cancellation and deadline delivery retain the original mask semantics. An already exhausted raw budget retains the runtime's existing cancellation behavior. Separate executor calls start separate budget snapshots; this is not a global quota across calls or a bound inside an arbitrary blocking transport. Other APIs that checkpoint only a raw `Cx` still reject an already exhausted quota without consuming a positive one: asupersync 0.5.0 exposes that budget as a read-only `Copy` snapshot. Deadline and explicit cancellation remain effective at their documented boundaries |
+| **Runtime-context migration** | Library client constructors and returning/custom transport runners require a caller-owned `Cx`. The process-owning CLI and `Server::run_stdio_with_cx` install the ambient context at their top-level runtime boundary; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
+| **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. The experimental `websocket-experimental` facade profile also provides native async `bind_websocket` and `serve_websocket` listener lifecycles, plus caller-driven client connection. These surfaces do not establish aggregate conformance or complete lifecycle qualification |
+| **Client Transport Coverage** | The `fastmcp-client::Client` type drives a subprocess over stdio. Its `Client::http_with_cx` and (exact-2024) `Client::sse_with_cx` constructors return a separate `HttpClient`, and `WebSocketClient` requires `websocket-experimental`. Public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` verbs. Modern HTTP answers typed reverse `sampling/createMessage`, `roots/list`, and `elicitation/create` requests that arrive on a request-owned SSE body by POSTing the JSON-RPC response. Public `HttpClient::call_tool` and `WebSocketClient::call_tool` also follow modern server `input_required` by invoking those same installed handlers locally and retrying with `inputResponses`. Live `bind_http` JSON `tools/call` returns `ctx.final_sampling` and `ctx.final_roots` as `input_required`; a write-half EOF after the request is ordinary H1 completion and does not cancel that result. Public `modern::Client` stdio `call_tool_result` / `read_resource_result` / `get_prompt_result` keep the same live `input_required` branch. A Modern2026 stdio session stamps the same `_meta` protocol version and client capabilities on `start_multiplexed_request` that the typed verbs already send. Public stdio `read_resource` / `get_prompt` follow installed modern reverse handlers the same way `call_tool` does. Eligible stateless HTTP MRTR retries use framework-issued opaque, single-use `requestState` and may resume on a later POST only when the method, target, arguments, and admitted principal still match; forged or replayed state is rejected. Elicitation resumes the same way: the client's answer travels in `inputResponses` on the retry POST, bound to the original request by that single-use state. With `websocket-experimental`, the facade exposes `WebSocketClient` with incremental catalog listen, the same typed verbs, and the same modern reverse handlers: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
+| **Two modules ship with tests but no consumer** | `fastmcp_transport::event_store` (TTL retention, per-stream caps, `replay_bounded` cursor paging, 45 tests) has no consumer anywhere: its only references are its own `pub mod` declaration and the facade re-export. SSE resumption is deliberately not wired — exact 2024-11-05 reconnects start a fresh stream and `Last-Event-ID` is intentionally ignored, pinned by `dual_era_endpoint_ignores_last_event_id_and_starts_a_fresh_legacy_stream`. `fastmcp_transport::http::HttpTransport` is a complete synchronous HTTP/1.1 `Read`/`Write` adapter (request-line and token validation, obs-fold and duplicate-`Host` rejection, `Content-Length`/`Transfer-Encoding` conflict rejection, chunked decoding, 167 tests); the live listener does not use it, reaching the wire through `asupersync::http::h1::Http1Codec` instead, and its only out-of-crate consumer is one `#[cfg(test)]` fixture in `fastmcp-server`. Neither is an overclaim — this README promises no SSE replay — but 212 green tests exercise code no shipped request path reaches, so treat them as unclaimed library surface rather than as coverage of the HTTP or SSE paths |
+| **Experimental WebSocket framing** | The frame codec that ships is asupersync's. `fastmcp_transport::websocket` compiles unconditionally, but its own RFC 6455 implementation — `WsFrame`, `WsReader::read_frame`, `WsWriter::write_frame`, `WsClientWriter`, `generate_mask`, `EndpointRole::validate_peer_mask`, `WsTransport`/`WsClientTransport` and their `Transport` impls — is `#[cfg(test)]` and is in no release binary. `getrandom`'s WebSocket-masking use is likewise test-only. The shipping path (`AsyncWsClientTransport`, `AsyncWsServerTransport`, `WebSocketListener`, `WebSocketUpgradeAdmission`) uses `asupersync::net::websocket` for handshake and framing; FastMCP owns fragmentation assembly, opcode dispatch, size ceilings, pending-write bounds and close-code selection above it. Those production transports implement no `Transport` impl, unlike `AsyncStdioTransport`. Consequently any RFC 6455 invariant proven only against the `cfg(test)` codec — mask direction in particular — is not evidence about the shipped path |
+| **Experimental WebSocket TLS** | The experimental async transport supports `ws://` and `wss://`. `wss://` can use the built-in WebPKI-rooted connector or a caller-supplied TLS connector for private roots, pinning, or client certificates; this connection support does not imply complete TLS, lifecycle, or MCP conformance qualification |
+| **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
+| **Wire Cancellation** | The modern-only split receive pump, including Unix stdio, admits bounded concurrent requests on the caller's dispatch runtime, including `subscriptions/listen`. It authenticates cancellation against the existing connection owner and serializes cancellation, response, and notification commits at the writer. Synchronous split runners use the bounded asupersync blocking bridge. Unsplit custom transports dispatch ordinary requests serially because receive and send share one handle; a `subscriptions/listen` runs off the receive loop, and output produced while `recv` blocks is queued and written as soon as `recv` returns. Transport reads and writes can still block. The dual-era Unix stdio pump retains its concurrent modern children and serialized exact MCP 2024-11-05 worker. A non-cooperative handler can exceed the bounded process-exit drain, and reliable `awaitCleanup` semantics remain unverified. "Transport reads and writes can still block" is a statement about the blocking stdio and custom adapters; a Unix `serve_stdio_io` server over the native process pipes does not block in its reader or writer, which removes that one residual without establishing any of the others |
+| **Silent stdio peers** | On Unix, the public subprocess `Client` enforces configured idle/absolute deadlines at child-pipe readiness and decode boundaries, including silent and partial-frame peers. Generic blocking `StdioTransport::recv` and non-Unix child-pipe I/O retain their documented frame/I/O-boundary limitation. Unix client writes use a separate two-second queue-and-commit deadline, so response-wait deadlines are not an end-to-end request or process wall-clock guarantee. Those residuals remain FND-04 work |
+| **Stdio output backpressure** | On Unix, primary server responses and notifications use serialized nonblocking writes with a two-second commit deadline for ordinary pipes/sockets; a timeout, lock poison, partial write, notification encoding failure, or descriptor-flag restoration failure is connection-fatal. The writer attempts to restore descriptor flags before releasing the local lock; on restoration failure the descriptor may remain nonblocking, and inherited duplicate descriptors can observe the temporary `O_NONBLOCK` setting. Regular files/devices and non-Unix stdout retain blocking-I/O limits. A handler that ignores cancellation may force unsuccessful process exit after the bounded drain; shutdown hooks are skipped unless all worker and modern-child quiescence is proven. This row describes the `run_stdio_with_cx` writer; a `serve_stdio_io` server over `NativePipeWriter` commits through the asynchronous transport instead, which has its own separate boundaries (see [Non-blocking stdio](#non-blocking-stdio-unix-opt-in)) |
+| **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
+| **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
+| **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
+| **Returning transport runners** | `run_transport_returning_with_cx` and the split returning variants return fatal receive/send/close errors and preserve simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. Each exact-2024 handler dispatch now opens and closes a budgeted child region of the caller's runtime, requiring a runtime-backed `Cx`. Blocking transport I/O and complete cancellation/cleanup guarantees remain unresolved |
+| **Request Cancellation Ownership** | Unix modern stdio request work runs in independently owned bounded child contexts, but process-exiting shutdown does not wait unboundedly for a non-cooperative child; cancellation therefore is not yet a complete quiescence or `awaitCleanup` guarantee |
+| **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. The WebSocket server and custom split transports use the same routing, proven live for exact-2024 reverse sampling and roots over `bind_websocket`. Non-Unix stdio, unsplit custom transports, and SSE do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
+| **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
+| **Authentication Admission** | Native HTTP requires `Authorization` for protected requests and rejects recognized body/meta and query credential fields before provider invocation. Other adapters retain a stripped legacy fallback. Complete authorization, lease/revocation, and OAuth challenge qualification remain open |
+| **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store. `ServerBuilder::task_supervisor(Arc::new(supervisor))` hosts the application's task service during each serve, waits for bounded readiness, and settles the service before returning. Without a ready service, task creation is refused |
+| **MCP Apps (opt-in `apps` feature)** | Off by default. The facade `apps` feature adds the official MCP Apps extension: server `ServerBuilder::mcp_apps` (bilateral capability negotiation and `server/discover` metadata; Apps owns no client-to-server method), `mcp_apps_ui_resource` for final-only `ui://` HTML documents and `mcp_apps_tool` for tools linked to one; client `ClientBuilder::mcp_apps` and the `mcp_apps` host bridge (`McpAppsHost`, `McpAppsBridgeTransport`). These are unit-tested (for example `builder_mcp_apps_ui_resource_binds_a_final_only_ui_catalog_entry`); Apps media rendering and Apps conformance are not claimed |
+| **Feature flags that gate nothing** | `fastmcp-server`'s `enterprise-auth` and `jwt-resource-auth` gate no server code; each only enables `fastmcp-protocol`'s `jose` feature, and no inbound-JWT resource-server path exists for `jwt-resource-auth` to reach. `fastmcp-server`'s `websocket-experimental` is also inert: it forwards only to `fastmcp-transport`'s empty feature and is a *different* feature from `fastmcp-server/websocket`, which does gate code. The CLI's `jwt-resource-auth` adds no capability but is not dependency-graph inert — it carries `dep:fastmcp-server`, linking the server crate into the CLI. `fastmcp-console`'s `enterprise-auth`, `oauth-client-credentials`, `builtin-auth-server`, `jwt-resource-auth`, `proxy` and `websocket-experimental` are empty, so its `proxy-legacy` and `proxy-tasks` reduce to `legacy-2024-11-05` and `tasks`. `fastmcp-transport`'s `websocket-experimental` is empty because `fastmcp_transport::websocket` is compiled unconditionally — but see **Experimental WebSocket framing** below: the always-compiled frame codec is not the one that ships. By contrast `fastmcp-server`'s `oauth-client-credentials` is **not** inert: together with `builtin-auth-server` it gates 34 sites, including the `client_credentials` arm of the token endpoint and the advertised `grant_types_supported` list. The facade and client `websocket-experimental` features gate code: `WebSocketClient`, `ClientBuilder::connect_websocket_with_cx`, and (through `fastmcp-server/websocket`) `bind_websocket`. This list is complete as measured 2026-10-12 over all 72 declared features in the 8 crates that declare any (`fastmcp-core` declares none): the seven user-enableable features with zero `cfg(feature = ...)` sites in their own crate's `src` **and** an empty value list are exactly `fastmcp-console`'s six above plus `fastmcp-transport`'s `websocket-experimental` |
+| **HTTP as_proxy auto-follow** | A gateway HTTP `as_proxy` does not auto-follow an upstream server `input_required` task across POSTs; per-request dispatch is stateless and upstream request state cannot resume. Callers resume such upstream tasks through an explicit matching `tasks/update` |
+| **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
 
 ---
 
 ## FAQ
 
-**Q: Why not use tokio directly?**
+**Q: Why is Tokio unsupported?**
 
-A: Tokio doesn't provide cancel-correctness out of the box. Dropping a Future silently discards work. asupersync provides checkpoints, masks, and 4-valued outcomes that make cancellation explicit and safe.
+A: FastMCP Rust is built around asupersync capability contexts, budgets, and cooperative-cancellation surfaces. Tokio and Tokio-based adapters are outside the supported runtime model.
 
 **Q: Can I use this with Claude Desktop?**
 
-A: Yes! FastMCP servers speak standard MCP protocol over stdio. Configure Claude Desktop to spawn your server binary.
+A: Stdio integration exists, but compatibility must be checked against the client: the root compatibility `PROTOCOL_VERSION` is `2024-11-05`, the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`, and MCP 2026-07-28 support is not yet verified.
 
 **Q: How do I add authentication?**
 
-A: MCP doesn't define authentication at the protocol level. For Claude Desktop, the process is already trusted. For network transports, wrap the connection with TLS and implement auth at the transport layer.
+A: Install an `AuthProvider` through the server builder. Native HTTP uses the
+`Authorization` header and rejects recognized credentials in JSON-RPC params,
+their `_meta`/`headers` containers, and query parameters with a fixed migration
+diagnostic. Static tokens remain a non-OAuth deployment mode; applications own
+TLS termination and token provisioning. Other transport adapters retain a
+stripped legacy JSON-RPC credential fallback. OAuth/OIDC production security,
+continuous authorization and profile conformance remain unverified.
 
 **Q: What's the performance overhead of checkpoints?**
 
-A: Checkpoints are a simple flag check (atomic load). The overhead is negligible—typically < 1 nanosecond per call.
+A: Checkpoints perform cancellation and budget checks. No project benchmark currently supports a universal per-call latency claim; measure them in the target workload if the cost matters.
 
 **Q: Can I use other async runtimes?**
 
-A: FastMCP is designed around asupersync's structured concurrency model. While you could theoretically swap runtimes, you'd lose cancel-correctness guarantees.
+A: No. The current API and implementation require asupersync; other async runtimes are not supported.
 
 **Q: How do I test my handlers?**
 
-A: Use `McpContext::for_testing()` to create a test context:
+A: `#[tool]` keeps your function, so call it directly with an `McpContext`
+built from a runtime's context and a request ID. (`Cx::for_testing()` needs
+asupersync's `test-internals` feature; this form needs no extra features.)
 ```rust
+use asupersync::runtime::RuntimeBuilder;
+use fastmcp_rust::{Cx, McpContext, McpResult, tool};
+
+#[tool]
+fn my_tool(ctx: &McpContext, input: String) -> McpResult<String> {
+    ctx.checkpoint()?;
+    Ok(input)
+}
+
 #[test]
 fn test_my_tool() {
-    let ctx = McpContext::for_testing();
-    let result = my_tool(&ctx, "input".to_string());
-    assert!(result.is_ok());
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("create test runtime");
+    runtime.block_on(async {
+        let ctx = McpContext::new(Cx::current().expect("test context"), 1);
+        let result = my_tool(&ctx, "input".to_string());
+        assert_eq!(result.unwrap(), "input");
+    });
 }
 ```
 
@@ -524,10 +1203,14 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-FastMCP Rust is licensed under the MIT License (with OpenAI/Anthropic Rider). See [LICENSE-MIT](LICENSE-MIT).
+FastMCP Rust is distributed under the terms in [LICENSE](LICENSE): the MIT
+License with the included OpenAI/Anthropic rider. Every workspace crate uses
+that file as its Cargo `license-file`. [LICENSE-MIT](LICENSE-MIT) is retained
+as a reference copy of the underlying MIT text; it is not an alternative
+license for this project.
 
 ---
 
 <p align="center">
-  <sub>Built with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for cancel-correct async</sub>
+  <sub>Built with <a href="https://github.com/Dicklesworthstone/asupersync">asupersync</a> for context-aware async</sub>
 </p>

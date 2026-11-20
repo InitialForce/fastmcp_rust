@@ -55,3 +55,53 @@ storage.sqlite3*
 proptest-regressions/
 test_meminfo
 perf.data
+# br doctor per-run artifacts
+.doctor/
+
+# FND-01: exact active ignore for verifier/integration run scratch
+.fnd01-run/
+
+# Beads compliance audit artifacts (local only)
+beads_compliance_audit/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
+
+# WAL certification sidecars (`*.db-wal` does not match beads.db-wal-cert).
+# Per-machine br fsqlite probes, like -wal/-shm; never canonical tracker state.
+.beads/*.db-wal-cert
+.beads/*.db-wal-cert-head
+
+# Remote compilation helper target trees (worker-local cargo target, gigabytes).
+.rch-target/
+.rch-target-*/
+
+# Isolated worktree-verify clones; never product source.
+.wm-verify*/
+
+# Isolated cargo target trees named after agents/worktrees (not `/target`).
+# `**/target/` only matches a directory literally named `target`.
+/target-*/
+
+# Agent polish dumps and timestamped beads/jsonl sync backups.
+.beads_polish_tmp/
+.fastmcp_temp_sync_backup/
+
+# One-off FND-01 provision wrapper (run scratch; `.fnd01-run/` already ignored).
+.fnd01-provision-and-run.sh
+
+# Accidental empty sibling-repo placeholder dropped at the repo root.
+/rich_rust
+
+# Local campaign/canary audit dumps and Python bytecode.
+.tmp_audit/
+__pycache__/
+
+# === agent ephemeral residue 2026-09-15 ===
+# Per-host gate/verify wrappers dropped at the repo root; never product source.
+/.gate_*.sh
+/.verify_*.sh
+.beads/*.lock
+.beads/*-fsqlite-ns-gate
+.beads/*-fsqlite-ns-use
+.beads-recovery-*/

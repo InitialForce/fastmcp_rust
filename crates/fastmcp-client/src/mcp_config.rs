@@ -24,13 +24,20 @@
 //! # Usage
 //!
 //! ```ignore
-//! use fastmcp_rust::mcp_config::{McpConfig, ConfigLoader};
+//! use fastmcp_rust::{
+//!     Cx,
+//!     mcp_config::{ConfigError, ConfigLoader, McpConfig},
+//! };
 //!
 //! // Load from default location
-//! let config = ConfigLoader::default()?.load()?;
+//! let config = ConfigLoader::default().load()?;
 //!
 //! // Create a client for a specific server
-//! let client = config.client("filesystem")?;
+//! # fn create_client(config: &McpConfig, cx: &Cx) -> Result<(), ConfigError> {
+//! let client = config.client(cx, "filesystem")?;
+//! # let _ = client;
+//! # Ok(())
+//! # }
 //!
 //! // Or load from a specific path
 //! let config = McpConfig::from_file("/path/to/config.json")?;
@@ -41,38 +48,70 @@
 //! Config files are searched in order:
 //! - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 //! - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-//! - Linux: `~/.config/claude/config.json`
+//! - Linux and other non-macOS Unix: `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json`
+//!   (falling back to `~/.config/Claude/claude_desktop_config.json`)
 //!
 //! Project-specific configs can be in `.vscode/mcp.json` or `.mcp/config.json`.
 
 use std::collections::HashMap;
-use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpResult};
-use fastmcp_transport::StdioTransport;
-use serde::{Deserialize, Serialize};
+use fastmcp_core::{CanonicalHttpUrl, McpError};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-use crate::{Client, ClientSession};
-use fastmcp_protocol::{ClientCapabilities, ClientInfo};
+use crate::{
+    Client, ClientBuilder, ClientProtocolPlan, HttpClient, HttpClientError, RequestTimeoutPolicy,
+};
+use fastmcp_protocol::protocol_policy::{
+    HttpEndpointBundle, HttpEndpointBundleError, HttpRouteKind, ProtocolPolicy,
+};
+
+mod input;
+mod parse;
+
+/// Default maximum serialized configuration file size, in bytes.
+///
+/// Use [`McpConfig::from_file_with_limit`] to choose an explicit larger or
+/// smaller bound. This is a configuration-file bound, not an MCP wire limit.
+pub const DEFAULT_MAX_CONFIG_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 // ============================================================================
 // Configuration Types
 // ============================================================================
 
 /// MCP configuration file containing server definitions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Accepts native `mcpServers`, TOML `mcp_servers`, and literal VS Code `servers`
+/// registries. Mixed registry dialects and unsupported VS Code execution or
+/// security controls are refused. Serialization retains the native format.
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConfig {
     /// Server configurations keyed by name.
-    #[serde(default)]
     pub mcp_servers: HashMap<String, ServerConfig>,
 }
 
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let enabled_server_count = self
+            .mcp_servers
+            .values()
+            .filter(|config| !config.disabled)
+            .count();
+        f.debug_struct("McpConfig")
+            .field("server_count", &self.mcp_servers.len())
+            .field("enabled_server_count", &enabled_server_count)
+            .field(
+                "disabled_server_count",
+                &self.mcp_servers.len().saturating_sub(enabled_server_count),
+            )
+            .finish()
+    }
+}
+
 /// Configuration for a single MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
     /// Command to execute (e.g., "npx", "uvx", "python").
@@ -93,6 +132,26 @@ pub struct ServerConfig {
     /// Whether the server is disabled.
     #[serde(default)]
     pub disabled: bool,
+
+    /// Optional immutable HTTP route configuration for this server.
+    ///
+    /// This config is separate from the stdio command surface. It never
+    /// derives a route from a peer, discovery response, redirect, or origin.
+    #[serde(default)]
+    http: Option<HttpEndpointConfig>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("command_set", &!self.command.is_empty())
+            .field("arg_count", &self.args.len())
+            .field("env_var_count", &self.env.len())
+            .field("cwd_set", &self.cwd.is_some())
+            .field("disabled", &self.disabled)
+            .field("http_configured", &self.http.is_some())
+            .finish()
+    }
 }
 
 impl ServerConfig {
@@ -105,6 +164,7 @@ impl ServerConfig {
             env: HashMap::new(),
             cwd: None,
             disabled: false,
+            http: None,
         }
     }
 
@@ -135,6 +195,351 @@ impl ServerConfig {
         self.disabled = true;
         self
     }
+
+    /// Attaches an already validated, immutable HTTP endpoint configuration.
+    #[must_use]
+    pub fn with_http_endpoint_config(mut self, http: HttpEndpointConfig) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    /// Returns this server's immutable HTTP endpoint configuration, if any.
+    #[must_use]
+    pub const fn http_endpoint_config(&self) -> Option<&HttpEndpointConfig> {
+        self.http.as_ref()
+    }
+}
+
+/// Typed refusal while parsing configured HTTP endpoint routes.
+///
+/// The error deliberately retains route roles rather than raw endpoint text,
+/// so configuration diagnostics do not disclose query values or userinfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpEndpointConfigError {
+    /// A configured target is not a canonical HTTP(S) URL.
+    InvalidTarget {
+        /// The configured route whose URL was rejected.
+        route: HttpRouteKind,
+    },
+    /// HTTP endpoint URLs cannot carry credentials in their authority.
+    UserinfoNotAllowed {
+        /// The configured route whose URL carried userinfo.
+        route: HttpRouteKind,
+    },
+    /// The policy required a modern POST route that was not configured.
+    MissingModernPostTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// The policy required a legacy SSE GET route that was not configured.
+    MissingLegacySseTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// The policy required a legacy message POST route that was not configured.
+    MissingLegacyMessagePostTarget {
+        /// The explicit policy being validated.
+        policy: ProtocolPolicy,
+    },
+    /// A configured route included an HTTP fragment.
+    FragmentNotAllowed {
+        /// The configured route whose fragment was rejected.
+        route: HttpRouteKind,
+    },
+    /// Two configured routes collide on the same method and canonical target.
+    RouteCollision {
+        /// The first colliding configured route.
+        first: HttpRouteKind,
+        /// The second colliding configured route.
+        second: HttpRouteKind,
+    },
+}
+
+impl std::fmt::Display for HttpEndpointConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTarget { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target is not a valid HTTP(S) URL"
+                )
+            }
+            Self::UserinfoNotAllowed { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target must not contain userinfo"
+                )
+            }
+            Self::MissingModernPostTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit modern MCP POST target"
+            ),
+            Self::MissingLegacySseTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit legacy SSE GET target"
+            ),
+            Self::MissingLegacyMessagePostTarget { policy } => write!(
+                formatter,
+                "{policy:?} requires an explicit legacy message POST target"
+            ),
+            Self::FragmentNotAllowed { route } => {
+                write!(
+                    formatter,
+                    "configured {route} target must not contain a fragment"
+                )
+            }
+            Self::RouteCollision { first, second } => {
+                write!(formatter, "configured {first} and {second} routes collide")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpEndpointConfigError {}
+
+impl From<HttpEndpointBundleError> for HttpEndpointConfigError {
+    fn from(error: HttpEndpointBundleError) -> Self {
+        match error {
+            HttpEndpointBundleError::MissingModernPostTarget { policy } => {
+                Self::MissingModernPostTarget { policy }
+            }
+            HttpEndpointBundleError::MissingLegacySseTarget { policy } => {
+                Self::MissingLegacySseTarget { policy }
+            }
+            HttpEndpointBundleError::MissingLegacyMessagePostTarget { policy } => {
+                Self::MissingLegacyMessagePostTarget { policy }
+            }
+            HttpEndpointBundleError::FragmentNotAllowed { route } => {
+                Self::FragmentNotAllowed { route }
+            }
+            HttpEndpointBundleError::RouteCollision { first, second, .. } => {
+                Self::RouteCollision { first, second }
+            }
+        }
+    }
+}
+
+/// Immutable HTTP endpoint configuration constructed from trusted local input.
+///
+/// The serialized form is a nested `http` object on a server configuration:
+///
+/// ```json
+/// {
+///   "policy": "Auto",
+///   "modernPost": "https://mcp.example.test/mcp",
+///   "legacySse": "https://mcp.example.test/sse",
+///   "legacyMessagePost": "https://mcp.example.test/messages",
+///   "credentialPartition": "credential-v1",
+///   "securityPartition": "security-v1",
+///   "transportProfile": "http-sse-v2",
+///   "policyGeneration": 1,
+///   "configurationGeneration": 1,
+///   "legacyReceiptGeneration": 1
+/// }
+/// ```
+///
+/// `policy` is intentionally required. `Auto`, `ModernOnly`, and
+/// `LegacyOnly` are distinct immutable selections, not strings that may be
+/// changed after a peer response or a failed request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpEndpointConfig {
+    policy: ProtocolPolicy,
+    modern_post: Option<CanonicalHttpUrl>,
+    legacy_sse: Option<CanonicalHttpUrl>,
+    legacy_message_post: Option<CanonicalHttpUrl>,
+    credential_partition: String,
+    security_partition: String,
+    transport_profile: String,
+    policy_generation: u64,
+    configuration_generation: u64,
+    legacy_receipt_generation: u64,
+    bundle: HttpEndpointBundle,
+}
+
+impl std::fmt::Debug for HttpEndpointConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpEndpointConfig")
+            .field("policy", &self.policy)
+            .field("modern_post_configured", &self.modern_post.is_some())
+            .field("legacy_sse_configured", &self.legacy_sse.is_some())
+            .field(
+                "legacy_message_post_configured",
+                &self.legacy_message_post.is_some(),
+            )
+            .field("policy_generation", &self.policy_generation)
+            .field("configuration_generation", &self.configuration_generation)
+            .field("legacy_receipt_generation", &self.legacy_receipt_generation)
+            .finish()
+    }
+}
+
+impl HttpEndpointConfig {
+    /// Validates trusted endpoint configuration and freezes its bundle key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        policy: ProtocolPolicy,
+        modern_post: Option<String>,
+        legacy_sse: Option<String>,
+        legacy_message_post: Option<String>,
+        credential_partition: String,
+        security_partition: String,
+        transport_profile: String,
+        policy_generation: u64,
+        configuration_generation: u64,
+        legacy_receipt_generation: u64,
+    ) -> Result<Self, HttpEndpointConfigError> {
+        let modern_post = parse_configured_target(modern_post, HttpRouteKind::ModernMcpPost)?;
+        let legacy_sse = parse_configured_target(legacy_sse, HttpRouteKind::LegacySseGet)?;
+        let legacy_message_post =
+            parse_configured_target(legacy_message_post, HttpRouteKind::LegacyMessagePost)?;
+        let bundle = HttpEndpointBundle::new(
+            policy,
+            modern_post.clone(),
+            legacy_sse.clone(),
+            legacy_message_post.clone(),
+            credential_partition.clone(),
+            security_partition.clone(),
+            transport_profile.clone(),
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+        )
+        .map_err(HttpEndpointConfigError::from)?;
+
+        Ok(Self {
+            policy,
+            modern_post,
+            legacy_sse,
+            legacy_message_post,
+            credential_partition,
+            security_partition,
+            transport_profile,
+            policy_generation,
+            configuration_generation,
+            legacy_receipt_generation,
+            bundle,
+        })
+    }
+
+    /// Returns the explicitly configured, immutable protocol policy.
+    #[must_use]
+    pub const fn policy(&self) -> ProtocolPolicy {
+        self.policy
+    }
+
+    /// Returns the validated immutable HTTP endpoint bundle.
+    #[must_use]
+    pub const fn endpoint_bundle(&self) -> &HttpEndpointBundle {
+        &self.bundle
+    }
+
+    /// Constructs the immutable client protocol plan for this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the retained canonical routes no longer
+    /// satisfy their explicit protocol policy.
+    pub fn protocol_plan(&self) -> Result<ClientProtocolPlan, HttpEndpointConfigError> {
+        ClientProtocolPlan::http(
+            self.policy,
+            self.modern_post.clone(),
+            self.legacy_sse.clone(),
+            self.legacy_message_post.clone(),
+            self.credential_partition.clone(),
+            self.security_partition.clone(),
+            self.transport_profile.clone(),
+            self.policy_generation,
+            self.configuration_generation,
+            self.legacy_receipt_generation,
+        )
+        .map_err(HttpEndpointConfigError::from)
+    }
+}
+
+fn parse_configured_target(
+    target: Option<String>,
+    route: HttpRouteKind,
+) -> Result<Option<CanonicalHttpUrl>, HttpEndpointConfigError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let target = CanonicalHttpUrl::parse(&target)
+        .map_err(|_| HttpEndpointConfigError::InvalidTarget { route })?;
+    if target.has_userinfo() {
+        return Err(HttpEndpointConfigError::UserinfoNotAllowed { route });
+    }
+    Ok(Some(target))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HttpEndpointConfigWire {
+    policy: ProtocolPolicy,
+    #[serde(default)]
+    modern_post: Option<String>,
+    #[serde(default)]
+    legacy_sse: Option<String>,
+    #[serde(default)]
+    legacy_message_post: Option<String>,
+    credential_partition: String,
+    security_partition: String,
+    transport_profile: String,
+    policy_generation: u64,
+    configuration_generation: u64,
+    legacy_receipt_generation: u64,
+}
+
+impl<'de> Deserialize<'de> for HttpEndpointConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HttpEndpointConfigWire::deserialize(deserializer)?;
+        Self::new(
+            wire.policy,
+            wire.modern_post,
+            wire.legacy_sse,
+            wire.legacy_message_post,
+            wire.credential_partition,
+            wire.security_partition,
+            wire.transport_profile,
+            wire.policy_generation,
+            wire.configuration_generation,
+            wire.legacy_receipt_generation,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for HttpEndpointConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        HttpEndpointConfigWire {
+            policy: self.policy,
+            modern_post: self
+                .modern_post
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            legacy_sse: self
+                .legacy_sse
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            legacy_message_post: self
+                .legacy_message_post
+                .as_ref()
+                .map(|target| target.as_str().to_owned()),
+            credential_partition: self.credential_partition.clone(),
+            security_partition: self.security_partition.clone(),
+            transport_profile: self.transport_profile.clone(),
+            policy_generation: self.policy_generation,
+            configuration_generation: self.configuration_generation,
+            legacy_receipt_generation: self.legacy_receipt_generation,
+        }
+        .serialize(serializer)
+    }
 }
 
 // ============================================================================
@@ -148,14 +553,27 @@ pub enum ConfigError {
     NotFound(String),
     /// Failed to read configuration file.
     ReadError(std::io::Error),
+    /// Configuration file exceeded its serialized byte bound.
+    FileTooLarge {
+        /// Maximum bytes permitted for this read.
+        limit_bytes: usize,
+    },
+    /// A file byte limit was zero or could not accommodate an overflow probe.
+    InvalidFileByteLimit,
     /// Failed to parse configuration.
     ParseError(String),
     /// Server not found in configuration.
     ServerNotFound(String),
     /// Server is disabled.
     ServerDisabled(String),
-    /// Failed to spawn server process.
-    SpawnError(String),
+    /// Server has no configured HTTP endpoint.
+    HttpNotConfigured(String),
+    /// Configured HTTP routes could not form a client protocol plan.
+    HttpPlanError(HttpEndpointConfigError),
+    /// Configured HTTP client connection or initialization failed.
+    HttpClientError(HttpClientError),
+    /// Configured subprocess creation or MCP client lifecycle failed.
+    ClientError(McpError),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -163,10 +581,21 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::NotFound(path) => write!(f, "Configuration file not found: {path}"),
             ConfigError::ReadError(e) => write!(f, "Failed to read configuration: {e}"),
+            ConfigError::FileTooLarge { limit_bytes } => {
+                write!(f, "Configuration file exceeds {limit_bytes} bytes")
+            }
+            ConfigError::InvalidFileByteLimit => {
+                f.write_str("Configuration file byte limit is zero or too large")
+            }
             ConfigError::ParseError(e) => write!(f, "Failed to parse configuration: {e}"),
             ConfigError::ServerNotFound(name) => write!(f, "Server not found: {name}"),
             ConfigError::ServerDisabled(name) => write!(f, "Server is disabled: {name}"),
-            ConfigError::SpawnError(e) => write!(f, "Failed to spawn server: {e}"),
+            ConfigError::HttpNotConfigured(name) => {
+                write!(f, "Server has no configured HTTP endpoint: {name}")
+            }
+            ConfigError::HttpPlanError(e) => write!(f, "Invalid configured HTTP plan: {e}"),
+            ConfigError::HttpClientError(e) => write!(f, "HTTP MCP client lifecycle failed: {e}"),
+            ConfigError::ClientError(e) => write!(f, "MCP client lifecycle failed: {e}"),
         }
     }
 }
@@ -175,6 +604,9 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ConfigError::ReadError(e) => Some(e),
+            ConfigError::HttpPlanError(e) => Some(e),
+            ConfigError::HttpClientError(e) => Some(e),
+            ConfigError::ClientError(e) => Some(e),
             _ => None,
         }
     }
@@ -197,22 +629,36 @@ impl McpConfig {
         Self::default()
     }
 
-    /// Loads configuration from a JSON file.
+    /// Loads configuration from a JSON, TOML, or JSONC file.
+    ///
+    /// `.toml` and `.jsonc` select those formats explicitly. The discovered
+    /// `.vscode/mcp.json` path accepts JSONC; other paths require strict JSON.
+    /// Parsing errors never trigger fallback to a different format. The read
+    /// is bounded by [`DEFAULT_MAX_CONFIG_FILE_BYTES`] before deserialization.
     ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be read or parsed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ConfigError::NotFound(path.display().to_string())
-            } else {
-                ConfigError::ReadError(e)
-            }
-        })?;
+        Self::from_file_with_limit(path, DEFAULT_MAX_CONFIG_FILE_BYTES)
+    }
 
-        Self::from_json(&content)
+    /// Loads a configuration file with an explicit serialized byte limit.
+    ///
+    /// Reads at most `max_bytes + 1` bytes, including a one-byte overflow probe.
+    /// A file that grows during the read cannot bypass the bound through stale
+    /// metadata. An oversized file is refused, never parsed as a prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidFileByteLimit`] for zero or a limit whose
+    /// one-byte probe cannot fit in `u64`, [`ConfigError::FileTooLarge`] for
+    /// oversized input, or the existing read/parse errors for other failures.
+    pub fn from_file_with_limit(
+        path: impl AsRef<Path>,
+        max_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        input::load(path.as_ref(), max_bytes)
     }
 
     /// Parses configuration from a JSON string.
@@ -221,7 +667,23 @@ impl McpConfig {
     ///
     /// Returns an error if parsing fails.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
-        serde_json::from_str(json).map_err(|e| ConfigError::ParseError(e.to_string()))
+        serde_json::from_str(json)
+            .map_err(|_| ConfigError::ParseError("Invalid JSON configuration".to_string()))
+    }
+
+    /// Parses configuration from JSON with comments and trailing commas.
+    ///
+    /// Unlike [`Self::from_json`], this accepts line/block comments and a
+    /// trailing comma after an object member or array element. It does not
+    /// accept JSON5 strings, unquoted keys, or variable substitution. VS Code
+    /// imports support literal stdio servers only; unsupported controls are
+    /// refused rather than silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted parse error for invalid or unsupported input.
+    pub fn from_jsonc(json: &str) -> Result<Self, ConfigError> {
+        parse::from_jsonc(json)
     }
 
     /// Parses configuration from a TOML string.
@@ -241,7 +703,8 @@ impl McpConfig {
     ///
     /// Returns an error if parsing fails.
     pub fn from_toml(toml: &str) -> Result<Self, ConfigError> {
-        toml::from_str(toml).map_err(|e| ConfigError::ParseError(e.to_string()))
+        toml::from_str(toml)
+            .map_err(|_| ConfigError::ParseError("Invalid TOML configuration".to_string()))
     }
 
     /// Serializes configuration to JSON.
@@ -283,31 +746,91 @@ impl McpConfig {
             .collect()
     }
 
-    /// Creates a client for a server by name.
+    /// Creates a client for a server by name under the caller's capability
+    /// context.
+    ///
+    /// Initialization and subsequent ordinary requests use
+    /// the default [`RequestTimeoutPolicy`]. Use
+    /// [`Self::client_with_timeout_policy`] to select different bounds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
-    pub fn client(&self, name: &str) -> Result<Client, ConfigError> {
-        self.client_with_cx(name, Cx::for_request())
+    /// Returns an error if the server is not found, disabled, or fails to start
+    /// or initialize.
+    ///
+    /// The context is mandatory; configuration-based client construction never
+    /// creates or re-enters a runtime on behalf of a library caller.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::mcp_config::McpConfig;
+    ///
+    /// let config = McpConfig::new();
+    /// let _client = config.client("filesystem");
+    /// ```
+    pub fn client(&self, cx: &Cx, name: &str) -> Result<Client, ConfigError> {
+        self.client_with_timeout_policy(cx, name, RequestTimeoutPolicy::default())
     }
 
-    /// Creates a client with a provided Cx for cancellation support.
+    /// Creates a client using an explicit idle/absolute timeout policy.
+    ///
+    /// The policy applies to initialization as well as subsequent ordinary
+    /// requests. Use this path when the default 30-second idle and 120-second
+    /// absolute initialization limits are not appropriate.
     ///
     /// # Errors
     ///
-    /// Returns an error if the server is not found, disabled, or fails to start.
-    pub fn client_with_cx(&self, name: &str, cx: Cx) -> Result<Client, ConfigError> {
+    /// Returns an error if the server is not found, disabled, or fails to
+    /// start or initialize.
+    pub fn client_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        name: &str,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<Client, ConfigError> {
+        timeout_policy
+            .validate()
+            .map_err(ConfigError::ClientError)?;
+        let config = self.enabled_server(name)?;
+
+        spawn_client_from_config(name, config, cx, timeout_policy)
+    }
+
+    /// Connects a ready HTTP client from one server's explicit endpoint
+    /// configuration under the caller's capability context.
+    ///
+    /// This entrypoint never inspects or spawns the configured stdio command.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the server is missing, disabled, lacks HTTP
+    /// endpoint configuration, has an invalid retained protocol plan, or the
+    /// HTTP connection lifecycle fails.
+    pub async fn http_client(&self, cx: &Cx, name: &str) -> Result<HttpClient, ConfigError> {
+        let config = self.enabled_server(name)?;
+        let http = config
+            .http_endpoint_config()
+            .ok_or_else(|| ConfigError::HttpNotConfigured(name.to_owned()))?;
+        let protocol_plan = http.protocol_plan().map_err(ConfigError::HttpPlanError)?;
+
+        Box::pin(
+            ClientBuilder::new()
+                .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
+                .protocol_plan(protocol_plan)
+                .connect_http_client_with_cx(cx),
+        )
+        .await
+        .map_err(ConfigError::HttpClientError)
+    }
+
+    fn enabled_server(&self, name: &str) -> Result<&ServerConfig, ConfigError> {
         let config = self
             .mcp_servers
             .get(name)
-            .ok_or_else(|| ConfigError::ServerNotFound(name.to_string()))?;
-
+            .ok_or_else(|| ConfigError::ServerNotFound(name.to_owned()))?;
         if config.disabled {
-            return Err(ConfigError::ServerDisabled(name.to_string()));
+            return Err(ConfigError::ServerDisabled(name.to_owned()));
         }
-
-        spawn_client_from_config(name, config, cx)
+        Ok(config)
     }
 
     /// Merges another configuration into this one.
@@ -322,131 +845,20 @@ impl McpConfig {
 fn spawn_client_from_config(
     name: &str,
     config: &ServerConfig,
-    cx: Cx,
+    cx: &Cx,
+    timeout_policy: RequestTimeoutPolicy,
 ) -> Result<Client, ConfigError> {
-    // Build the command
-    let mut cmd = Command::new(&config.command);
-    cmd.args(&config.args);
-
-    // Set environment variables
-    for (key, value) in &config.env {
-        cmd.env(key, value);
+    let mut builder = ClientBuilder::new()
+        .client_info(format!("fastmcp-client:{name}"), env!("CARGO_PKG_VERSION"))
+        .request_timeout_policy(timeout_policy)
+        .envs(config.env.clone());
+    if let Some(cwd) = config.cwd.as_deref() {
+        builder = builder.working_dir(cwd);
     }
-
-    // Set working directory if specified
-    if let Some(ref cwd) = config.cwd {
-        cmd.current_dir(cwd);
-    }
-
-    // Configure stdio
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
-
-    // Spawn the process
-    let mut child = cmd.spawn().map_err(|e| {
-        ConfigError::SpawnError(format!("Failed to spawn {}: {}", config.command, e))
-    })?;
-
-    // Get stdin/stdout handles
-    let stdin = child.stdin.take().ok_or_else(|| {
-        ConfigError::SpawnError(format!("Failed to get stdin for server '{name}'"))
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ConfigError::SpawnError(format!("Failed to get stdout for server '{name}'"))
-    })?;
-
-    // Create transport
-    let transport = StdioTransport::new(stdout, stdin);
-
-    // Create client info
-    let client_info = ClientInfo {
-        name: format!("fastmcp-client:{name}"),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
-    let client_capabilities = ClientCapabilities::default();
-
-    // Create client and initialize
-    create_and_initialize_client(child, transport, cx, client_info, client_capabilities)
-        .map_err(|e| ConfigError::SpawnError(format!("Initialization failed: {e}")))
-}
-
-/// Creates a client and performs initialization handshake.
-fn create_and_initialize_client(
-    child: Child,
-    mut transport: StdioTransport<ChildStdout, ChildStdin>,
-    cx: Cx,
-    client_info: ClientInfo,
-    client_capabilities: ClientCapabilities,
-) -> McpResult<Client> {
-    use fastmcp_protocol::{
-        InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, PROTOCOL_VERSION,
-    };
-    use fastmcp_transport::Transport;
-
-    // Send initialize request
-    let params = InitializeParams {
-        protocol_version: PROTOCOL_VERSION.to_string(),
-        capabilities: client_capabilities.clone(),
-        client_info: client_info.clone(),
-    };
-
-    let params_value = serde_json::to_value(&params)
-        .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
-
-    let request = JsonRpcRequest::new("initialize", Some(params_value), 1);
-
-    transport
-        .send(&cx, &JsonRpcMessage::Request(request))
-        .map_err(crate::transport_error_to_mcp)?;
-
-    // Receive response
-    let response = loop {
-        let message = transport.recv(&cx).map_err(crate::transport_error_to_mcp)?;
-        if let JsonRpcMessage::Response(resp) = message {
-            break resp;
-        }
-    };
-
-    // Check for error
-    if let Some(error) = response.error {
-        return Err(McpError::new(
-            fastmcp_core::McpErrorCode::from(error.code),
-            error.message,
-        ));
-    }
-
-    // Parse result
-    let result_value = response
-        .result
-        .ok_or_else(|| McpError::internal_error("No result in initialize response"))?;
-
-    let init_result: InitializeResult = serde_json::from_value(result_value)
-        .map_err(|e| McpError::internal_error(format!("Failed to parse initialize result: {e}")))?;
-
-    // Send initialized notification
-    let notification = JsonRpcRequest {
-        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-        method: "initialized".to_string(),
-        params: Some(serde_json::json!({})),
-        id: None,
-    };
-
-    transport
-        .send(&cx, &JsonRpcMessage::Request(notification))
-        .map_err(crate::transport_error_to_mcp)?;
-
-    // Create session
-    let session = ClientSession::new(
-        client_info,
-        client_capabilities,
-        init_result.server_info,
-        init_result.capabilities,
-        init_result.protocol_version,
-    );
-
-    // Return client
-    Ok(Client::from_parts(child, transport, cx, session, 30_000))
+    let arguments = config.args.iter().map(String::as_str).collect::<Vec<_>>();
+    builder
+        .connect_stdio_once_with_cx(&config.command, &arguments, cx)
+        .map_err(ConfigError::ClientError)
 }
 
 // ============================================================================
@@ -504,11 +916,13 @@ impl ConfigLoader {
     ///
     /// # Errors
     ///
-    /// Returns an error if no configuration file is found or parsing fails.
+    /// Returns an error if no configuration file is found, a candidate cannot
+    /// be read, or parsing fails. Only `NotFound` permits trying the next path.
     pub fn load(&self) -> Result<McpConfig, ConfigError> {
         for path in &self.search_paths {
-            if path.exists() {
-                return McpConfig::from_file(path);
+            match McpConfig::from_file(path) {
+                Err(ConfigError::NotFound(_)) => {}
+                result => return result,
             }
         }
 
@@ -520,18 +934,23 @@ impl ConfigLoader {
     /// Loads and merges all existing configuration files.
     ///
     /// Later files override earlier ones.
-    pub fn load_all(&self) -> McpConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns the first read or parse error instead of silently omitting an
+    /// existing configuration file from the merged result.
+    pub fn load_all(&self) -> Result<McpConfig, ConfigError> {
         let mut config = McpConfig::new();
 
         for path in &self.search_paths {
-            if path.exists() {
-                if let Ok(loaded) = McpConfig::from_file(path) {
-                    config.merge(loaded);
-                }
+            match McpConfig::from_file(path) {
+                Ok(loaded) => config.merge(loaded),
+                Err(ConfigError::NotFound(_)) => {}
+                Err(error) => return Err(error),
             }
         }
 
-        config
+        Ok(config)
     }
 
     /// Returns all search paths.
@@ -551,74 +970,130 @@ impl ConfigLoader {
 // Default Config Paths
 // ============================================================================
 
-/// Returns platform-specific default configuration paths.
-#[must_use]
-pub fn default_config_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+#[derive(Debug, Clone)]
+struct ConfigLocations {
+    // Other Unix targets derive their paths from `unix_config` instead.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    home: Option<PathBuf>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unix_config: Option<PathBuf>,
+    #[cfg(target_os = "windows")]
+    windows_data: Option<PathBuf>,
+}
 
-    // Project-specific configs (current directory)
-    paths.push(PathBuf::from(".mcp/config.json"));
-    paths.push(PathBuf::from(".vscode/mcp.json"));
+impl ConfigLocations {
+    fn from_environment() -> Self {
+        let home = dirs::home_dir();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let unix_config = unix_config_home(
+            home.as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        );
 
-    // User-level configs
-    if let Some(home) = dirs::home_dir() {
-        #[cfg(target_os = "macos")]
-        {
-            // Claude Desktop on macOS
-            paths.push(home.join("Library/Application Support/Claude/claude_desktop_config.json"));
-            // Generic MCP config
-            paths.push(home.join(".config/mcp/config.json"));
+        Self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            home,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            unix_config,
+            #[cfg(target_os = "windows")]
+            windows_data: dirs::data_dir(),
         }
+    }
+}
 
-        #[cfg(target_os = "windows")]
-        {
-            // Claude Desktop on Windows
-            if let Some(appdata) = dirs::data_dir() {
-                paths.push(appdata.join("Claude/claude_desktop_config.json"));
-            }
-            // Generic MCP config
-            paths.push(home.join(".mcp/config.json"));
-        }
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_config_home(
+    home: Option<&Path>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .map(Path::new)
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|path| path.join(".config")))
+}
 
-        #[cfg(target_os = "linux")]
-        {
-            // XDG config directory
-            if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
-                let xdg_path = PathBuf::from(xdg_config);
-                paths.push(xdg_path.join("mcp/config.json"));
-                paths.push(xdg_path.join("claude/config.json"));
-            } else {
-                paths.push(home.join(".config/mcp/config.json"));
-                paths.push(home.join(".config/claude/config.json"));
-            }
-        }
+fn claude_desktop_config_path_from(locations: &ConfigLocations) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        locations
+            .home
+            .as_ref()
+            .map(|home| home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        locations
+            .windows_data
+            .as_ref()
+            .map(|data| data.join("Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        locations
+            .unix_config
+            .as_ref()
+            .map(|config| config.join("Claude/claude_desktop_config.json"))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+    {
+        let _ = locations;
+        None
+    }
+}
+
+fn default_config_paths_from(locations: &ConfigLocations) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(".mcp/config.json"),
+        PathBuf::from(".vscode/mcp.json"),
+    ];
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if let Some(claude_path) = claude_desktop_config_path_from(locations) {
+        paths.push(claude_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = &locations.home {
+        paths.push(home.join(".config/mcp/config.json"));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(home) = &locations.home {
+        paths.push(home.join(".mcp/config.json"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(config) = &locations.unix_config {
+        paths.push(config.join("mcp/config.json"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some(claude_path) = claude_desktop_config_path_from(locations) {
+        paths.push(claude_path);
     }
 
     paths
 }
 
+/// Returns platform-specific default configuration paths.
+#[must_use]
+pub fn default_config_paths() -> Vec<PathBuf> {
+    default_config_paths_from(&ConfigLocations::from_environment())
+}
+
 /// Returns the Claude Desktop configuration path for the current platform.
+///
+/// macOS and Windows use Claude Desktop's native locations. Claude Desktop is
+/// not officially distributed for Linux; on non-macOS Unix, FastMCP retains a
+/// desktop-compatible config convention beneath the XDG configuration
+/// directory so its installer, lister, and configuration loader agree.
 #[must_use]
 pub fn claude_desktop_config_path() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .map(|h| h.join("Library/Application Support/Claude/claude_desktop_config.json"))
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        dirs::data_dir().map(|d| d.join("Claude/claude_desktop_config.json"))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(xdg_config) = env::var("XDG_CONFIG_HOME") {
-            Some(PathBuf::from(xdg_config).join("claude/config.json"))
-        } else {
-            dirs::home_dir().map(|h| h.join(".config/claude/config.json"))
-        }
-    }
+    claude_desktop_config_path_from(&ConfigLocations::from_environment())
 }
 
 // ============================================================================
@@ -633,7 +1108,151 @@ mod tests {
     fn test_empty_config() {
         let config = McpConfig::new();
         assert!(config.mcp_servers.is_empty());
-        assert!(config.server_names().is_empty());
+        assert_eq!(config.server_names().len(), 0);
+    }
+
+    #[test]
+    fn explicit_http_policies_parse_to_immutable_endpoint_bundles() {
+        let config = McpConfig::from_json(
+            r#"{
+                "mcpServers": {
+                    "modern": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "ModernOnly",
+                            "modernPost": "https://modern.example.test/mcp",
+                            "credentialPartition": "credential-a",
+                            "securityPartition": "security-a",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    },
+                    "legacy": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "LegacyOnly",
+                            "legacySse": "https://legacy.example.test/sse",
+                            "legacyMessagePost": "https://legacy.example.test/messages",
+                            "credentialPartition": "credential-b",
+                            "securityPartition": "security-b",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    },
+                    "auto": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "Auto",
+                            "modernPost": "https://auto.example.test/mcp",
+                            "legacySse": "https://auto.example.test/sse",
+                            "legacyMessagePost": "https://auto.example.test/messages",
+                            "credentialPartition": "credential-c",
+                            "securityPartition": "security-c",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("every explicit policy with its required routes is valid");
+
+        let modern = config
+            .get_server("modern")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("modern config must retain its immutable bundle");
+        let legacy = config
+            .get_server("legacy")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("legacy config must retain its immutable bundle");
+        let auto = config
+            .get_server("auto")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("auto config must retain its immutable bundle");
+
+        assert_eq!(modern.policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(legacy.policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(auto.policy(), ProtocolPolicy::Auto);
+
+        let original_auto_key = auto.endpoint_bundle().key();
+        let serialized = config.to_json();
+        let reparsed = McpConfig::from_json(&serialized)
+            .expect("canonical endpoint configuration must round-trip");
+        let reparsed_auto = reparsed
+            .get_server("auto")
+            .and_then(ServerConfig::http_endpoint_config)
+            .expect("round-tripped auto config must retain its immutable bundle");
+        assert_eq!(reparsed_auto.endpoint_bundle().key(), original_auto_key);
+    }
+
+    #[test]
+    fn auto_endpoint_bundle_rejects_only_a_missing_legacy_message_post() {
+        let accepted = HttpEndpointConfig::new(
+            ProtocolPolicy::Auto,
+            Some("https://auto.example.test/mcp".to_owned()),
+            Some("https://auto.example.test/sse".to_owned()),
+            Some("https://auto.example.test/messages".to_owned()),
+            "credential-c".to_owned(),
+            "security-c".to_owned(),
+            "http-sse-v2".to_owned(),
+            3,
+            5,
+            7,
+        )
+        .expect("the accepted auto bundle has every required route");
+        let accepted_key = accepted.endpoint_bundle().key();
+
+        // The only changed input is the missing legacy message POST target.
+        // The accepted bundle is immutable, so this failed construction cannot
+        // mutate its endpoint key or make it share a cache identity.
+        let refusal = HttpEndpointConfig::new(
+            ProtocolPolicy::Auto,
+            Some("https://auto.example.test/mcp".to_owned()),
+            Some("https://auto.example.test/sse".to_owned()),
+            None,
+            "credential-c".to_owned(),
+            "security-c".to_owned(),
+            "http-sse-v2".to_owned(),
+            3,
+            5,
+            7,
+        )
+        .expect_err("Auto must reject a missing explicit legacy message POST target");
+        assert_eq!(
+            refusal,
+            HttpEndpointConfigError::MissingLegacyMessagePostTarget {
+                policy: ProtocolPolicy::Auto,
+            }
+        );
+        let parse_error = McpConfig::from_json(
+            r#"{
+                "mcpServers": {
+                    "auto": {
+                        "command": "unused",
+                        "http": {
+                            "policy": "Auto",
+                            "modernPost": "https://auto.example.test/mcp",
+                            "legacySse": "https://auto.example.test/sse",
+                            "credentialPartition": "credential-c",
+                            "securityPartition": "security-c",
+                            "transportProfile": "http-sse-v2",
+                            "policyGeneration": 3,
+                            "configurationGeneration": 5,
+                            "legacyReceiptGeneration": 7
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect_err("config parsing must run endpoint-bundle validation");
+        assert!(matches!(parse_error, ConfigError::ParseError(_)));
+        assert_eq!(accepted.endpoint_bundle().key(), accepted_key);
     }
 
     #[test]
@@ -712,6 +1331,58 @@ mod tests {
     }
 
     #[test]
+    fn server_config_debug_redacts_environment_and_argument_values() {
+        let env_value_canary = "server-config-env-value-canary";
+        let argument_canary = "server-config-api-argument-canary";
+        let command_canary = "server-config-command-secret-canary";
+        let config = ServerConfig::new(command_canary)
+            .with_args(["-m", "safe_module", "--api-key", argument_canary])
+            .with_env("SERVICE_API_TOKEN", env_value_canary)
+            .with_cwd("/private/server/path");
+
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("ServerConfig"));
+        assert!(debug.contains("command_set: true"));
+        assert!(debug.contains("arg_count: 4"));
+        assert!(debug.contains("env_var_count: 1"));
+        assert!(debug.contains("cwd_set: true"));
+        assert!(debug.contains("disabled: false"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains(argument_canary));
+        assert!(!debug.contains(command_canary));
+        assert!(!debug.contains("SERVICE_API_TOKEN"));
+        assert!(!debug.contains("/private/server/path"));
+
+        let serialized = serde_json::to_value(&config).expect("server config must serialize");
+        assert_eq!(serialized["command"], command_canary);
+        assert_eq!(serialized["args"][3], argument_canary);
+        assert_eq!(serialized["env"]["SERVICE_API_TOKEN"], env_value_canary);
+    }
+
+    #[test]
+    fn mcp_config_debug_is_a_redacted_aggregate_summary() {
+        let env_value_canary = "aggregate-env-value-canary";
+        let argument_canary = "aggregate-api-argument-canary";
+        let mut config = McpConfig::new();
+        config.add_server(
+            "enabled-server",
+            ServerConfig::new("runner")
+                .with_args(["--credential", argument_canary])
+                .with_env("API_TOKEN", env_value_canary),
+        );
+        config.add_server("disabled-server", ServerConfig::new("other").disabled());
+
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("McpConfig"));
+        assert!(debug.contains("server_count: 2"));
+        assert!(debug.contains("enabled_server_count: 1"));
+        assert!(debug.contains("disabled_server_count: 1"));
+        assert!(!debug.contains(env_value_canary));
+        assert!(!debug.contains(argument_canary));
+        assert!(!debug.contains("API_TOKEN"));
+    }
+
+    #[test]
     fn test_config_add_and_get_server() {
         let mut config = McpConfig::new();
 
@@ -780,7 +1451,7 @@ mod tests {
     #[test]
     fn test_error_server_not_found() {
         let config = McpConfig::new();
-        let result = config.client("nonexistent");
+        let result = config.client(&Cx::for_testing(), "nonexistent");
         assert!(matches!(result, Err(ConfigError::ServerNotFound(_))));
     }
 
@@ -789,14 +1460,81 @@ mod tests {
         let mut config = McpConfig::new();
         config.add_server("disabled", ServerConfig::new("echo").disabled());
 
-        let result = config.client("disabled");
+        let result = config.client(&Cx::for_testing(), "disabled");
         assert!(matches!(result, Err(ConfigError::ServerDisabled(_))));
     }
 
     #[test]
     fn test_default_config_paths_not_empty() {
         let paths = default_config_paths();
-        assert!(!paths.is_empty());
+        assert_ne!(paths.len(), 0);
+    }
+
+    #[test]
+    fn default_loader_includes_the_authoritative_claude_desktop_path() {
+        let Some(claude_path) = claude_desktop_config_path() else {
+            return;
+        };
+
+        let loader = ConfigLoader::default();
+        assert!(loader.search_paths().contains(&claude_path));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_loader_and_resolver_share_isolated_xdg_path() {
+        let home = Path::new("/isolated/home");
+        let xdg = std::ffi::OsStr::new("/isolated/xdg");
+        let locations = ConfigLocations {
+            unix_config: unix_config_home(Some(home), Some(xdg)),
+        };
+        let expected = PathBuf::from("/isolated/xdg/Claude/claude_desktop_config.json");
+
+        assert_eq!(
+            claude_desktop_config_path_from(&locations),
+            Some(expected.clone())
+        );
+
+        let loader = ConfigLoader {
+            search_paths: default_config_paths_from(&locations),
+        };
+        assert!(loader.search_paths().contains(&expected));
+        assert!(
+            loader
+                .search_paths()
+                .contains(&PathBuf::from("/isolated/xdg/mcp/config.json"))
+        );
+        assert!(
+            !loader
+                .search_paths()
+                .contains(&PathBuf::from("/isolated/xdg/claude/config.json"))
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_empty_missing_or_relative_xdg_falls_back_to_isolated_home() {
+        let home = Path::new("/isolated/home");
+        let expected = home.join(".config");
+        let xdg_values = [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("relative/config")),
+        ];
+
+        for xdg in xdg_values {
+            assert_eq!(unix_config_home(Some(home), xdg), Some(expected.clone()));
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn unix_absolute_xdg_does_not_require_home() {
+        let xdg = std::ffi::OsStr::new("/isolated/xdg");
+        assert_eq!(
+            unix_config_home(None, Some(xdg)),
+            Some(PathBuf::from("/isolated/xdg"))
+        );
     }
 
     #[test]
@@ -808,7 +1546,25 @@ mod tests {
                 "server not found",
             ),
             (ConfigError::ServerDisabled("name".into()), "disabled"),
+            (
+                ConfigError::HttpNotConfigured("name".into()),
+                "http endpoint",
+            ),
+            (
+                ConfigError::HttpPlanError(HttpEndpointConfigError::MissingModernPostTarget {
+                    policy: ProtocolPolicy::ModernOnly,
+                }),
+                "http plan",
+            ),
+            (
+                ConfigError::HttpClientError(HttpClientError::RequestIdExhausted),
+                "http mcp client lifecycle",
+            ),
             (ConfigError::ParseError("msg".into()), "parse"),
+            (
+                ConfigError::ClientError(McpError::request_cancelled()),
+                "lifecycle",
+            ),
         ];
 
         for (error, expected) in errors {
@@ -832,6 +1588,330 @@ mod tests {
 
         let parse_err = ConfigError::ParseError("bad".into());
         assert!(std::error::Error::source(&parse_err).is_none());
+
+        let client_err = ConfigError::ClientError(McpError::request_cancelled());
+        assert!(std::error::Error::source(&client_err).is_some());
+
+        let http_plan_err =
+            ConfigError::HttpPlanError(HttpEndpointConfigError::MissingModernPostTarget {
+                policy: ProtocolPolicy::ModernOnly,
+            });
+        assert!(std::error::Error::source(&http_plan_err).is_some());
+
+        let http_client_err = ConfigError::HttpClientError(HttpClientError::RequestIdExhausted);
+        assert!(std::error::Error::source(&http_client_err).is_some());
+    }
+
+    #[test]
+    fn active_and_cancelled_contexts_differ_only_at_cancellation_gate() {
+        let mut config = McpConfig::new();
+        config.add_server("cancelled", ServerConfig::new("definitely-not-a-command"));
+        let original_config = config.to_json();
+
+        let active_error = match config.client(&Cx::for_testing(), "cancelled") {
+            Ok(_) => panic!("an unresolved command must not create a client"),
+            Err(error) => error,
+        };
+        assert!(matches!(active_error, ConfigError::ClientError(_)));
+        assert!(!matches!(
+            active_error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::RequestCancelled,
+                ..
+            })
+        ));
+        assert_eq!(config.to_json(), original_config);
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+
+        let error = match config.client(&cancelled_cx, "cancelled") {
+            Ok(_) => panic!("cancelled context must be rejected before spawn"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::RequestCancelled,
+                ..
+            })
+        ));
+        assert_eq!(config.to_json(), original_config);
+    }
+
+    #[test]
+    fn invalid_policy_precedes_config_lookup_and_process_creation() {
+        let mut config = McpConfig::new();
+        config.add_server("configured", ServerConfig::new("definitely-not-a-command"));
+        let invalid_policy = RequestTimeoutPolicy {
+            idle_timeout: std::time::Duration::ZERO,
+            absolute_timeout: std::time::Duration::from_secs(1),
+            reset_idle_on_matching_progress: true,
+            bounds: crate::RequestTimeoutBounds::Bounded,
+        };
+
+        let error = match config.client_with_timeout_policy(
+            &Cx::for_testing(),
+            "missing",
+            invalid_policy,
+        ) {
+            Ok(_) => panic!("invalid timeout policy must fail before configuration lookup"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+
+        let cancelled_cx = Cx::for_testing();
+        cancelled_cx.set_cancel_requested(true);
+        let error =
+            match config.client_with_timeout_policy(&cancelled_cx, "configured", invalid_policy) {
+                Ok(_) => panic!("invalid timeout policy must fail before checkpoint and spawn"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            ConfigError::ClientError(McpError {
+                code: fastmcp_core::McpErrorCode::InvalidParams,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_aware_config_client_applies_policy_to_initialization() {
+        let mut config = McpConfig::new();
+        config.add_server(
+            "silent",
+            ServerConfig::new("sh").with_args(["-c", "exec sleep 5"]),
+        );
+        let policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(250),
+        )
+        .expect("custom initialization policy must validate");
+        let started = std::time::Instant::now();
+
+        let error = match config.client_with_timeout_policy(&Cx::for_testing(), "silent", policy) {
+            Ok(_) => panic!("silent initialization must honor the custom idle timeout"),
+            Err(error) => error,
+        };
+        let ConfigError::ClientError(error) = error else {
+            panic!("initialization timeout must remain a client lifecycle error");
+        };
+
+        assert_eq!(error.message, "Request timed out at the idle deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": "idle"}))
+        );
+        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the custom
+        // idle timeout fired; this proves it fired at that deadline rather
+        // than late. Timing is the property a custom-timeout test exists to
+        // assert. Real `sh` child, so virtual time cannot replace it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    fn legacy_fallback_config_fixture(discovery_error_id: u64) -> (ServerConfig, PathBuf) {
+        let trace = std::env::temp_dir().join(format!(
+            "fastmcp-config-auto-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock follows Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::File::create_new(&trace).expect("reserve a unique child trace");
+        let script = r#"printf 'spawn:%s\n' "$$" >> "$FASTMCP_CONFIG_SPAWN_TRACE" || exit 90;
+            IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*)
+                    printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$FASTMCP_CONFIG_DISCOVERY_ERROR_ID";
+                    exec sleep 2 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"configured-legacy","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
+                    IFS= read -r ping || exit 2;
+                    case "$ping" in *'"method":"ping"'*) ;; *) exit 3 ;; esac;
+                    case "$ping" in *'"id":2}'*|*'"id":2,'*) ;; *) exit 4 ;; esac;
+                    case "$ping" in *'"params":{}'*) ;; *) exit 5 ;; esac;
+                    printf 'ping:%s\n' "$$" >> "$FASTMCP_CONFIG_SPAWN_TRACE" || exit 91;
+                    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}';
+                    IFS= read -r end ;;
+                *) exit 1 ;;
+            esac"#;
+        let server = ServerConfig::new("sh")
+            .with_args(["-c", script])
+            .with_env(
+                "FASTMCP_CONFIG_DISCOVERY_ERROR_ID",
+                discovery_error_id.to_string(),
+            )
+            .with_env(
+                "FASTMCP_CONFIG_SPAWN_TRACE",
+                trace.to_str().expect("test trace path is UTF-8"),
+            );
+        (server, trace)
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn config_client_auto_reopens_a_fresh_child_for_exact_legacy_fallback() {
+        let (server, trace) = legacy_fallback_config_fixture(1);
+        let mut config = McpConfig::new();
+        config.add_server("legacy", server);
+
+        let mut client = config
+            .client(&Cx::for_request(), "legacy")
+            .expect("the correlated refusal authorizes one fresh legacy child");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the fresh configured legacy child is usable");
+        client.close().expect("configured legacy client cleanup");
+        let trace = std::fs::read_to_string(trace).expect("read the complete child trace");
+        let events: Vec<_> = trace.lines().collect();
+        assert_eq!(
+            events.len(),
+            3,
+            "exactly two children and one ping: {trace}"
+        );
+        let probe = events[0].strip_prefix("spawn:").expect("discovery child");
+        let legacy = events[1]
+            .strip_prefix("spawn:")
+            .expect("fresh legacy child");
+        assert_ne!(
+            probe, legacy,
+            "fallback must not reuse the discovery process"
+        );
+        assert_eq!(events[2], format!("ping:{legacy}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_client_uses_modern_first_builder_with_identity_cwd_and_environment() {
+        let cwd = std::env::current_dir().expect("current directory is available");
+        let cwd = cwd
+            .to_str()
+            .expect("test workspace path is valid UTF-8")
+            .to_owned();
+        let script = r#"test "$PWD" = "$FASTMCP_CONFIG_EXPECTED_CWD" || exit 91;
+            test "$FASTMCP_CONFIG_CANARY" = "config-modern-env" || exit 92;
+            IFS= read -r discover || exit 93;
+            case "$discover" in *server/discover*) ;; *) exit 94 ;; esac;
+            case "$discover" in *fastmcp-client:modern*) ;; *) exit 95 ;; esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"configured-modern","version":"1.0.0"}}}}';
+            IFS= read -r ping || exit 96;
+            case "$ping" in *'"method":"server/discover"'*) ;; *) exit 97 ;; esac;
+            case "$ping" in *'"id":2}'*|*'"id":2,'*) ;; *) exit 98 ;; esac;
+            case "$ping" in *2026-07-28*) ;; *) exit 99 ;; esac;
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}';
+            IFS= read -r end"#;
+        let mut config = McpConfig::new();
+        config.add_server(
+            "modern",
+            ServerConfig::new("sh")
+                .with_args(["-c", script])
+                .with_cwd(cwd.as_str())
+                .with_env("FASTMCP_CONFIG_EXPECTED_CWD", cwd.as_str())
+                .with_env("FASTMCP_CONFIG_CANARY", "config-modern-env"),
+        );
+        let config_before = config.to_json();
+
+        let mut default_client = config
+            .client(&Cx::for_request(), "modern")
+            .expect("default config client completes modern discovery");
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::Auto);
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(
+            default_client.request_timeout_policy(),
+            RequestTimeoutPolicy::default()
+        );
+        assert_eq!(
+            default_client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        assert_eq!(default_client.protocol_version(), "2026-07-28");
+        default_client
+            .ping()
+            .expect("default configured modern client is usable");
+        default_client
+            .close()
+            .expect("default configured modern client cleanup");
+
+        let timeout_policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(4),
+        )
+        .expect("configured modern timeout policy is valid");
+
+        let mut client = config
+            .client_with_timeout_policy(&Cx::for_request(), "modern", timeout_policy)
+            .expect("configured stdio client completes modern discovery");
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+        );
+        assert_eq!(client.protocol_version(), "2026-07-28");
+        assert_eq!(client.request_timeout_policy(), timeout_policy);
+        client
+            .ping()
+            .expect("the configured modern session is usable");
+        client.close().expect("configured modern client cleanup");
+        assert_eq!(config.to_json(), config_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_client_wrong_id_discovery_never_authorizes_legacy_fallback() {
+        let (server, trace) = legacy_fallback_config_fixture(2);
+        let mut config = McpConfig::new();
+        config.add_server("wrong-id", server);
+        let config_before = config.to_json();
+        let timeout_policy = RequestTimeoutPolicy::new(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("bounded wrong-ID policy is valid");
+
+        let error =
+            match config.client_with_timeout_policy(&Cx::for_request(), "wrong-id", timeout_policy)
+            {
+                Err(error) => error,
+                Ok(mut client) => {
+                    let _ = client.close();
+                    panic!("a wrong-ID discovery refusal must not open a legacy child")
+                }
+            };
+
+        assert!(matches!(error, ConfigError::ClientError(_)));
+        assert_eq!(config.to_json(), config_before);
+        let trace = std::fs::read_to_string(trace).expect("read the rejected discovery trace");
+        let events: Vec<_> = trace.lines().collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "wrong-ID refusal must spawn only one child: {trace}"
+        );
+        assert!(events[0].starts_with("spawn:"));
     }
 
     #[test]
@@ -885,14 +1965,20 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_json() {
-        let result = McpConfig::from_json("not json {{{");
-        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+        let canary = "JSON-CONFIG-SECRET-CANARY";
+        let error = McpConfig::from_json(&format!(r#"{{"secret":"{canary}",}}"#))
+            .expect_err("invalid JSON must fail");
+        assert!(matches!(&error, ConfigError::ParseError(_)));
+        assert!(!error.to_string().contains(canary));
     }
 
     #[test]
     fn test_parse_invalid_toml() {
-        let result = McpConfig::from_toml("[invalid toml = = =");
-        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+        let canary = "TOML-CONFIG-SECRET-CANARY";
+        let error = McpConfig::from_toml(&format!("secret = \"{canary}\"\n[invalid toml = = ="))
+            .expect_err("invalid TOML must fail");
+        assert!(matches!(&error, ConfigError::ParseError(_)));
+        assert!(!error.to_string().contains(canary));
     }
 
     #[test]
@@ -931,20 +2017,49 @@ mod tests {
     #[test]
     fn test_config_loader_load_all_no_files() {
         let loader = ConfigLoader::from_path("/nonexistent/a.json");
-        let config = loader.load_all();
+        let config = loader.load_all().expect("missing paths are skipped");
         assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn config_loader_load_all_surfaces_an_existing_malformed_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock is after the epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fastmcp-config-loader-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("exclusively create the runtime fixture directory");
+        let path = directory.join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{"fixture":{"command":"echo"}}}"#)
+            .expect("write a valid config at the runtime path");
+        let loader = ConfigLoader::from_path(&path);
+        let valid = loader.load_all().expect("read the existing valid config");
+        assert_eq!(valid.server_names(), vec!["fixture"]);
+        assert_eq!(valid.get_server("fixture").unwrap().command, "echo");
+
+        // Change only the contents of the same existing file. Its error must
+        // propagate instead of being treated like a missing optional config.
+        std::fs::write(&path, "{malformed JSON").expect("plant invalid config contents");
+        let error = loader
+            .load_all()
+            .expect_err("an existing non-JSON file must not be silently omitted");
+
+        assert!(matches!(error, ConfigError::ParseError(_)));
     }
 
     #[test]
     fn test_config_loader_existing_paths_empty() {
         let loader = ConfigLoader::from_path("/nonexistent/file.json");
-        assert!(loader.existing_paths().is_empty());
+        assert_eq!(loader.existing_paths().len(), 0);
     }
 
     #[test]
     fn test_config_loader_default() {
         let loader = ConfigLoader::default();
-        assert!(!loader.search_paths().is_empty());
+        assert_ne!(loader.search_paths().len(), 0);
     }
 
     #[test]
@@ -952,15 +2067,15 @@ mod tests {
         let mut config = McpConfig::new();
         config.add_server("a", ServerConfig::new("cmd").disabled());
         config.add_server("b", ServerConfig::new("cmd").disabled());
-        assert!(config.enabled_servers().is_empty());
+        assert_eq!(config.enabled_servers().len(), 0);
     }
 
     #[test]
     fn test_claude_desktop_config_path_is_some() {
-        // On all supported platforms, this should return Some when home dir is available
+        // On supported/configured platforms, this should return Some when the
+        // required platform directory is available.
         let path = claude_desktop_config_path();
-        // Home dir is usually available in CI and dev environments
-        if dirs::home_dir().is_some() {
+        if dirs::home_dir().is_some() || dirs::data_dir().is_some() {
             assert!(path.is_some());
         }
     }
@@ -978,14 +2093,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_spawn_error_display() {
-        let err = ConfigError::SpawnError("process died".into());
-        let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("spawn"));
-        assert!(msg.contains("process died"));
-    }
-
-    #[test]
     fn test_config_empty_json_object() {
         let config = McpConfig::from_json("{}").expect("parse empty object");
         assert!(config.mcp_servers.is_empty());
@@ -996,7 +2103,7 @@ mod tests {
         let json = r#"{"mcpServers": {"srv": {"command": "echo"}}}"#;
         let config = McpConfig::from_json(json).expect("parse");
         let srv = config.get_server("srv").unwrap();
-        assert!(srv.args.is_empty());
+        assert_eq!(srv.args.len(), 0);
         assert!(srv.env.is_empty());
         assert!(srv.cwd.is_none());
         assert!(!srv.disabled);
